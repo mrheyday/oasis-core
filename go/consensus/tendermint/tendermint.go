@@ -23,6 +23,7 @@ import (
 	tmmempool "github.com/tendermint/tendermint/mempool"
 	tmnode "github.com/tendermint/tendermint/node"
 	tmp2p "github.com/tendermint/tendermint/p2p"
+	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	tmproxy "github.com/tendermint/tendermint/proxy"
 	tmcli "github.com/tendermint/tendermint/rpc/client/local"
 	tmrpctypes "github.com/tendermint/tendermint/rpc/core/types"
@@ -1215,17 +1216,19 @@ func genesisToTendermint(d *genesisAPI.Document) (*tmtypes.GenesisDoc, error) {
 	doc := tmtypes.GenesisDoc{
 		ChainID:     d.ChainContext()[:tmtypes.MaxChainIDLen],
 		GenesisTime: d.Time,
-		ConsensusParams: &tmtypes.ConsensusParams{
-			Block: tmtypes.BlockParams{
+		ConsensusParams: &tmproto.ConsensusParams{
+			Block: tmproto.BlockParams{
 				MaxBytes:   int64(d.Consensus.Parameters.MaxBlockSize),
 				MaxGas:     maxBlockGas,
 				TimeIotaMs: 1000,
 			},
-			Evidence: tmtypes.EvidenceParams{
-				MaxAgeNumBlocks: int64(d.Consensus.Parameters.MaxEvidenceAgeBlocks),
-				MaxAgeDuration:  d.Consensus.Parameters.MaxEvidenceAgeTime,
+			Evidence: tmproto.EvidenceParams{
+				MaxAgeNumBlocks:  int64(d.Consensus.Parameters.MaxEvidenceAgeBlocks),
+				MaxAgeDuration:   d.Consensus.Parameters.MaxEvidenceAgeTime,
+				MaxNum:           50,
+				ProofTrialPeriod: 50_000,
 			},
-			Validator: tmtypes.ValidatorParams{
+			Validator: tmproto.ValidatorParams{
 				PubKeyTypes: []string{tmtypes.ABCIPubKeyTypeEd25519},
 			},
 		},
@@ -1313,7 +1316,7 @@ func (t *tendermintService) syncWorker() {
 			}
 		}()
 
-		return t.node.ConsensusReactor().FastSync(), nil
+		return t.node.ConsensusReactor().WaitSync(), nil
 	}
 
 	for {
