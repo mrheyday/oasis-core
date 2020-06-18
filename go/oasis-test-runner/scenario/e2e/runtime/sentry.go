@@ -1,10 +1,30 @@
 package runtime
 
 import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/security/advancedtls"
+	"google.golang.org/grpc/status"
+
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	fileSigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/file"
+	cmnGrpc "github.com/oasisprotocol/oasis-core/go/common/grpc"
+	"github.com/oasisprotocol/oasis-core/go/common/identity"
+	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/log"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
+	"github.com/oasisprotocol/oasis-core/go/sentry/api"
+	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/database"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 )
 
 var (
@@ -16,7 +36,11 @@ var (
 	ValidatorExtraLogWatcherHandlerFactories = []log.WatcherHandlerFactory{
 		oasis.LogAssertPeerExchangeDisabled(),
 	}
+
+	emptyGetCheckpointsReq = &checkpoint.GetCheckpointsRequest{Namespace: runtimeID}
 )
+
+const sanityChecksContextTimeout = 30 * time.Second
 
 type sentryImpl struct {
 	runtimeImpl
@@ -69,38 +93,38 @@ func (s *sentryImpl) Fixture() (*oasis.NetworkFixture, error) {
 	// +------------+           +----------+
 	//
 	f.Sentries = []oasis.SentryFixture{
-		oasis.SentryFixture{
+		{
 			Validators: []int{0},
 		},
-		oasis.SentryFixture{
+		{
 			Validators: []int{0},
 		},
-		oasis.SentryFixture{
+		{
 			Validators: []int{1, 2},
 		},
-		oasis.SentryFixture{
+		{
 			StorageWorkers: []int{0},
 		},
-		oasis.SentryFixture{
+		{
 			StorageWorkers: []int{1},
 		},
-		oasis.SentryFixture{
+		{
 			KeymanagerWorkers: []int{0},
 		},
 	}
 
 	f.Validators = []oasis.ValidatorFixture{
-		oasis.ValidatorFixture{
+		{
 			Entity:                     1,
 			LogWatcherHandlerFactories: ValidatorExtraLogWatcherHandlerFactories,
 			Sentries:                   []int{0, 1},
 		},
-		oasis.ValidatorFixture{
+		{
 			Entity:                     1,
 			LogWatcherHandlerFactories: ValidatorExtraLogWatcherHandlerFactories,
 			Sentries:                   []int{2},
 		},
-		oasis.ValidatorFixture{
+		{
 			Entity:                     1,
 			LogWatcherHandlerFactories: ValidatorExtraLogWatcherHandlerFactories,
 			Sentries:                   []int{2},
@@ -108,12 +132,15 @@ func (s *sentryImpl) Fixture() (*oasis.NetworkFixture, error) {
 	}
 
 	f.StorageWorkers = []oasis.StorageWorkerFixture{
-		oasis.StorageWorkerFixture{
+		{
 			Backend:  database.BackendNameBadgerDB,
 			Entity:   1,
 			Sentries: []int{3},
+			// Disable cert rotation on one of the storage nodes so we can use
+			// its TLS keys in the access control sanity checks.
+			DisableCertRotation: true,
 		},
-		oasis.StorageWorkerFixture{
+		{
 			Backend:  database.BackendNameBadgerDB,
 			Entity:   1,
 			Sentries: []int{4},
@@ -121,7 +148,7 @@ func (s *sentryImpl) Fixture() (*oasis.NetworkFixture, error) {
 	}
 
 	f.Keymanagers = []oasis.KeymanagerFixture{
-		oasis.KeymanagerFixture{
+		{
 			Runtime:  0,
 			Entity:   1,
 			Sentries: []int{5},
@@ -129,4 +156,247 @@ func (s *sentryImpl) Fixture() (*oasis.NetworkFixture, error) {
 	}
 
 	return f, nil
+}
+
+func (s *sentryImpl) dial(address string, clientOpts *cmnGrpc.ClientOptions, skipClientAuth bool) (*grpc.ClientConn, error) {
+	var creds credentials.TransportCredentials
+	var err error
+	switch skipClientAuth {
+	case false:
+		creds, err = cmnGrpc.NewClientCreds(clientOpts)
+	case true:
+		creds, err = advancedtls.NewClientCreds(&advancedtls.ClientOptions{
+			Certificates:         clientOpts.Certificates,
+			GetClientCertificate: clientOpts.GetClientCertificate,
+			VType:                advancedtls.SkipVerification,
+			VerifyPeer: func(params *advancedtls.VerificationFuncParams) (*advancedtls.VerificationResults, error) {
+				return &advancedtls.VerificationResults{}, nil
+			},
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+	opts := grpc.WithTransportCredentials(creds)
+	conn, err := cmnGrpc.Dial(address, opts) // nolint: staticcheck
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (s *sentryImpl) loadNodeIdentity(dataDir string) (*identity.Identity, error) {
+	nodeSignerFactory, err := fileSigner.NewFactory(dataDir, signature.SignerNode, signature.SignerP2P, signature.SignerConsensus)
+	if err != nil {
+		return nil, err
+	}
+	return identity.Load(dataDir, nodeSignerFactory)
+}
+
+func (s *sentryImpl) Run(childEnv *env.Env) error {
+	// Run the basic runtime test.
+	if err := s.runtimeImpl.Run(childEnv); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sanityChecksContextTimeout)
+	defer cancel()
+
+	// Load identities and addresses used in the sanity checks.
+	sentry0 := s.Net.Sentries()[0]
+	sentry0Address := sentry0.GetSentryControlAddress()
+
+	sentry4 := s.Net.Sentries()[4]
+	sentry4Address := sentry4.GetSentryAddress()
+
+	storage0 := s.Net.StorageWorkers()[0]
+	storage0Identity, err := s.loadNodeIdentity(storage0.DataDir())
+	if err != nil {
+		return fmt.Errorf("sentry: error loading storage node identity: %w", err)
+	}
+	// Make sure storage0 has disabled certificate rotation.
+	if !storage0Identity.DoNotRotateTLS {
+		return fmt.Errorf("sentry: storage-0 does not have disabled certificate rotation")
+	}
+
+	storage1 := s.Net.StorageWorkers()[1]
+	storage1Address := storage1.GetClientAddress()
+
+	validator0 := s.Net.Validators()[0]
+	validator0Identity, err := s.loadNodeIdentity(validator0.DataDir())
+	if err != nil {
+		return fmt.Errorf("sentry: error loading validator node identity: %w", err)
+	}
+
+	validator1 := s.Net.Validators()[1]
+	validator1Identity, err := s.loadNodeIdentity(validator1.DataDir())
+	if err != nil {
+		return fmt.Errorf("sentry: error loading validator node identity: %w", err)
+	}
+
+	// Sanity check sentry control endpoints. Only configured upstream nodes are
+	// allowed to access their corresponding sentry control endpoint.
+
+	// Check Sentry-0 control endpoint without client certificates.
+	opts := &cmnGrpc.ClientOptions{
+		CommonName: identity.CommonName,
+		ServerPubKeys: map[signature.PublicKey]bool{
+			sentry0.GetTLSPubKey(): true,
+		},
+		Certificates: []tls.Certificate{},
+	}
+	conn, err := s.dial(sentry0Address, opts, false)
+	if err != nil {
+		return fmt.Errorf("sentry: dial error: %w", err)
+	}
+	defer conn.Close()
+	sentry0Client := api.NewSentryClient(conn)
+	_, err = sentry0Client.GetAddresses(ctx)
+	s.Logger.Debug("sentry0.GetAddress without cert", "err", err)
+	if status.Code(err) != codes.PermissionDenied {
+		return errors.New("sentry0 control endpoint should deny connection without certificate")
+	}
+
+	// Check Sentry-0 control endpoint with Validator-1 client certificates.
+	opts = &cmnGrpc.ClientOptions{
+		CommonName: identity.CommonName,
+		ServerPubKeys: map[signature.PublicKey]bool{
+			sentry0.GetTLSPubKey(): true,
+		},
+		Certificates: []tls.Certificate{*validator1Identity.TLSSentryClientCertificate},
+	}
+	conn, err = s.dial(sentry0Address, opts, false)
+	if err != nil {
+		return fmt.Errorf("sentry: dial error: %w", err)
+	}
+	defer conn.Close()
+	sentry0Client = api.NewSentryClient(conn)
+	_, err = sentry0Client.GetAddresses(ctx)
+	s.Logger.Debug("sentry0.GetAddress with validator1 sentry cert", "err", err)
+	if status.Code(err) != codes.PermissionDenied {
+		return errors.New("sentry0 control endpoint should deny connection with validator1 certificate")
+	}
+
+	// Check Sentry-0 control endpoint with Validator-0 client certificates.
+	opts = &cmnGrpc.ClientOptions{
+		CommonName: identity.CommonName,
+		ServerPubKeys: map[signature.PublicKey]bool{
+			sentry0.GetTLSPubKey(): true,
+		},
+		Certificates: []tls.Certificate{*validator0Identity.TLSSentryClientCertificate},
+	}
+	conn, err = s.dial(sentry0Address, opts, false)
+	if err != nil {
+		return fmt.Errorf("sentry: dial error: %w", err)
+	}
+	defer conn.Close()
+	sentry0Client = api.NewSentryClient(conn)
+	_, err = sentry0Client.GetAddresses(ctx)
+	s.Logger.Debug("sentry0.GetAddress with validator0 sentry cert", "err", err)
+	if err != nil {
+		return errors.New("sentry0 control endpoint should allow connection with validator0 certificate")
+	}
+
+	// Sanity check storage endpoints. Only committee and configured upstream sentry nodes
+	// are allowed to access corresponding storage node write endpoints.
+
+	// Check Storage-1 endpoint with Validator-0 client certificates.
+	opts = &cmnGrpc.ClientOptions{
+		CommonName:    identity.CommonName,
+		ServerPubKeys: map[signature.PublicKey]bool{},
+		Certificates:  []tls.Certificate{*validator0Identity.TLSSentryClientCertificate},
+	}
+	// XXX: we need to skip client authentication of the server keys as storage-1 is using ephemeral
+	// tls keys which aren't known.
+	conn, err = s.dial(storage1Address, opts, true)
+	if err != nil {
+		return fmt.Errorf("sentry: dial error: %w", err)
+	}
+	defer conn.Close()
+	storage1Client := storage.NewStorageClient(conn)
+	_, err = storage1Client.GetCheckpoints(ctx, emptyGetCheckpointsReq)
+	s.Logger.Debug("storage1.GetCheckpoints with validator0 cert", "err", err)
+	if status.Code(err) != codes.PermissionDenied {
+		return errors.New("storage1 checkpoint endpoint should deny connection with validator0 certificate")
+	}
+
+	// Check Storage-1 endpoint with Storage-0 client certificates.
+	opts = &cmnGrpc.ClientOptions{
+		CommonName:    identity.CommonName,
+		ServerPubKeys: map[signature.PublicKey]bool{},
+		Certificates:  []tls.Certificate{*storage0Identity.GetTLSCertificate()},
+	}
+	// XXX: we need to skip client authentication of the server keys as storage-1 is using ephemeral
+	// tls keys which aren't known.
+	conn, err = s.dial(storage1Address, opts, true)
+	if err != nil {
+		return fmt.Errorf("sentry: dial error: %w", err)
+	}
+	defer conn.Close()
+	storage1Client = storage.NewStorageClient(conn)
+	_, err = storage1Client.GetCheckpoints(ctx, emptyGetCheckpointsReq)
+	s.Logger.Debug("storage1.GetCheckpoints with storage0 cert", "err", err)
+	if err != nil {
+		return errors.New("storage1 checkpoints endpoint should allow connection with storage0 certificate")
+	}
+
+	// Sanity check Sentry-4 storage endpoint. All nodes are allowed to access
+	// storage sentry read only endpoints. Only active storage committee nodes
+	// are nodes are allowed to access checkpoint endpoints.
+
+	// Check Sentry-4 storage endpoint with Validator-0 client certificates.
+	opts = &cmnGrpc.ClientOptions{
+		CommonName: identity.CommonName,
+		ServerPubKeys: map[signature.PublicKey]bool{
+			sentry4.GetTLSPubKey(): true,
+		},
+		Certificates: []tls.Certificate{*validator0Identity.TLSSentryClientCertificate},
+	}
+	conn, err = s.dial(sentry4Address, opts, false)
+	if err != nil {
+		return fmt.Errorf("sentry: dial error: %w", err)
+	}
+	defer conn.Close()
+	sentry4Client := storage.NewStorageClient(conn)
+	_, err = sentry4Client.SyncGet(ctx, &storage.GetRequest{})
+	s.Logger.Debug("sentry4.SyncGet with validator0 sentry cert", "err", err)
+	// XXX: since we make an invalid request the request does fail, but ensure
+	// it makes past access control.
+	if status.Code(err) == codes.PermissionDenied {
+		return errors.New("sentry4 storage read-only endpoint should allow connections with validator0 certificate")
+	}
+	_, err = sentry4Client.GetCheckpoints(ctx, emptyGetCheckpointsReq)
+	s.Logger.Debug("sentry4.SyncGet with validator0 sentry cert", "err", err)
+	if status.Code(err) != codes.PermissionDenied {
+		return errors.New("sentry4 storage checkpoint endpoint should deny connection with validator0 sentry certificate")
+	}
+
+	// Check Sentry-4 storage endpoint with Storage-0 client certificates.
+	opts = &cmnGrpc.ClientOptions{
+		CommonName: identity.CommonName,
+		ServerPubKeys: map[signature.PublicKey]bool{
+			sentry4.GetTLSPubKey(): true,
+		},
+		Certificates: []tls.Certificate{*storage0Identity.GetTLSCertificate()},
+	}
+	conn, err = s.dial(sentry4Address, opts, false)
+	if err != nil {
+		return fmt.Errorf("sentry: dial error: %w", err)
+	}
+	defer conn.Close()
+	sentry4Client = storage.NewStorageClient(conn)
+	_, err = sentry4Client.SyncGet(ctx, &storage.GetRequest{})
+	s.Logger.Debug("sentry4.SyncGet with storage0 cert", "err", err)
+	// XXX: since we make an invalid request the request does fail, but ensure
+	// it makes past access control.
+	if status.Code(err) == codes.PermissionDenied {
+		return errors.New("sentry4 storage read-only endpoint should allow connections with validator0 certificate")
+	}
+	_, err = sentry4Client.GetCheckpoints(ctx, emptyGetCheckpointsReq)
+	s.Logger.Debug("sentry4.GetCheckpoints with storage0 cert", "err", err)
+	if err != nil {
+		return errors.New("sentry4 storage checkpoints endpoint should allow connection with storage0 certificate")
+	}
+
+	return nil
 }

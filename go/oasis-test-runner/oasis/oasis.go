@@ -33,7 +33,6 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/log"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
-	"github.com/oasisprotocol/oasis-core/go/worker/registration"
 )
 
 const (
@@ -733,10 +732,6 @@ func (net *Network) startOasisNode(
 	args := append([]string{}, subCmd...)
 	args = append(args, baseArgs...)
 	args = append(args, extraArgs.vec...)
-
-	if !strings.HasPrefix(node.Name, "sentry-") && !strings.HasPrefix(node.Name, "ias-proxy") && len(net.byzantine) == 0 {
-		args = append(args, []string{"--" + registration.CfgRegistrationRotateCerts, "1"}...)
-	}
 
 	w, err := node.dir.NewLogWriter(logConsoleFile)
 	if err != nil {

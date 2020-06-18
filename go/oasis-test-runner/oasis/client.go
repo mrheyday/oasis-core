@@ -23,6 +23,7 @@ func (client *Client) startNode() error {
 	args := newArgBuilder().
 		debugDontBlameOasis().
 		debugAllowTestKeys().
+		workerCertificateRotation(true).
 		tendermintDebugDisableCheckTx(client.consensus.DisableCheckTx).
 		tendermintPrune(client.consensus.PruneNumKept).
 		tendermintCoreListenAddress(client.consensusPort).
