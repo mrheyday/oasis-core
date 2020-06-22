@@ -50,7 +50,7 @@ import (
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	"github.com/oasisprotocol/oasis-core/go/sentry"
-	sentryAPI "github.com/oasisprotocol/oasis-core/go/sentry/api"
+	sentryLocalBackend "github.com/oasisprotocol/oasis-core/go/sentry/localbackend"
 	stakingAPI "github.com/oasisprotocol/oasis-core/go/staking/api"
 	"github.com/oasisprotocol/oasis-core/go/storage"
 	storageAPI "github.com/oasisprotocol/oasis-core/go/storage/api"
@@ -114,7 +114,7 @@ type Node struct {
 	Upgrader upgradeAPI.Backend
 	Genesis  genesisAPI.Provider
 	Identity *identity.Identity
-	Sentry   sentryAPI.Backend
+	Sentry   sentryLocalBackend.LocalBackend
 	IAS      iasAPI.Endpoint
 
 	RuntimeRegistry runtimeRegistry.Registry

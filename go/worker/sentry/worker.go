@@ -12,6 +12,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/sentry/api"
+	sentry "github.com/oasisprotocol/oasis-core/go/sentry/localbackend"
 	workerGrpcSentry "github.com/oasisprotocol/oasis-core/go/worker/sentry/grpc"
 )
 
@@ -40,7 +41,7 @@ type Worker struct {
 
 	grpcWorker *workerGrpcSentry.Worker
 
-	backend api.Backend
+	backend sentry.LocalBackend
 
 	grpcServer *grpc.Server
 
@@ -119,7 +120,7 @@ func (w *Worker) Cleanup() {
 }
 
 // New creates a new sentry worker.
-func New(backend api.Backend, identity *identity.Identity) (*Worker, error) {
+func New(backend sentry.LocalBackend, identity *identity.Identity) (*Worker, error) {
 	w := &Worker{
 		enabled: Enabled(),
 		backend: backend,

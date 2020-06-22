@@ -276,8 +276,7 @@ func New(
 		return nil, err
 	}
 
-	grpcPolicyWatcher := policy.NewPolicyWatcher()
-	policyAPI.RegisterService(grpc.Server(), grpcPolicyWatcher)
+	grpcPolicyWatcher := policy.NewPolicyWatcher(cfg.SentryAddresses, identity)
 
 	return newWorker(
 		dataDir,

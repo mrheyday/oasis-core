@@ -7,11 +7,14 @@ import (
 	"sync"
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	cmnGrpc "github.com/oasisprotocol/oasis-core/go/common/grpc"
+	"github.com/oasisprotocol/oasis-core/go/common/grpc/policy"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/sentry/api"
+	"github.com/oasisprotocol/oasis-core/go/sentry/localbackend"
 	grpcSentry "github.com/oasisprotocol/oasis-core/go/worker/sentry/grpc"
 )
 
@@ -26,6 +29,8 @@ type backend struct {
 	identity  *identity.Identity
 
 	upstreamTLSPubKeys []signature.PublicKey
+
+	grpcPolicyCheckers map[cmnGrpc.ServiceName]*policy.DynamicRuntimePolicyChecker
 }
 
 func (b *backend) GetAddresses(ctx context.Context) (*api.SentryAddresses, error) {
@@ -82,19 +87,44 @@ func (b *backend) GetUpstreamTLSPubKeys(ctx context.Context) ([]signature.Public
 	return b.upstreamTLSPubKeys, nil
 }
 
+func (b *backend) UpdatePolicies(ctx context.Context, p api.ServicePolicies) error {
+	b.Lock()
+	defer b.Unlock()
+
+	b.grpcPolicyCheckers[p.Service] = policy.NewDynamicRuntimePolicyChecker(p.Service, nil)
+	for namespace, policy := range p.AccessPolicies {
+		b.grpcPolicyCheckers[p.Service].SetAccessPolicy(policy, namespace)
+	}
+
+	return nil
+}
+
+func (b *backend) GetPolicyChecker(ctx context.Context, service cmnGrpc.ServiceName) (*policy.DynamicRuntimePolicyChecker, error) {
+	b.RLock()
+	defer b.RUnlock()
+
+	p, ok := b.grpcPolicyCheckers[service]
+	if !ok {
+		return nil, fmt.Errorf("no policy checker defined for given service")
+	}
+
+	return p, nil
+}
+
 // New constructs a new sentry Backend instance.
 func New(
 	consensusBackend consensus.Backend,
 	identity *identity.Identity,
-) (api.Backend, error) {
+) (localbackend.LocalBackend, error) {
 	if consensusBackend == nil {
 		return nil, fmt.Errorf("sentry: consensus backend is nil")
 	}
 
 	b := &backend{
-		logger:    logging.GetLogger("sentry"),
-		consensus: consensusBackend,
-		identity:  identity,
+		logger:             logging.GetLogger("sentry"),
+		consensus:          consensusBackend,
+		identity:           identity,
+		grpcPolicyCheckers: make(map[cmnGrpc.ServiceName]*policy.DynamicRuntimePolicyChecker),
 	}
 
 	return b, nil
