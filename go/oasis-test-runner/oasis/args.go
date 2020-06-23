@@ -175,6 +175,22 @@ func (args *argBuilder) tendermintDebugAllowDuplicateIP() *argBuilder {
 	return args
 }
 
+func (args *argBuilder) tendermintStateSync(
+	consensusNodes []string,
+	trustHeight uint64,
+	trustHash string,
+) *argBuilder {
+	args.vec = append(args.vec,
+		"--"+tendermint.CfgConsensusStateSyncEnabled,
+		"--"+tendermint.CfgConsensusStateSyncTrustHeight, strconv.FormatUint(trustHeight, 10),
+		"--"+tendermint.CfgConsensusStateSyncTrustHash, trustHash,
+	)
+	for _, address := range consensusNodes {
+		args.vec = append(args.vec, "--"+tendermint.CfgConsensusStateSyncConsensusNode, address)
+	}
+	return args
+}
+
 func (args *argBuilder) storageBackend(backend string) *argBuilder {
 	args.vec = append(args.vec, []string{
 		"--" + storage.CfgBackend, backend,
