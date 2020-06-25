@@ -59,6 +59,8 @@ type RuntimeCfg struct { // nolint: maligned
 	AdmissionPolicy registry.RuntimeAdmissionPolicy
 	Staking         registry.RuntimeStakingParameters
 
+	NoAutoStart bool
+
 	Pruner RuntimePrunerCfg
 
 	ExcludeFromGenesis bool

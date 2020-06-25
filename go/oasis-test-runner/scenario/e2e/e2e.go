@@ -79,6 +79,7 @@ func RegisterScenarios() error {
 		// Runtime test.
 		Runtime,
 		RuntimeEncryption,
+		RuntimeUpgrade,
 		// Byzantine executor node.
 		ByzantineExecutorHonest,
 		ByzantineExecutorWrong,
