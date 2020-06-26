@@ -12,6 +12,8 @@ import (
 
 // Query is the staking query interface.
 type Query interface {
+	TokenSymbol(context.Context) (string, error)
+	TokenValue(context.Context) (*quantity.Quantity, error)
 	TotalSupply(context.Context) (*quantity.Quantity, error)
 	CommonPool(context.Context) (*quantity.Quantity, error)
 	LastBlockFees(context.Context) (*quantity.Quantity, error)
@@ -41,6 +43,14 @@ func (sf *QueryFactory) QueryAt(ctx context.Context, height int64) (Query, error
 
 type stakingQuerier struct {
 	state *stakingState.ImmutableState
+}
+
+func (sq *stakingQuerier) TokenSymbol(ctx context.Context) (string, error) {
+	return sq.state.TokenSymbol(ctx)
+}
+
+func (sq *stakingQuerier) TokenValue(ctx context.Context) (*quantity.Quantity, error) {
+	return sq.state.TokenValue(ctx)
 }
 
 func (sq *stakingQuerier) TotalSupply(ctx context.Context) (*quantity.Quantity, error) {

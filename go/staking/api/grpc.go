@@ -14,6 +14,10 @@ var (
 	// serviceName is the gRPC service name.
 	serviceName = cmnGrpc.NewServiceName("Staking")
 
+	// methodTokenSymbol is the TokenSymbol method.
+	methodTokenSymbol = serviceName.NewMethod("TokenSymbol", int64(0))
+	// methodTokenValue is the TokenValue method.
+	methodTokenValue = serviceName.NewMethod("TokenValue", int64(0))
 	// methodTotalSupply is the TotalSupply method.
 	methodTotalSupply = serviceName.NewMethod("TotalSupply", int64(0))
 	// methodCommonPool is the CommonPool method.
@@ -51,6 +55,14 @@ var (
 		ServiceName: string(serviceName),
 		HandlerType: (*Backend)(nil),
 		Methods: []grpc.MethodDesc{
+			{
+				MethodName: methodTokenSymbol.ShortName(),
+				Handler:    handlerTokenSymbol,
+			},
+			{
+				MethodName: methodTokenValue.ShortName(),
+				Handler:    handlerTokenValue,
+			},
 			{
 				MethodName: methodTotalSupply.ShortName(),
 				Handler:    handlerTotalSupply,
@@ -120,6 +132,52 @@ var (
 		},
 	}
 )
+
+func handlerTokenSymbol( // nolint: golint
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var height int64
+	if err := dec(&height); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).TokenSymbol(ctx, height)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodTokenSymbol.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(Backend).TokenSymbol(ctx, req.(int64))
+	}
+	return interceptor(ctx, height, info, handler)
+}
+
+func handlerTokenValue( // nolint: golint
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var height int64
+	if err := dec(&height); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).TokenValue(ctx, height)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodTokenValue.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(Backend).TokenValue(ctx, req.(int64))
+	}
+	return interceptor(ctx, height, info, handler)
+}
 
 func handlerTotalSupply( // nolint: golint
 	srv interface{},
@@ -493,6 +551,22 @@ func RegisterService(server *grpc.Server, service Backend) {
 
 type stakingClient struct {
 	conn *grpc.ClientConn
+}
+
+func (c *stakingClient) TokenSymbol(ctx context.Context, height int64) (string, error) {
+	var rsp string
+	if err := c.conn.Invoke(ctx, methodTokenSymbol.FullName(), height, &rsp); err != nil {
+		return "", err
+	}
+	return rsp, nil
+}
+
+func (c *stakingClient) TokenValue(ctx context.Context, height int64) (*quantity.Quantity, error) {
+	var rsp quantity.Quantity
+	if err := c.conn.Invoke(ctx, methodTokenValue.FullName(), height, &rsp); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
 }
 
 func (c *stakingClient) TotalSupply(ctx context.Context, height int64) (*quantity.Quantity, error) {

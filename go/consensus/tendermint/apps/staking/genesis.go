@@ -24,6 +24,26 @@ func (app *stakingApplication) initParameters(ctx *abciAPI.Context, state *staki
 	return nil
 }
 
+func (app *stakingApplication) initTokenSymbol(ctx *abciAPI.Context, state *stakingState.MutableState, st *staking.Genesis) error {
+	if err := state.SetTokenSymbol(ctx, st.TokenSymbol); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to set token symbol: %w", err)
+	}
+
+	return nil
+}
+
+func (app *stakingApplication) initTokenValue(ctx *abciAPI.Context, state *stakingState.MutableState, st *staking.Genesis) error {
+	if !st.TokenValue.IsValid() {
+		return fmt.Errorf("tendermint/staking: invalid genesis state TokenValue")
+	}
+
+	if err := state.SetTokenValue(ctx, &st.TokenValue); err != nil {
+		return fmt.Errorf("tendermint/staking: failed to set token value: %w", err)
+	}
+
+	return nil
+}
+
 func (app *stakingApplication) initCommonPool(ctx *abciAPI.Context, st *staking.Genesis, totalSupply *quantity.Quantity) error {
 	if !st.CommonPool.IsValid() {
 		return fmt.Errorf("tendermint/staking: invalid genesis state CommonPool")
@@ -281,6 +301,14 @@ func (app *stakingApplication) InitChain(ctx *abciAPI.Context, request types.Req
 		return err
 	}
 
+	if err := app.initTokenSymbol(ctx, state, st); err != nil {
+		return err
+	}
+
+	if err := app.initTokenValue(ctx, state, st); err != nil {
+		return err
+	}
+
 	if err := app.initCommonPool(ctx, st, &totalSupply); err != nil {
 		return err
 	}
@@ -315,6 +343,16 @@ func (app *stakingApplication) InitChain(ctx *abciAPI.Context, request types.Req
 
 // Genesis exports current state in genesis format.
 func (sq *stakingQuerier) Genesis(ctx context.Context) (*staking.Genesis, error) {
+	tokenSymbol, err := sq.state.TokenSymbol(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	tokenValue, err := sq.state.TokenValue(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	totalSupply, err := sq.state.TotalSupply(ctx)
 	if err != nil {
 		return nil, err
@@ -363,6 +401,8 @@ func (sq *stakingQuerier) Genesis(ctx context.Context) (*staking.Genesis, error)
 
 	gen := staking.Genesis{
 		Parameters:           *params,
+		TokenSymbol:          tokenSymbol,
+		TokenValue:           *tokenValue,
 		TotalSupply:          *totalSupply,
 		CommonPool:           *commonPool,
 		LastBlockFees:        *lastBlockFees,

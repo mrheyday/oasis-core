@@ -36,6 +36,14 @@ var (
 	//
 	// Value is a CBOR-serialized account address.
 	accountKeyFmt = keyformat.New(0x50, &staking.Address{})
+	// tokenSymbolKeyFmt is the key format used for the token's ticker symbol.
+	//
+	// Value is a CBOR-serialized string.
+	tokenSymbolKeyFmt = keyformat.New(0xE0)
+	// tokenValueKeyFmt is the key format used for the token's value in base units.
+	//
+	// Value is a CBOR-serialized quantity.
+	tokenValueKeyFmt = keyformat.New(0xE1)
 	// totalSupplyKeyFmt is the key format used for the total supply.
 	//
 	// Value is a CBOR-serialized quantity.
@@ -78,6 +86,38 @@ var (
 // ImmutableState is the immutable staking state wrapper.
 type ImmutableState struct {
 	is *abciAPI.ImmutableState
+}
+
+func (s *ImmutableState) TokenSymbol(ctx context.Context) (string, error) {
+	value, err := s.is.Get(ctx, tokenSymbolKeyFmt.Encode())
+	if err != nil {
+		return "", abciAPI.UnavailableStateError(err)
+	}
+	if value == nil {
+		return "", nil
+	}
+
+	var str string
+	if err := cbor.Unmarshal(value, &str); err != nil {
+		return "", abciAPI.UnavailableStateError(err)
+	}
+	return str, nil
+}
+
+func (s *ImmutableState) TokenValue(ctx context.Context) (*quantity.Quantity, error) {
+	value, err := s.is.Get(ctx, tokenValueKeyFmt.Encode())
+	if err != nil {
+		return nil, abciAPI.UnavailableStateError(err)
+	}
+	if value == nil {
+		return &quantity.Quantity{}, nil
+	}
+
+	var q quantity.Quantity
+	if err := cbor.Unmarshal(value, &q); err != nil {
+		return nil, abciAPI.UnavailableStateError(err)
+	}
+	return &q, nil
 }
 
 func (s *ImmutableState) TotalSupply(ctx context.Context) (*quantity.Quantity, error) {
@@ -521,6 +561,16 @@ type MutableState struct {
 
 func (s *MutableState) SetAccount(ctx context.Context, addr staking.Address, account *staking.Account) error {
 	err := s.ms.Insert(ctx, accountKeyFmt.Encode(&addr), cbor.Marshal(account))
+	return abciAPI.UnavailableStateError(err)
+}
+
+func (s *MutableState) SetTokenSymbol(ctx context.Context, str string) error {
+	err := s.ms.Insert(ctx, tokenSymbolKeyFmt.Encode(), cbor.Marshal(str))
+	return abciAPI.UnavailableStateError(err)
+}
+
+func (s *MutableState) SetTokenValue(ctx context.Context, q *quantity.Quantity) error {
+	err := s.ms.Insert(ctx, tokenValueKeyFmt.Encode(), cbor.Marshal(q))
 	return abciAPI.UnavailableStateError(err)
 }
 

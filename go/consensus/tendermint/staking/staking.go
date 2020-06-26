@@ -38,6 +38,24 @@ type tendermintBackend struct {
 	closedCh chan struct{}
 }
 
+func (tb *tendermintBackend) TokenSymbol(ctx context.Context, height int64) (string, error) {
+	q, err := tb.querier.QueryAt(ctx, height)
+	if err != nil {
+		return "", err
+	}
+
+	return q.TokenSymbol(ctx)
+}
+
+func (tb *tendermintBackend) TokenValue(ctx context.Context, height int64) (*quantity.Quantity, error) {
+	q, err := tb.querier.QueryAt(ctx, height)
+	if err != nil {
+		return nil, err
+	}
+
+	return q.TokenValue(ctx)
+}
+
 func (tb *tendermintBackend) TotalSupply(ctx context.Context, height int64) (*quantity.Quantity, error) {
 	q, err := tb.querier.QueryAt(ctx, height)
 	if err != nil {

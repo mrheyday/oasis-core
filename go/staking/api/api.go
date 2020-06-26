@@ -82,6 +82,12 @@ var (
 
 // Backend is a staking implementation.
 type Backend interface {
+	// TokenSymbol returns the token's ticker symbol.
+	TokenSymbol(ctx context.Context, height int64) (string, error)
+
+	// TokenValue returns the token's value in base units.
+	TokenValue(ctx context.Context, height int64) (*quantity.Quantity, error)
+
 	// TotalSupply returns the total number of base units.
 	TotalSupply(ctx context.Context, height int64) (*quantity.Quantity, error)
 
@@ -647,6 +653,10 @@ type DebondingDelegation struct {
 type Genesis struct {
 	Parameters ConsensusParameters `json:"params"`
 
+	// TokenSymbol is the token's ticker symbol.
+	TokenSymbol string `json:"token_symbol"`
+	// TokenValue is the token's value in base units.
+	TokenValue    quantity.Quantity `json:"token_value"`
 	TotalSupply   quantity.Quantity `json:"total_supply"`
 	CommonPool    quantity.Quantity `json:"common_pool"`
 	LastBlockFees quantity.Quantity `json:"last_block_fees"`
