@@ -67,7 +67,7 @@ func (oversized) Run(
 			Data []byte          `json:"xfer_data"`
 		}
 		xfer := customTransfer{
-			// Send zero tokens to self, so the transaction will be valid.
+			// Send zero stake to self, so the transaction will be valid.
 			To: txSignerAddr,
 			// Include some extra random data so we are over the MaxTxSize limit.
 			Data: make([]byte, genesisDoc.Consensus.Parameters.MaxTxSize),

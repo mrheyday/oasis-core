@@ -107,9 +107,9 @@ func AuthenticateAndPayFees(
 	// Emit transfer event if fee is non-zero.
 	if !fee.Amount.IsZero() {
 		ev := cbor.Marshal(&staking.TransferEvent{
-			From:   addr,
-			To:     staking.FeeAccumulatorAddress,
-			Tokens: fee.Amount,
+			From:      addr,
+			To:        staking.FeeAccumulatorAddress,
+			BaseUnits: fee.Amount,
 		})
 		ctx.EmitEvent(abciAPI.NewEventBuilder(AppName).Attribute(KeyTransfer, ev))
 	}

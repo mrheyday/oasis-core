@@ -80,9 +80,9 @@ var (
 	}
 )
 
-// Backend is a staking token implementation.
+// Backend is a staking implementation.
 type Backend interface {
-	// TotalSupply returns the total number of tokens.
+	// TotalSupply returns the total number of base units.
 	TotalSupply(ctx context.Context, height int64) (*quantity.Quantity, error)
 
 	// CommonPool returns the common pool balance.
@@ -119,11 +119,12 @@ type Backend interface {
 	// on all balance transfers.
 	WatchTransfers(ctx context.Context) (<-chan *TransferEvent, pubsub.ClosableSubscription, error)
 
-	// WatchBurns returns a channel of BurnEvent on token destruction.
+	// WatchBurns returns a channel that produces a stream of BurnEvent when
+	// base units destructed.
 	WatchBurns(ctx context.Context) (<-chan *BurnEvent, pubsub.ClosableSubscription, error)
 
 	// WatchEscrows returns a channel that produces a stream of EscrowEvent
-	// when entities add to their escrow balance, get tokens deducted from
+	// when entities add to their escrow balance, get base units deducted from
 	// their escrow balance, and have their escrow balance released into their
 	// general balance.
 	WatchEscrows(ctx context.Context) (<-chan *EscrowEvent, pubsub.ClosableSubscription, error)
@@ -150,18 +151,18 @@ type OwnerQuery struct {
 	Owner  Address `json:"owner"`
 }
 
-// TransferEvent is the event emitted when a balance is transfered, either by
+// TransferEvent is the event emitted when a balance is transferred, either by
 // a call to Transfer or Withdraw.
 type TransferEvent struct {
-	From   Address           `json:"from"`
-	To     Address           `json:"to"`
-	Tokens quantity.Quantity `json:"tokens"`
+	From      Address           `json:"from"`
+	To        Address           `json:"to"`
+	BaseUnits quantity.Quantity `json:"base_units"`
 }
 
-// BurnEvent is the event emitted when tokens are destroyed via a call to Burn.
+// BurnEvent is the event emitted when base units are destroyed via a call to Burn.
 type BurnEvent struct {
-	Owner  Address           `json:"owner"`
-	Tokens quantity.Quantity `json:"tokens"`
+	Owner     Address           `json:"owner"`
+	BaseUnits quantity.Quantity `json:"base_units"`
 }
 
 // EscrowEvent is an escrow event.
@@ -181,33 +182,33 @@ type Event struct {
 	Escrow   *EscrowEvent   `json:"escrow,omitempty"`
 }
 
-// AddEscrowEvent is the event emitted when a balance is transfered into
-// an escrow balance.
+// AddEscrowEvent is the event emitted when a balance is transferred into an
+// escrow balance.
 type AddEscrowEvent struct {
-	Owner  Address           `json:"owner"`
-	Escrow Address           `json:"escrow"`
-	Tokens quantity.Quantity `json:"tokens"`
+	Owner     Address           `json:"owner"`
+	Escrow    Address           `json:"escrow"`
+	BaseUnits quantity.Quantity `json:"base_units"`
 }
 
-// TakeEscrowEvent is the event emitted when balance is deducted from an
-// escrow balance (stake is slashed).
+// TakeEscrowEvent is the event emitted when balance is deducted from an escrow
+// balance (stake is slashed).
 type TakeEscrowEvent struct {
-	Owner  Address           `json:"owner"`
-	Tokens quantity.Quantity `json:"tokens"`
+	Owner     Address           `json:"owner"`
+	BaseUnits quantity.Quantity `json:"base_units"`
 }
 
-// ReclaimEscrowEvent is the event emitted when tokens are reclaimed from an
+// ReclaimEscrowEvent is the event emitted when base units are reclaimed from an
 // escrow balance back into the entity's general balance.
 type ReclaimEscrowEvent struct {
-	Owner  Address           `json:"owner"`
-	Escrow Address           `json:"escrow"`
-	Tokens quantity.Quantity `json:"tokens"`
+	Owner     Address           `json:"owner"`
+	Escrow    Address           `json:"escrow"`
+	BaseUnits quantity.Quantity `json:"base_units"`
 }
 
-// Transfer is a token transfer.
+// Transfer is a base unit transfer.
 type Transfer struct {
-	To     Address           `json:"xfer_to"`
-	Tokens quantity.Quantity `json:"xfer_tokens"`
+	To        Address           `json:"xfer_to"`
+	BaseUnits quantity.Quantity `json:"xfer_base_units"`
 }
 
 // NewTransferTx creates a new transfer transaction.
@@ -215,9 +216,9 @@ func NewTransferTx(nonce uint64, fee *transaction.Fee, xfer *Transfer) *transact
 	return transaction.NewTransaction(nonce, fee, MethodTransfer, xfer)
 }
 
-// Burn is a token burn (destruction).
+// Burn is a base unit burn (destruction).
 type Burn struct {
-	Tokens quantity.Quantity `json:"burn_tokens"`
+	BaseUnits quantity.Quantity `json:"burn_base_units"`
 }
 
 // NewBurnTx creates a new burn transaction.
@@ -225,10 +226,10 @@ func NewBurnTx(nonce uint64, fee *transaction.Fee, burn *Burn) *transaction.Tran
 	return transaction.NewTransaction(nonce, fee, MethodBurn, burn)
 }
 
-// Escrow is a token escrow.
+// Escrow is a base unit escrow.
 type Escrow struct {
-	Account Address           `json:"escrow_account"`
-	Tokens  quantity.Quantity `json:"escrow_tokens"`
+	Account   Address           `json:"escrow_account"`
+	BaseUnits quantity.Quantity `json:"escrow_base_units"`
 }
 
 // NewAddEscrowTx creates a new add escrow transaction.
@@ -236,7 +237,7 @@ func NewAddEscrowTx(nonce uint64, fee *transaction.Fee, escrow *Escrow) *transac
 	return transaction.NewTransaction(nonce, fee, MethodAddEscrow, escrow)
 }
 
-// ReclaimEscrow is a token escrow reclamation.
+// ReclaimEscrow is a base unit escrow reclamation.
 type ReclaimEscrow struct {
 	Account Address           `json:"escrow_account"`
 	Shares  quantity.Quantity `json:"reclaim_shares"`
@@ -264,8 +265,8 @@ type SharePool struct {
 	TotalShares quantity.Quantity `json:"total_shares,omitempty"`
 }
 
-// sharesForTokens computes the amount of shares for the given amount of tokens.
-func (p *SharePool) sharesForTokens(amount *quantity.Quantity) (*quantity.Quantity, error) {
+// sharesForStake computes the amount of shares for the given amount of base units.
+func (p *SharePool) sharesForStake(amount *quantity.Quantity) (*quantity.Quantity, error) {
 	if p.TotalShares.IsZero() {
 		// No existing shares, exchange rate is 1:1.
 		return amount.Clone(), nil
@@ -293,15 +294,15 @@ func (p *SharePool) sharesForTokens(amount *quantity.Quantity) (*quantity.Quanti
 	return q, nil
 }
 
-// Deposit moves tokens into the combined balance, raising the shares.
+// Deposit moves stake into the combined balance, raising the shares.
 // If an error occurs, the pool and affected accounts are left in an invalid state.
-func (p *SharePool) Deposit(shareDst, tokenSrc, tokenAmount *quantity.Quantity) error {
-	shares, err := p.sharesForTokens(tokenAmount)
+func (p *SharePool) Deposit(shareDst, stakeSrc, baseUnitsAmount *quantity.Quantity) error {
+	shares, err := p.sharesForStake(baseUnitsAmount)
 	if err != nil {
 		return err
 	}
 
-	if err = quantity.Move(&p.Balance, tokenSrc, tokenAmount); err != nil {
+	if err = quantity.Move(&p.Balance, stakeSrc, baseUnitsAmount); err != nil {
 		return err
 	}
 
@@ -316,16 +317,16 @@ func (p *SharePool) Deposit(shareDst, tokenSrc, tokenAmount *quantity.Quantity) 
 	return nil
 }
 
-// tokensForShares computes the amount of tokens for the given amount of shares.
-func (p *SharePool) tokensForShares(amount *quantity.Quantity) (*quantity.Quantity, error) {
+// stakeForShares computes the amount of base units for the given amount of shares.
+func (p *SharePool) stakeForShares(amount *quantity.Quantity) (*quantity.Quantity, error) {
 	if amount.IsZero() || p.Balance.IsZero() || p.TotalShares.IsZero() {
-		// No existing shares or no balance means no tokens.
+		// No existing shares or no balance means no base units.
 		return quantity.NewQuantity(), nil
 	}
 
 	// Exchange rate is based on issued shares and the total balance as:
 	//
-	//     tokens = shares * balance / total_shares
+	//     base_units = shares * balance / total_shares
 	//
 	q := amount.Clone()
 	// Multiply first.
@@ -339,10 +340,10 @@ func (p *SharePool) tokensForShares(amount *quantity.Quantity) (*quantity.Quanti
 	return q, nil
 }
 
-// Withdraw moves tokens out of the combined balance, reducing the shares.
+// Withdraw moves stake out of the combined balance, reducing the shares.
 // If an error occurs, the pool and affected accounts are left in an invalid state.
-func (p *SharePool) Withdraw(tokenDst, shareSrc, shareAmount *quantity.Quantity) error {
-	tokens, err := p.tokensForShares(shareAmount)
+func (p *SharePool) Withdraw(stakeDst, shareSrc, shareAmount *quantity.Quantity) error {
+	baseUnits, err := p.stakeForShares(shareAmount)
 	if err != nil {
 		return err
 	}
@@ -355,7 +356,7 @@ func (p *SharePool) Withdraw(tokenDst, shareSrc, shareAmount *quantity.Quantity)
 		return err
 	}
 
-	if err = quantity.Move(tokenDst, &p.Balance, tokens); err != nil {
+	if err = quantity.Move(stakeDst, &p.Balance, baseUnits); err != nil {
 		return err
 	}
 

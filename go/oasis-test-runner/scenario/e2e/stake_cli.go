@@ -111,7 +111,7 @@ func (sc *stakeCLIImpl) Run(childEnv *env.Env) error {
 
 	cli := cli.New(childEnv, sc.Net, sc.Logger)
 
-	// General token info.
+	// Common staking info.
 	if err := sc.getInfo(childEnv); err != nil {
 		return err
 	}
@@ -225,7 +225,7 @@ func (sc *stakeCLIImpl) testPubkey2Address(childEnv *env.Env, publicKeyText stri
 	return nil
 }
 
-// testTransfer tests transfer of transferAmount tokens from src to dst.
+// testTransfer tests transfer of transferAmount base units from src to dst.
 func (sc *stakeCLIImpl) testTransfer(childEnv *env.Env, cli *cli.Helpers, src api.Address, dst api.Address) error {
 	transferTxPath := filepath.Join(childEnv.Dir(), "stake_transfer.json")
 	if err := sc.genTransferTx(childEnv, transferAmount, 0, dst, transferTxPath); err != nil {
@@ -262,7 +262,7 @@ func (sc *stakeCLIImpl) testTransfer(childEnv *env.Env, cli *cli.Helpers, src ap
 	return nil
 }
 
-// testBurn tests burning of burnAmount tokens owned by src.
+// testBurn tests burning of burnAmount base units owned by src.
 func (sc *stakeCLIImpl) testBurn(childEnv *env.Env, cli *cli.Helpers, src api.Address) error {
 	burnTxPath := filepath.Join(childEnv.Dir(), "stake_burn.json")
 	if err := sc.genBurnTx(childEnv, burnAmount, 1, burnTxPath); err != nil {
@@ -290,7 +290,7 @@ func (sc *stakeCLIImpl) testBurn(childEnv *env.Env, cli *cli.Helpers, src api.Ad
 	return nil
 }
 
-// testEscrow tests escrowing escrowAmount tokens from src to dst.
+// testEscrow tests escrowing escrowAmount base units from src to dst.
 func (sc *stakeCLIImpl) testEscrow(childEnv *env.Env, cli *cli.Helpers, src api.Address, escrow api.Address) error {
 	escrowTxPath := filepath.Join(childEnv.Dir(), "stake_escrow.json")
 	if err := sc.genEscrowTx(childEnv, escrowAmount, 2, escrow, escrowTxPath); err != nil {
@@ -340,7 +340,7 @@ func (sc *stakeCLIImpl) testReclaimEscrow(childEnv *env.Env, cli *cli.Helpers, s
 		return fmt.Errorf("failed to set epoch: %w", err)
 	}
 
-	// Since we are the only ones who put tokens into the escrow account and there was no slashing,
+	// Since we are the only ones who put stake into the escrow account and there was no slashing,
 	// we can expect the reclaimed escrow amount to equal the number of reclaimed escrow shares.
 	var reclaimEscrowAmount int64 = reclaimEscrowShares
 	if err := sc.checkBalance(childEnv, src, initBalance-transferAmount-burnAmount-escrowAmount+reclaimEscrowAmount-4*feeAmount); err != nil {
@@ -400,7 +400,7 @@ func (sc *stakeCLIImpl) testAmendCommissionSchedule(childEnv *env.Env, cli *cli.
 }
 
 func (sc *stakeCLIImpl) getInfo(childEnv *env.Env) error {
-	sc.Logger.Info("querying common token info")
+	sc.Logger.Info("querying common staking info")
 	args := []string{
 		"stake", "info",
 		"--" + grpc.CfgAddress, "unix:" + sc.Net.Validators()[0].SocketPath(),
@@ -408,7 +408,7 @@ func (sc *stakeCLIImpl) getInfo(childEnv *env.Env) error {
 
 	out, err := cli.RunSubCommandWithOutput(childEnv, sc.Logger, "info", sc.Net.Config().NodeBinary, args)
 	if err != nil {
-		return fmt.Errorf("failed to query common token info: error: %w output: %s", err, out.String())
+		return fmt.Errorf("failed to query common staking info: error: %w output: %s", err, out.String())
 	}
 	return nil
 }

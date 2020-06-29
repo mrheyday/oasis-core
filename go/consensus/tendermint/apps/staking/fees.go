@@ -78,9 +78,9 @@ func (app *stakingApplication) disburseFeesP(
 
 		// Emit transfer event.
 		evt := &staking.TransferEvent{
-			From:   staking.FeeAccumulatorAddress,
-			To:     proposerAddr,
-			Tokens: *feeProposerAmt,
+			From:      staking.FeeAccumulatorAddress,
+			To:        proposerAddr,
+			BaseUnits: *feeProposerAmt,
 		}
 		ctx.EmitEvent(abciAPI.NewEventBuilder(app.Name()).Attribute(KeyTransfer, cbor.Marshal(evt)))
 	}
@@ -101,9 +101,9 @@ func (app *stakingApplication) disburseFeesP(
 
 		// Emit transfer event.
 		evt := &staking.TransferEvent{
-			From:   staking.FeeAccumulatorAddress,
-			To:     staking.CommonPoolAddress,
-			Tokens: *remaining,
+			From:      staking.FeeAccumulatorAddress,
+			To:        staking.CommonPoolAddress,
+			BaseUnits: *remaining,
 		}
 		ctx.EmitEvent(abciAPI.NewEventBuilder(app.Name()).Attribute(KeyTransfer, cbor.Marshal(evt)))
 	}
@@ -194,9 +194,9 @@ func (app *stakingApplication) disburseFeesVQ(
 
 		// Emit transfer event.
 		evt := &staking.TransferEvent{
-			From:   staking.FeeAccumulatorAddress,
-			To:     proposerAddr,
-			Tokens: *nextProposerTotal,
+			From:      staking.FeeAccumulatorAddress,
+			To:        proposerAddr,
+			BaseUnits: *nextProposerTotal,
 		}
 		ctx.EmitEvent(abciAPI.NewEventBuilder(app.Name()).Attribute(KeyTransfer, cbor.Marshal(evt)))
 	}
@@ -218,9 +218,9 @@ func (app *stakingApplication) disburseFeesVQ(
 
 			// Emit transfer event.
 			evt := &staking.TransferEvent{
-				From:   staking.FeeAccumulatorAddress,
-				To:     voterAddr,
-				Tokens: *shareVote,
+				From:      staking.FeeAccumulatorAddress,
+				To:        voterAddr,
+				BaseUnits: *shareVote,
 			}
 			ctx.EmitEvent(abciAPI.NewEventBuilder(app.Name()).Attribute(KeyTransfer, cbor.Marshal(evt)))
 		}
@@ -242,9 +242,9 @@ func (app *stakingApplication) disburseFeesVQ(
 
 		// Emit transfer event.
 		evt := &staking.TransferEvent{
-			From:   staking.FeeAccumulatorAddress,
-			To:     staking.CommonPoolAddress,
-			Tokens: *remaining,
+			From:      staking.FeeAccumulatorAddress,
+			To:        staking.CommonPoolAddress,
+			BaseUnits: *remaining,
 		}
 		ctx.EmitEvent(abciAPI.NewEventBuilder(app.Name()).Attribute(KeyTransfer, cbor.Marshal(evt)))
 	}
