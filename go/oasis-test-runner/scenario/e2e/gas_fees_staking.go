@@ -9,6 +9,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
+	consensusGenesis "github.com/oasisprotocol/oasis-core/go/consensus/genesis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
@@ -63,10 +64,16 @@ func (sc *gasFeesImpl) Fixture() (*oasis.NetworkFixture, error) {
 
 	return &oasis.NetworkFixture{
 		Network: oasis.NetworkCfg{
-			NodeBinary:              f.Network.NodeBinary,
-			EpochtimeMock:           true,
-			StakingGenesis:          "tests/fixture-data/gas-fees/staking-genesis.json",
-			ConsensusGasCostsTxByte: 0, // So we can control gas more easily.
+			NodeBinary:     f.Network.NodeBinary,
+			EpochtimeMock:  true,
+			StakingGenesis: "tests/fixture-data/gas-fees/staking-genesis.json",
+			Consensus: consensusGenesis.Genesis{
+				Parameters: consensusGenesis.Parameters{
+					GasCosts: transaction.Costs{
+						consensusGenesis.GasOpTxByte: 0, // So we can control gas more easily.
+					},
+				},
+			},
 		},
 		Entities: []oasis.EntityCfg{
 			oasis.EntityCfg{IsDebugTestEntity: true},

@@ -6,9 +6,20 @@
     "network": {
         "node_binary": "oasis-node",
         "runtime_loader_binary": "oasis-core-runtime-loader",
-        "consensus_backend": "",
-        "consensus_timeout_commit": 1000000000,
-        "consensus_gas_costs_tx_byte": 0,
+        "consensus": {
+            "backend": "",
+            "params": {
+                "timeout_commit": 1000000000,
+                "skip_timeout_commit": false,
+                "empty_block_interval": 0,
+                "max_tx_size": 0,
+                "max_block_size": 0,
+                "max_block_gas": 0,
+                "max_evidence_age_blocks": 0,
+                "max_evidence_age_time": 0,
+                "state_checkpoint_interval": 0
+            }
+        },
         "halt_epoch": 18446744073709551615,
         "epochtime_mock": false,
         "epochtime_tendermint_interval": 0,
