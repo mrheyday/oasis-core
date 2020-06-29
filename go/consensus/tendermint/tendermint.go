@@ -1231,6 +1231,9 @@ func genesisToTendermint(d *genesisAPI.Document) (*tmtypes.GenesisDoc, error) {
 			Validator: tmproto.ValidatorParams{
 				PubKeyTypes: []string{tmtypes.ABCIPubKeyTypeEd25519},
 			},
+			Version: tmproto.VersionParams{
+				AppVersion: version.ConsensusProtocol.ToU64(),
+			},
 		},
 		AppState: b,
 	}
