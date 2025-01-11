@@ -2,6 +2,9 @@
 package migrations
 
 import (
+	"fmt"
+	"sync"
+
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	upgradeApi "github.com/oasisprotocol/oasis-core/go/upgrade/api"
 )
@@ -11,21 +14,30 @@ const (
 	ModuleName = "upgrade-migrations"
 )
 
-var registeredHandlers = map[string]Handler{
-	DummyUpgradeName: &dummyMigrationHandler{},
-}
+var (
+	registeredHandlers sync.Map
+
+	// ErrMissingMigrationHandler is error returned when a migration handler is not registered.
+	ErrMissingMigrationHandler = fmt.Errorf("missing migration handler")
+)
 
 // Handler is the interface used by migration handlers.
 type Handler interface {
+	// HasStartupUpgrade returns true iff the handler requires a startup upgrade.
+	HasStartupUpgrade() bool
+
 	// StartupUpgrade is called by the upgrade manager to perform
 	// the node startup portion of the upgrade.
-	StartupUpgrade(*Context) error
+	StartupUpgrade() error
 
 	// ConsensusUpgrade is called by the upgrade manager to perform
 	// the consensus portion of the upgrade. The interface argument is
 	// a private structure passed to Backend.ConsensusUpgrade by the
 	// consensus backend.
-	ConsensusUpgrade(*Context, interface{}) error
+	//
+	// This method will be called twice, once in BeginBlock and once in
+	// EndBlock.
+	ConsensusUpgrade(interface{}) error
 }
 
 // Context defines the common context used by migration handlers.
@@ -40,8 +52,13 @@ type Context struct {
 }
 
 // Register registers a new migration handler, by upgrade name.
-func Register(name string, handler Handler) {
-	registeredHandlers[name] = handler
+func Register(name upgradeApi.HandlerName, handler Handler) {
+	if err := name.ValidateBasic(); err != nil {
+		panic(fmt.Errorf("migration handler name error: %w", err))
+	}
+	if _, isRegistered := registeredHandlers.LoadOrStore(name, handler); isRegistered {
+		panic(fmt.Errorf("migration handler already registered: %s", name))
+	}
 }
 
 // NewContext returns a new upgrade migration context.
@@ -54,14 +71,11 @@ func NewContext(upgrade *upgradeApi.PendingUpgrade, dataDir string) *Context {
 }
 
 // GetHandler returns the handler associated with the upgrade described in the context.
-// If the handler does not exist, this is considered a severe programmer error and will result in a panic.
-func GetHandler(ctx *Context) Handler {
-	handler, ok := registeredHandlers[ctx.Upgrade.Descriptor.Name]
-	if !ok {
-		// If we got here, that means the upgrade descriptor checked out, including the upgrader hash.
-		// Nothing left to do but bite the dust.
-		panic("unknown upgrade name, no way forward")
+func GetHandler(name upgradeApi.HandlerName) (Handler, error) {
+	h, exists := registeredHandlers.Load(name)
+	if !exists {
+		return nil, ErrMissingMigrationHandler
 	}
 
-	return handler
+	return h.(Handler), nil
 }

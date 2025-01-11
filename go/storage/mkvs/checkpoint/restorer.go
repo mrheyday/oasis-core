@@ -23,16 +23,12 @@ type restorer struct {
 }
 
 // Implements Restorer.
-func (rs *restorer) StartRestore(ctx context.Context, checkpoint *Metadata) error {
+func (rs *restorer) StartRestore(_ context.Context, checkpoint *Metadata) error {
 	rs.Lock()
 	defer rs.Unlock()
 
 	if rs.currentCheckpoint != nil {
 		return ErrRestoreAlreadyInProgress
-	}
-
-	if err := rs.ndb.StartMultipartInsert(checkpoint.Root.Version); err != nil {
-		return err
 	}
 
 	rs.currentCheckpoint = checkpoint
@@ -44,14 +40,14 @@ func (rs *restorer) StartRestore(ctx context.Context, checkpoint *Metadata) erro
 	return nil
 }
 
-func (rs *restorer) AbortRestore(ctx context.Context) error {
+func (rs *restorer) AbortRestore(context.Context) error {
 	rs.Lock()
 	defer rs.Unlock()
 
 	rs.pendingChunks = nil
 	rs.currentCheckpoint = nil
 
-	return rs.ndb.AbortMultipartInsert()
+	return nil
 }
 
 func (rs *restorer) GetCurrentCheckpoint() *Metadata {

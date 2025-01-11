@@ -6,7 +6,6 @@ import (
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/errors"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
@@ -68,9 +67,6 @@ var (
 	ErrRootMustFollowOld = nodedb.ErrRootMustFollowOld
 	// ErrReadOnly indicates that the storage backend is read-only.
 	ErrReadOnly = nodedb.ErrReadOnly
-
-	// ReceiptSignatureContext is the signature context used for verifying MKVS receipts.
-	ReceiptSignatureContext = signature.NewContext("oasis-core/storage: receipt", signature.WithChainSeparation())
 )
 
 // Config is the storage backend configuration.
@@ -80,15 +76,6 @@ type Config struct { // nolint: maligned
 
 	// DB is the path to the database.
 	DB string
-
-	// Signer is the signing key to use for generating recipts.
-	Signer signature.Signer
-
-	// ApplyLockLRUSlots is the number of LRU slots to use for Apply call locks.
-	ApplyLockLRUSlots uint64
-
-	// InsecureSkipChecks bypasses the known root checks.
-	InsecureSkipChecks bool
 
 	// Namespace is the namespace contained within the database.
 	Namespace common.Namespace
@@ -133,52 +120,19 @@ type LogEntry = writelog.LogEntry
 // WriteLogIterator iterates over write log entries.
 type WriteLogIterator = writelog.Iterator
 
-// ReceiptBody is the body of a receipt.
-type ReceiptBody struct {
-	// Version is the storage data structure version.
-	Version uint16 `json:"version"`
-	// Namespace is the chain namespace under which the root(s) are stored.
-	Namespace common.Namespace `json:"ns"`
-	// Round is the chain round in which the root(s) are stored.
-	Round uint64 `json:"round"`
-	// Roots are the merkle roots of the merklized data structure that the
-	// storage node is certifying to store.
-	Roots []hash.Hash `json:"roots"`
-}
+// RootType is a storage root type.
+type RootType = mkvsNode.RootType
 
-// Receipt is a signed ReceiptBody.
-type Receipt struct {
-	signature.Signed
-}
-
-// Open first verifies the blob signature then unmarshals the blob.
-func (s *Receipt) Open(receipt *ReceiptBody) error {
-	return s.Signed.Open(ReceiptSignatureContext, receipt)
-}
-
-// SignReceipt signs a storage receipt for the given roots.
-func SignReceipt(signer signature.Signer, ns common.Namespace, round uint64, roots []hash.Hash) (*Receipt, error) {
-	if signer == nil {
-		return nil, ErrCantProve
-	}
-	if len(roots) == 0 {
-		return nil, ErrNoRoots
-	}
-	receipt := ReceiptBody{
-		Version:   1,
-		Namespace: ns,
-		Round:     round,
-		Roots:     roots,
-	}
-	signed, err := signature.SignSigned(signer, ReceiptSignatureContext, &receipt)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Receipt{
-		Signed: *signed,
-	}, nil
-}
+const (
+	// RootTypeInvalid is an invalid/uninitialized root type.
+	RootTypeInvalid = mkvsNode.RootTypeInvalid
+	// RootTypeState is the type for state storage roots.
+	RootTypeState = mkvsNode.RootTypeState
+	// RootTypeIO is the type for IO storage roots.
+	RootTypeIO = mkvsNode.RootTypeIO
+	// RootTypeMax is the number of different root types.
+	RootTypeMax = mkvsNode.RootTypeMax
+)
 
 // Root is a storage root.
 type Root = mkvsNode.Root
@@ -223,35 +177,15 @@ type Proof = syncer.Proof
 // NodeDB is a node database.
 type NodeDB = nodedb.NodeDB
 
-// ApplyOp is an apply operation within a batch of apply operations.
-type ApplyOp struct {
-	// SrcRound is the source root round.
-	SrcRound uint64 `json:"src_round"`
-	// SrcRoot is the merkle root to apply the operations against. It may
-	// refer to a nil node (empty hash) in which case a new root will be
-	// created.
-	SrcRoot hash.Hash `json:"src_root"`
-	// DstRoot is the expected merkle root after applying the write log.
-	DstRoot hash.Hash `json:"dst_root"`
-	// WriteLog is a write log of operations to apply.
-	WriteLog WriteLog `json:"writelog"`
-}
-
 // ApplyRequest is an Apply request.
 type ApplyRequest struct {
 	Namespace common.Namespace `json:"namespace"`
+	RootType  RootType         `json:"root_type"`
 	SrcRound  uint64           `json:"src_round"`
 	SrcRoot   hash.Hash        `json:"src_root"`
 	DstRound  uint64           `json:"dst_round"`
 	DstRoot   hash.Hash        `json:"dst_root"`
 	WriteLog  WriteLog         `json:"writelog"`
-}
-
-// ApplyBatchRequest is an ApplyBatch request.
-type ApplyBatchRequest struct {
-	Namespace common.Namespace `json:"namespace"`
-	DstRound  uint64           `json:"dst_round"`
-	Ops       []ApplyOp        `json:"ops"`
 }
 
 // SyncOptions are the sync options.
@@ -278,19 +212,6 @@ type Backend interface {
 	syncer.ReadSyncer
 	checkpoint.ChunkProvider
 
-	// Apply applies a set of operations against the MKVS.  The root may refer
-	// to a nil node, in which case a new root will be created.
-	// The expected new root is used to check if the new root after all the
-	// operations are applied already exists in the local DB.  If it does, the
-	// Apply is ignored.
-	Apply(ctx context.Context, request *ApplyRequest) ([]*Receipt, error)
-
-	// ApplyBatch applies multiple sets of operations against the MKVS and
-	// returns a single receipt covering all applied roots.
-	//
-	// See Apply for more details.
-	ApplyBatch(ctx context.Context, request *ApplyBatchRequest) ([]*Receipt, error)
-
 	// GetDiff returns an iterator of write log entries that must be applied
 	// to get from the first given root to the second one.
 	GetDiff(ctx context.Context, request *GetDiffRequest) (WriteLogIterator, error)
@@ -307,11 +228,25 @@ type Backend interface {
 type LocalBackend interface {
 	Backend
 
+	// Apply applies a set of operations against the MKVS.  The root may refer
+	// to a nil node, in which case a new root will be created.
+	// The expected new root is used to check if the new root after all the
+	// operations are applied already exists in the local DB.  If it does, the
+	// Apply is ignored.
+	Apply(ctx context.Context, request *ApplyRequest) error
+
 	// Checkpointer returns the checkpoint creator/restorer for this storage backend.
 	Checkpointer() checkpoint.CreateRestorer
 
 	// NodeDB returns the underlying node database.
 	NodeDB() nodedb.NodeDB
+}
+
+// WrappedLocalBackend is an interface implemented by storage backends that wrap a local storage
+// backend in order to support unwrapping.
+type WrappedLocalBackend interface {
+	// Unwrap returns the underlying local storage backend.
+	Unwrap() LocalBackend
 }
 
 // ClientBackend is a storage client backend implementation.
@@ -321,7 +256,10 @@ type ClientBackend interface {
 	// GetConnectedNodes returns currently connected storage nodes.
 	GetConnectedNodes() []*node.Node
 
-	// EnsureCommitteeVersion waits for the storage committee client to be fully synced to the
-	// given version.
+	// EnsureCommitteeVersion waits for the storage committee client to be fully
+	// synced to the given version.
+	//
+	// This method will error in case the storage-client is not configured to
+	// track a specific committee.
 	EnsureCommitteeVersion(ctx context.Context, version int64) error
 }

@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
@@ -34,12 +33,15 @@ var (
 const (
 	// iasAPISubscriptionKeyHeader is the header IAS V4 endpoint uses for client
 	// authentication.
-	iasAPISubscriptionKeyHeader = "Ocp-Apim-Subscription-Key"
-	iasAPITimeout               = 10 * time.Second
-	iasAPIProductionBaseURL     = "https://api.trustedservices.intel.com/sgx"
-	iasAPITestingBaseURL        = "https://api.trustedservices.intel.com/sgx/dev"
-	iasAPIAttestationReportPath = "/attestation/v4/report"
-	iasAPISigRLPath             = "/attestation/v4/sigrl/"
+	iasAPISubscriptionKeyHeader   = "Ocp-Apim-Subscription-Key"
+	iasAPITimeout                 = 10 * time.Second
+	iasAPIProductionBaseURL       = "https://api.trustedservices.intel.com/sgx"
+	iasAPITestingBaseURL          = "https://api.trustedservices.intel.com/sgx/dev"
+	iasAPIv4AttestationReportPath = "/attestation/v4/report"
+	iasAPIv5AttestationReportPath = "/attestation/v5/report"
+	iasAPISigRLPath               = "/attestation/v5/sigrl/"
+	iasAPIAVRTCBUpdateParam       = "update"
+	iasAPIAVRTCBUpdateValueEarly  = "early"
 )
 
 type httpEndpoint struct {
@@ -51,9 +53,18 @@ type httpEndpoint struct {
 	spidInfo api.SPIDInfo
 }
 
-func (e *httpEndpoint) doIASRequest(ctx context.Context, method, uPath, bodyType string, body io.Reader) (*http.Response, error) {
+func (e *httpEndpoint) doIASRequest(ctx context.Context, method, uPath, bodyType string, body io.Reader, query ...string) (*http.Response, error) {
 	u := *e.baseURL
 	u.Path = path.Join(u.Path, uPath)
+
+	if len(query)%2 != 0 {
+		return nil, fmt.Errorf("ias request error: invalid number of query parameter items")
+	}
+	queryValues := url.Values{}
+	for i := 0; i < len(query); i += 2 {
+		queryValues.Set(query[i], query[i+1])
+	}
+	u.RawQuery = queryValues.Encode()
 
 	req, err := http.NewRequest(method, u.String(), body)
 	if err != nil {
@@ -71,6 +82,7 @@ func (e *httpEndpoint) doIASRequest(ctx context.Context, method, uPath, bodyType
 	}
 	if resp.StatusCode != http.StatusOK {
 		logger.Error("ias response status error", "status", http.StatusText(resp.StatusCode), "method", method, "url", u)
+		resp.Body.Close()
 		return nil, fmt.Errorf("ias: response status error: %s", http.StatusText(resp.StatusCode))
 	}
 
@@ -93,6 +105,12 @@ func (e *httpEndpoint) VerifyEvidence(ctx context.Context, evidence *api.Evidenc
 		return nil, err
 	}
 
+	// Determine API version needed.
+	iasAPIAttestationReportPath := iasAPIv4AttestationReportPath
+	if evidence.EarlyTCBUpdate || evidence.MinTCBEvaluationDataNumber > 0 {
+		iasAPIAttestationReportPath = iasAPIv5AttestationReportPath
+	}
+
 	// Encode the payload in the format that IAS wants.
 	reqPayload, err := json.Marshal(&iasEvidencePayload{
 		ISVEnclaveQuote: evidence.Quote,
@@ -104,10 +122,11 @@ func (e *httpEndpoint) VerifyEvidence(ctx context.Context, evidence *api.Evidenc
 	}
 
 	// Dispatch the request via HTTP.
-	resp, err := e.doIASRequest(ctx, http.MethodPost, iasAPIAttestationReportPath, "application/json", bytes.NewReader(reqPayload))
-	if resp != nil {
-		defer resp.Body.Close()
+	query := []string{}
+	if evidence.EarlyTCBUpdate {
+		query = []string{iasAPIAVRTCBUpdateParam, iasAPIAVRTCBUpdateValueEarly}
 	}
+	resp, err := e.doIASRequest(ctx, http.MethodPost, iasAPIAttestationReportPath, "application/json", bytes.NewReader(reqPayload), query...)
 	if err != nil {
 		return nil, fmt.Errorf("ias: http POST failed: %w", err)
 	}
@@ -116,7 +135,7 @@ func (e *httpEndpoint) VerifyEvidence(ctx context.Context, evidence *api.Evidenc
 	// Extract the pertinent parts of the response.
 	sig := []byte(resp.Header.Get("X-IASReport-Signature"))
 	certChain := []byte(resp.Header.Get("X-IASReport-Signing-Certificate"))
-	avr, err := ioutil.ReadAll(resp.Body)
+	avr, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("ias: failed to read response body: %w", err)
 	}
@@ -133,7 +152,7 @@ func (e *httpEndpoint) VerifyEvidence(ctx context.Context, evidence *api.Evidenc
 	}, nil
 }
 
-func (e *httpEndpoint) GetSPIDInfo(ctx context.Context) (*api.SPIDInfo, error) {
+func (e *httpEndpoint) GetSPIDInfo(context.Context) (*api.SPIDInfo, error) {
 	return &e.spidInfo, nil
 }
 
@@ -144,15 +163,13 @@ func (e *httpEndpoint) GetSigRL(ctx context.Context, epidGID uint32) ([]byte, er
 	// Dispatch the request via HTTP.
 	p := path.Join(iasAPISigRLPath, hex.EncodeToString(gid[:]))
 	resp, err := e.doIASRequest(ctx, http.MethodGet, p, "", nil)
-	if resp != nil {
-		defer resp.Body.Close()
-	}
 	if err != nil {
 		return nil, fmt.Errorf("ias: http GET failed: %w", err)
 	}
+	defer resp.Body.Close()
 
 	// Extract and parse the SigRL.
-	sigRL, err := ioutil.ReadAll(resp.Body)
+	sigRL, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("ias: failed to read response body: %w", err)
 	}
@@ -179,7 +196,7 @@ type mockEndpoint struct {
 	spidInfo api.SPIDInfo
 }
 
-func (e *mockEndpoint) VerifyEvidence(ctx context.Context, evidence *api.Evidence) (*ias.AVRBundle, error) {
+func (e *mockEndpoint) VerifyEvidence(_ context.Context, evidence *api.Evidence) (*ias.AVRBundle, error) {
 	if len(evidence.Nonce) > ias.NonceMaxLen {
 		return nil, fmt.Errorf("ias: invalid nonce length")
 	}
@@ -194,11 +211,11 @@ func (e *mockEndpoint) VerifyEvidence(ctx context.Context, evidence *api.Evidenc
 	}, nil
 }
 
-func (e *mockEndpoint) GetSPIDInfo(ctx context.Context) (*api.SPIDInfo, error) {
+func (e *mockEndpoint) GetSPIDInfo(context.Context) (*api.SPIDInfo, error) {
 	return &e.spidInfo, nil
 }
 
-func (e *mockEndpoint) GetSigRL(ctx context.Context, epidGID uint32) ([]byte, error) {
+func (e *mockEndpoint) GetSigRL(context.Context, uint32) ([]byte, error) {
 	return nil, nil
 }
 

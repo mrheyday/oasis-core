@@ -1,27 +1,32 @@
 //! Deoxys-II-256-128 MRAE primitives implementation.
-
-pub use super::deoxysii_rust::{DeoxysII, KEY_SIZE, NONCE_SIZE, TAG_SIZE};
-
-use super::{
-    hmac::{Hmac, Mac, NewMac},
-    sha2::Sha512Trunc256,
-    x25519_dalek,
-};
-
 use anyhow::Result;
+use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
+use sha2::Sha512_256;
+use x25519_dalek::{PublicKey, StaticSecret};
 
-type Kdf = Hmac<Sha512Trunc256>;
+pub use deoxysii::{DeoxysII, KEY_SIZE, NONCE_SIZE, TAG_SIZE};
+
+type Kdf = Hmac<Sha512_256>;
+
+/// An abstract Deoxys-II-256-128 box opener.
+pub trait Opener: Send + Sync {
+    /// Unboxes ("opens") the provided additional data and ciphertext.
+    fn box_open(
+        &self,
+        nonce: &[u8; NONCE_SIZE],
+        ciphertext: Vec<u8>,
+        additional_data: Vec<u8>,
+        peers_public_key: &PublicKey,
+    ) -> Result<Vec<u8>>;
+}
 
 /// Derives a MRAE AEAD symmetric key suitable for use with the asymmetric
 /// box primitives from the provided X25519 public and private keys.
-fn derive_symmetric_key(public: &[u8; 32], private: &[u8; 32]) -> [u8; KEY_SIZE] {
-    let public = x25519_dalek::PublicKey::from(public.clone());
-    let private = x25519_dalek::StaticSecret::from(private.clone());
+fn derive_symmetric_key(public: &PublicKey, private: &StaticSecret) -> [u8; KEY_SIZE] {
+    let pmk = private.diffie_hellman(public);
 
-    let pmk = private.diffie_hellman(&public);
-
-    let mut kdf = Kdf::new_varkey(b"MRAE_Box_Deoxys-II-256-128").expect("Hmac::new_varkey");
+    let mut kdf = Kdf::new_from_slice(b"MRAE_Box_Deoxys-II-256-128").expect("Hmac::new_from_slice");
     kdf.update(pmk.as_bytes());
     drop(pmk);
 
@@ -34,13 +39,11 @@ fn derive_symmetric_key(public: &[u8; 32], private: &[u8; 32]) -> [u8; KEY_SIZE]
 
 /// Generates a public/private key pair suitable for use with
 /// `derive_symmetric_key`, `box_seal`, and `box_open`.
-pub fn generate_key_pair() -> ([u8; 32], [u8; 32]) {
-    let mut rng = OsRng {};
+pub fn generate_key_pair() -> (PublicKey, StaticSecret) {
+    let sk = StaticSecret::random_from_rng(OsRng);
+    let pk = PublicKey::from(&sk);
 
-    let sk = x25519_dalek::StaticSecret::new(&mut rng);
-    let pk = x25519_dalek::PublicKey::from(&sk);
-
-    (pk.as_bytes().clone(), sk.to_bytes())
+    (pk, sk)
 }
 
 /// Boxes ("seals") the provided additional data and plaintext via
@@ -52,8 +55,8 @@ pub fn box_seal(
     nonce: &[u8; NONCE_SIZE],
     plaintext: Vec<u8>,
     additional_data: Vec<u8>,
-    peers_public_key: &[u8; 32],
-    private_key: &[u8; 32],
+    peers_public_key: &PublicKey,
+    private_key: &StaticSecret,
 ) -> Result<Vec<u8>> {
     let key = derive_symmetric_key(peers_public_key, private_key);
 
@@ -71,8 +74,8 @@ pub fn box_open(
     nonce: &[u8; NONCE_SIZE],
     ciphertext: Vec<u8>,
     additional_data: Vec<u8>,
-    peers_public_key: &[u8; 32],
-    private_key: &[u8; 32],
+    peers_public_key: &PublicKey,
+    private_key: &StaticSecret,
 ) -> Result<Vec<u8>> {
     let key = derive_symmetric_key(peers_public_key, private_key);
 
@@ -96,10 +99,10 @@ mod tests {
         let (b_pub, b_priv) = generate_key_pair(); // Bob
 
         // None of the generated keys should be the same.
-        assert_ne!(a_pub, b_pub);
-        assert_ne!(a_priv, b_priv);
-        assert_ne!(a_pub, a_priv);
-        assert_ne!(b_pub, b_priv);
+        assert_ne!(a_pub.to_bytes(), b_pub.to_bytes());
+        assert_ne!(a_priv.to_bytes(), b_priv.to_bytes());
+        assert_ne!(a_pub.to_bytes(), a_priv.to_bytes());
+        assert_ne!(b_pub.to_bytes(), b_priv.to_bytes());
 
         // Should successfully seal the text in a box.
         let nonce = [1u8; NONCE_SIZE];

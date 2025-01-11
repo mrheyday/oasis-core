@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -23,6 +22,7 @@ import (
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdConsensus "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/consensus"
+	cmdContext "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/context"
 	cmdFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	cmdGrpc "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/grpc"
 	cmdSigner "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/signer"
@@ -30,10 +30,9 @@ import (
 )
 
 const (
-	cfgAllowEntitySignedNodes = "entity.debug.allow_entity_signed_nodes"
-	CfgNodeID                 = "entity.node.id"
-	CfgNodeDescriptor         = "entity.node.descriptor"
-	CfgReuseSigner            = "entity.reuse_signer"
+	CfgNodeID         = "entity.node.id"
+	CfgNodeDescriptor = "entity.node.descriptor"
+	CfgReuseSigner    = "entity.reuse_signer"
 
 	entityGenesisFilename = "entity_genesis.json"
 )
@@ -45,38 +44,44 @@ var (
 	registerOrDeregisterFlags = flag.NewFlagSet("", flag.ContinueOnError)
 
 	entityCmd = &cobra.Command{
-		Use:   "entity",
-		Short: "entity registry backend utilities",
+		Use:        "entity",
+		Short:      "entity registry backend utilities",
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	initCmd = &cobra.Command{
-		Use:   "init",
-		Short: "initialize an entity",
-		Run:   doInit,
+		Use:        "init",
+		Short:      "initialize an entity",
+		Run:        doInit,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	updateCmd = &cobra.Command{
-		Use:   "update",
-		Short: "update an entity",
-		Run:   doUpdate,
+		Use:        "update",
+		Short:      "update an entity",
+		Run:        doUpdate,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	registerCmd = &cobra.Command{
-		Use:   "gen_register",
-		Short: "generate a register entity transaction",
-		Run:   doGenRegister,
+		Use:        "gen_register",
+		Short:      "generate a register entity transaction",
+		Run:        doGenRegister,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	deregisterCmd = &cobra.Command{
-		Use:   "gen_deregister",
-		Short: "generate a deregister entity transaction",
-		Run:   doGenDeregister,
+		Use:        "gen_deregister",
+		Short:      "generate a deregister entity transaction",
+		Run:        doGenDeregister,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	listCmd = &cobra.Command{
-		Use:   "list",
-		Short: "list registered entities",
-		Run:   doList,
+		Use:        "list",
+		Short:      "list registered entities",
+		Run:        doList,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	logger = logging.GetLogger("cmd/registry/entity")
@@ -95,7 +100,7 @@ func doConnect(cmd *cobra.Command) (*grpc.ClientConn, registry.Backend) {
 	return conn, client
 }
 
-func doInit(cmd *cobra.Command, args []string) {
+func doInit(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -144,7 +149,7 @@ func doInit(cmd *cobra.Command, args []string) {
 	)
 }
 
-func doUpdate(cmd *cobra.Command, args []string) {
+func doUpdate(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -167,8 +172,6 @@ func doUpdate(cmd *cobra.Command, args []string) {
 	}
 
 	// Update the entity.
-	ent.AllowEntitySignedNodes = viper.GetBool(cfgAllowEntitySignedNodes)
-
 	ent.Nodes = nil
 	for _, v := range viper.GetStringSlice(CfgNodeID) {
 		var nodeID signature.PublicKey
@@ -183,7 +186,7 @@ func doUpdate(cmd *cobra.Command, args []string) {
 	}
 	for _, v := range viper.GetStringSlice(CfgNodeDescriptor) {
 		var b []byte
-		if b, err = ioutil.ReadFile(v); err != nil {
+		if b, err = os.ReadFile(v); err != nil {
 			logger.Error("failed to read node descriptor",
 				"err", err,
 				"path", v,
@@ -266,8 +269,14 @@ func signAndWriteEntityGenesis(dataDir string, signer signature.Signer, ent *ent
 	}
 
 	// Write out the signed entity registration.
-	b, _ := json.Marshal(signed)
-	if err = ioutil.WriteFile(filepath.Join(dataDir, entityGenesisFilename), b, 0o600); err != nil {
+	prettySigned, err := cmdCommon.PrettyJSONMarshal(signed)
+	if err != nil {
+		logger.Error("failed to get pretty JSON of signed entity genesis registration",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	if err = os.WriteFile(filepath.Join(dataDir, entityGenesisFilename), prettySigned, 0o600); err != nil {
 		logger.Error("failed to write signed entity genesis registration",
 			"err", err,
 		)
@@ -277,25 +286,17 @@ func signAndWriteEntityGenesis(dataDir string, signer signature.Signer, ent *ent
 	return nil
 }
 
-func doGenRegister(cmd *cobra.Command, args []string) {
+func doGenRegister(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
 
-	cmdConsensus.InitGenesis()
+	genesis := cmdConsensus.InitGenesis()
 	cmdConsensus.AssertTxFileOK()
 
-	entityDir, err := cmdSigner.CLIDirOrPwd()
+	ent, signer, err := cmdCommon.LoadEntitySigner()
 	if err != nil {
-		logger.Error("failed to retrieve entity dir",
-			"err", err,
-		)
-		os.Exit(1)
-	}
-
-	ent, signer, err := cmdCommon.LoadEntity(cmdSigner.Backend(), entityDir)
-	if err != nil {
-		logger.Error("failed to load entity",
+		logger.Error("failed to load entity and its signer",
 			"err", err,
 		)
 		os.Exit(1)
@@ -313,24 +314,24 @@ func doGenRegister(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := registry.NewRegisterEntityTx(nonce, fee, signed)
 
-	cmdConsensus.SignAndSaveTx(context.Background(), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, signer)
 }
 
-func doGenDeregister(cmd *cobra.Command, args []string) {
+func doGenDeregister(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
 
-	cmdConsensus.InitGenesis()
+	genesis := cmdConsensus.InitGenesis()
 	cmdConsensus.AssertTxFileOK()
 
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := registry.NewDeregisterEntityTx(nonce, fee)
 
-	cmdConsensus.SignAndSaveTx(context.Background(), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
-func doList(cmd *cobra.Command, args []string) {
+func doList(cmd *cobra.Command, _ []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -347,26 +348,30 @@ func doList(cmd *cobra.Command, args []string) {
 	}
 
 	for _, ent := range entities {
-		var s string
+		var entString string
 		switch cmdFlags.Verbose() {
 		case true:
-			b, _ := json.Marshal(ent)
-			s = string(b)
+			prettyEnt, err := cmdCommon.PrettyJSONMarshal(ent)
+			if err != nil {
+				logger.Error("failed to get pretty JSON of entity",
+					"err", err,
+					"entity ID", ent.ID.String(),
+				)
+				entString = fmt.Sprintf("[invalid pretty JSON for entity %s]", ent.ID)
+			} else {
+				entString = string(prettyEnt)
+			}
 		default:
-			s = ent.ID.String()
+			entString = ent.ID.String()
 		}
 
-		fmt.Printf("%v\n", s)
+		fmt.Println(entString)
 	}
 }
 
 func loadOrGenerateEntity(dataDir string, generate bool) (*entity.Entity, signature.Signer, error) {
 	if cmdFlags.DebugTestEntity() {
 		return entity.TestEntity()
-	}
-
-	if viper.GetBool(cfgAllowEntitySignedNodes) && !cmdFlags.DebugDontBlameOasis() {
-		return nil, nil, fmt.Errorf("loadOrGenerateEntity: sanity check failed: one or more unsafe debug flags set")
 	}
 
 	entityDir, err := cmdSigner.CLIDirOrPwd()
@@ -383,8 +388,7 @@ func loadOrGenerateEntity(dataDir string, generate bool) (*entity.Entity, signat
 
 	if generate {
 		template := &entity.Entity{
-			Versioned:              cbor.NewVersioned(entity.LatestEntityDescriptorVersion),
-			AllowEntitySignedNodes: viper.GetBool(cfgAllowEntitySignedNodes),
+			Versioned: cbor.NewVersioned(entity.LatestDescriptorVersion),
 		}
 
 		if viper.GetBool(CfgReuseSigner) {
@@ -425,10 +429,8 @@ func Register(parentCmd *cobra.Command) {
 }
 
 func init() {
-	entityFlags.Bool(cfgAllowEntitySignedNodes, false, "Entity signing key may be used for node registration (UNSAFE)")
 	entityFlags.AddFlagSet(cmdSigner.Flags)
 	entityFlags.AddFlagSet(cmdSigner.CLIFlags)
-	_ = entityFlags.MarkHidden(cfgAllowEntitySignedNodes)
 	_ = viper.BindPFlags(entityFlags)
 
 	initFlags.Bool(CfgReuseSigner, false, "Reuse entity signer instead of generating a new one")

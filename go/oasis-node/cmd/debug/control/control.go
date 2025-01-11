@@ -8,9 +8,9 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	control "github.com/oasisprotocol/oasis-core/go/control/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdGrpc "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/grpc"
 	cmdControl "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/control"
@@ -66,7 +66,7 @@ func doConnect(cmd *cobra.Command) (*grpc.ClientConn, control.DebugController) {
 	return conn, client
 }
 
-func doSetEpoch(cmd *cobra.Command, args []string) {
+func doSetEpoch(cmd *cobra.Command, _ []string) {
 	conn, client := doConnect(cmd)
 	defer conn.Close()
 
@@ -74,14 +74,14 @@ func doSetEpoch(cmd *cobra.Command, args []string) {
 		"epoch", epoch,
 	)
 
-	if err := client.SetEpoch(context.Background(), epochtime.EpochTime(epoch)); err != nil {
+	if err := client.SetEpoch(context.Background(), beacon.EpochTime(epoch)); err != nil {
 		logger.Error("failed to set epoch",
 			"err", err,
 		)
 	}
 }
 
-func doWaitNodes(cmd *cobra.Command, args []string) {
+func doWaitNodes(cmd *cobra.Command, _ []string) {
 	conn, client := doConnect(cmd)
 	defer conn.Close()
 
@@ -99,7 +99,7 @@ func doWaitNodes(cmd *cobra.Command, args []string) {
 	logger.Info("enough nodes have been registered")
 }
 
-func doWaitReady(cmd *cobra.Command, args []string) {
+func doWaitReady(cmd *cobra.Command, _ []string) {
 	conn, client := cmdControl.DoConnect(cmd)
 	defer conn.Close()
 

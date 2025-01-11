@@ -1,12 +1,9 @@
 //! Transaction I/O tree.
 use anyhow::{anyhow, Result};
-use io_context::Context;
-use serde::{self, ser::SerializeSeq, Deserialize, Serializer};
-use serde_bytes::{self, Bytes};
 
 use super::tags::Tags;
 use crate::{
-    common::{cbor, crypto::hash::Hash, key_format::KeyFormat},
+    common::{crypto::hash::Hash, key_format::KeyFormat},
     storage::mkvs::{self, sync::ReadSync, Root, WriteLog},
 };
 
@@ -35,7 +32,7 @@ struct TxnKeyFormat {
 
 impl KeyFormat for TxnKeyFormat {
     fn prefix() -> u8 {
-        'T' as u8
+        b'T'
     }
 
     fn size() -> usize {
@@ -74,9 +71,12 @@ struct TagKeyFormat {
     tx_hash: Hash,
 }
 
+/// Hash used for block emitted tags not tied to a specific transaction.
+pub const TAG_BLOCK_TX_HASH: Hash = Hash([0u8; 32]);
+
 impl KeyFormat for TagKeyFormat {
     fn prefix() -> u8 {
-        'E' as u8
+        b'E'
     }
 
     fn size() -> usize {
@@ -100,10 +100,10 @@ impl KeyFormat for TagKeyFormat {
 /// The input transaction artifacts.
 ///
 /// These are the artifacts that are stored CBOR-serialized in the Merkle tree.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, cbor::Encode, cbor::Decode)]
+#[cbor(as_array)]
 struct InputArtifacts {
     /// Transaction input.
-    #[serde(with = "serde_bytes")]
     pub input: Vec<u8>,
     /// Transaction order within the batch.
     ///
@@ -113,43 +113,20 @@ struct InputArtifacts {
     pub batch_order: u32,
 }
 
-impl serde::Serialize for InputArtifacts {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut seq = serializer.serialize_seq(Some(2))?;
-        seq.serialize_element(&Bytes::new(&self.input))?;
-        seq.serialize_element(&self.batch_order)?;
-        seq.end()
-    }
-}
-
 /// The output transaction artifacts.
 ///
 /// These are the artifacts that are stored CBOR-serialized in the Merkle tree.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, cbor::Encode, cbor::Decode)]
+#[cbor(as_array)]
 struct OutputArtifacts {
     /// Transaction output.
-    #[serde(with = "serde_bytes")]
     pub output: Vec<u8>,
-}
-
-impl serde::Serialize for OutputArtifacts {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut seq = serializer.serialize_seq(Some(1))?;
-        seq.serialize_element(&Bytes::new(&self.output))?;
-        seq.end()
-    }
 }
 
 /// A Merkle tree containing transaction artifacts.
 pub struct Tree {
     io_root: Root,
-    tree: mkvs::Tree,
+    tree: mkvs::OverlayTree<mkvs::Tree>,
 }
 
 impl Tree {
@@ -157,12 +134,14 @@ impl Tree {
     pub fn new(read_syncer: Box<dyn ReadSync>, io_root: Root) -> Self {
         Self {
             io_root,
-            tree: mkvs::Tree::make().with_root(io_root).new(read_syncer),
+            tree: mkvs::OverlayTree::new(
+                mkvs::Tree::builder().with_root(io_root).build(read_syncer),
+            ),
         }
     }
 
     /// Add an input transaction artifact.
-    pub fn add_input(&mut self, ctx: Context, input: Vec<u8>, batch_order: u32) -> Result<()> {
+    pub fn add_input(&mut self, input: Vec<u8>, batch_order: u32) -> Result<()> {
         if input.is_empty() {
             return Err(anyhow!("transaction: no input given"));
         }
@@ -170,42 +149,31 @@ impl Tree {
         let tx_hash = Hash::digest_bytes(&input);
 
         self.tree.insert(
-            ctx,
             &TxnKeyFormat {
                 tx_hash,
                 kind: ArtifactKind::Input,
             }
             .encode(),
-            &cbor::to_vec(&InputArtifacts { input, batch_order }),
+            &cbor::to_vec(InputArtifacts { input, batch_order }),
         )?;
 
         Ok(())
     }
 
     /// Add an output transaction artifact.
-    pub fn add_output(
-        &mut self,
-        ctx: Context,
-        tx_hash: Hash,
-        output: Vec<u8>,
-        tags: Tags,
-    ) -> Result<()> {
-        let ctx = ctx.freeze();
-
+    pub fn add_output(&mut self, tx_hash: Hash, output: Vec<u8>, tags: Tags) -> Result<()> {
         self.tree.insert(
-            Context::create_child(&ctx),
             &TxnKeyFormat {
                 tx_hash,
                 kind: ArtifactKind::Output,
             }
             .encode(),
-            &cbor::to_vec(&OutputArtifacts { output }),
+            &cbor::to_vec(OutputArtifacts { output }),
         )?;
 
         // Add tags if specified.
         for tag in tags {
             self.tree.insert(
-                Context::create_child(&ctx),
                 &TagKeyFormat {
                     key: tag.key,
                     tx_hash,
@@ -218,18 +186,32 @@ impl Tree {
         Ok(())
     }
 
+    /// Add block tags.
+    pub fn add_block_tags(&mut self, tags: Tags) -> Result<()> {
+        for tag in tags {
+            self.tree.insert(
+                &TagKeyFormat {
+                    key: tag.key,
+                    tx_hash: TAG_BLOCK_TX_HASH,
+                }
+                .encode(),
+                &tag.value,
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Commit updates to the underlying Merkle tree and return the write
     /// log and root hash.
-    pub fn commit(&mut self, ctx: Context) -> Result<(WriteLog, Hash)> {
+    pub fn commit(&mut self) -> Result<(WriteLog, Hash)> {
         self.tree
-            .commit(ctx, self.io_root.namespace, self.io_root.version)
+            .commit_both(self.io_root.namespace, self.io_root.version)
     }
 }
 
 #[cfg(test)]
 mod test {
-    use io_context::Context;
-
     use crate::storage::mkvs::sync::*;
 
     use super::{super::tags::Tag, *};
@@ -246,9 +228,8 @@ mod test {
 
         let input = b"this goes in".to_vec();
         let tx_hash = Hash::digest_bytes(&input);
-        tree.add_input(Context::background(), input, 0).unwrap();
+        tree.add_input(input, 0).unwrap();
         tree.add_output(
-            Context::background(),
             tx_hash,
             b"and this comes out".to_vec(),
             vec![Tag::new(b"tag1".to_vec(), b"value1".to_vec())],
@@ -259,9 +240,8 @@ mod test {
             let input = format!("this goes in ({})", i).into_bytes();
             let tx_hash = Hash::digest_bytes(&input);
 
-            tree.add_input(Context::background(), input, i + 1).unwrap();
+            tree.add_input(input, i + 1).unwrap();
             tree.add_output(
-                Context::background(),
                 tx_hash,
                 b"and this comes out".to_vec(),
                 vec![
@@ -273,10 +253,10 @@ mod test {
         }
 
         // NOTE: This root is synced with go/runtime/transaction/transaction_test.go.
-        let (_, root_hash) = tree.commit(Context::background()).unwrap();
+        let (_, root_hash) = tree.commit().unwrap();
         assert_eq!(
             format!("{:?}", root_hash),
-            "c65f4e8bd5314c26f245337a859ad244f4b1544acf60ef334cf0d0eadb47363b",
+            "8399ffa753987b00ec6ab251337c6b88e40812662ed345468fcbf1dbdd16321c",
         );
     }
 }

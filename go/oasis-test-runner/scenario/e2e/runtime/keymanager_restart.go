@@ -2,7 +2,9 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
@@ -12,79 +14,80 @@ import (
 var KeymanagerRestart scenario.Scenario = newKmRestartImpl()
 
 type kmRestartImpl struct {
-	runtimeImpl
+	Scenario
 }
 
 func newKmRestartImpl() scenario.Scenario {
 	return &kmRestartImpl{
-		runtimeImpl: *newRuntimeImpl(
+		Scenario: *NewScenario(
 			"keymanager-restart",
-			"simple-keyvalue-enc-client",
-			[]string{
-				"--key", "key1",
-				"--seed", "first_seed",
-			},
+			NewTestClient().WithScenario(InsertRemoveEncWithSecretsScenario),
 		),
 	}
 }
 
+func (sc *kmRestartImpl) Fixture() (*oasis.NetworkFixture, error) {
+	f, err := sc.Scenario.Fixture()
+	if err != nil {
+		return nil, err
+	}
+
+	// Speed up the test.
+	f.Network.Beacon.VRFParameters = &beacon.VRFParameters{
+		Interval:             10,
+		ProofSubmissionDelay: 2,
+	}
+
+	// This requires multiple keymanagers.
+	f.Keymanagers = []oasis.KeymanagerFixture{
+		{Runtime: 0, Entity: 1, Policy: 0},
+		{Runtime: 0, Entity: 1, Policy: 0},
+		{Runtime: 0, Entity: 1, Policy: 0},
+	}
+
+	// The round is allowed to fail until the keymanager becomes available after restart.
+	f.Network.DefaultLogWatcherHandlerFactories = nil
+
+	// Enable master secret rotation.
+	f.KeymanagerPolicies[0].MasterSecretRotationInterval = 1
+
+	return f, nil
+}
+
 func (sc *kmRestartImpl) Clone() scenario.Scenario {
 	return &kmRestartImpl{
-		runtimeImpl: *sc.runtimeImpl.Clone().(*runtimeImpl),
+		Scenario: *sc.Scenario.Clone().(*Scenario),
 	}
 }
 
-func (sc *kmRestartImpl) Run(childEnv *env.Env) error {
-	ctx := context.Background()
-	clientErrCh, cmd, err := sc.runtimeImpl.start(childEnv)
-	if err != nil {
+func (sc *kmRestartImpl) Run(ctx context.Context, childEnv *env.Env) error {
+	if err := sc.StartNetworkAndTestClient(ctx, childEnv); err != nil {
 		return err
 	}
 
 	// Wait for the client to exit.
-	select {
-	case err = <-sc.Net.Errors():
-		_ = cmd.Process.Kill()
-	case err = <-clientErrCh:
-	}
-	if err != nil {
+	if err := sc.WaitTestClient(); err != nil {
 		return err
 	}
 
-	// XXX: currently assumes single keymanager.
-	km := sc.Net.Keymanagers()[0]
+	// Wait until 3 master secrets are generated.
+	if _, err := sc.WaitMasterSecret(ctx, 2); err != nil {
+		return fmt.Errorf("master secret not generated: %w", err)
+	}
 
-	// Restart the key manager.
-	sc.Logger.Info("restarting the key manager")
-	if err = km.Restart(ctx); err != nil {
+	// Restart the key managers.
+	if err := sc.RestartAndWaitKeymanagers(ctx, []int{0, 1, 2}); err != nil {
 		return err
 	}
 
-	// Wait for the key manager to be ready.
-	sc.Logger.Info("waiting for the key manager to become ready")
-	kmCtrl, err := oasis.NewController(km.SocketPath())
-	if err != nil {
-		return err
-	}
-	if err = kmCtrl.WaitReady(ctx); err != nil {
+	// Test if rotations still work.
+	if _, err := sc.WaitMasterSecret(ctx, 5); err != nil {
 		return err
 	}
 
 	// Run the second client on a different key so that it will require
 	// a second trip to the keymanager.
 	sc.Logger.Info("starting a second client to check if key manager works")
-	sc.runtimeImpl.clientArgs = []string{
-		"--key", "key2",
-		"--seed", "second_seed",
-	}
-	cmd, err = sc.startClient(childEnv)
-	if err != nil {
-		return err
-	}
-
-	client2ErrCh := make(chan error)
-	go func() {
-		client2ErrCh <- cmd.Wait()
-	}()
-	return sc.wait(childEnv, cmd, client2ErrCh)
+	sc.Scenario.TestClient = NewTestClient().WithSeed("seed2").WithScenario(InsertRemoveEncWithSecretsScenarioV2)
+	return sc.RunTestClientAndCheckLogs(ctx, childEnv)
 }

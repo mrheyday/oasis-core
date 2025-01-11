@@ -1,88 +1,56 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"maps"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
-	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/sgx"
-	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
+	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	cmSync "github.com/oasisprotocol/oasis-core/go/common/sync"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
-	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle"
 )
 
 // RuntimeUpgrade is the runtime upgrade scenario.
 var RuntimeUpgrade scenario.Scenario = newRuntimeUpgradeImpl()
 
+const versionActivationTimeout = 15 * time.Second
+
 type runtimeUpgradeImpl struct {
-	runtimeImpl
+	Scenario
 
-	nonce uint64
-
-	firstNewWorker int
+	upgradedRuntimeIndex int
 }
 
 func newRuntimeUpgradeImpl() scenario.Scenario {
 	return &runtimeUpgradeImpl{
-		runtimeImpl: *newRuntimeImpl(
+		Scenario: *NewScenario(
 			"runtime-upgrade",
-			"simple-keyvalue-enc-client",
-			nil,
+			NewTestClient().WithScenario(InsertRemoveEncWithSecretsScenario),
 		),
 	}
 }
 
 func (sc *runtimeUpgradeImpl) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := sc.runtimeImpl.Fixture()
+	f, err := sc.Scenario.Fixture()
 	if err != nil {
 		return nil, err
 	}
 
-	// Get number of compute runtimes.
-	computeIndex := -1
-	for i := range f.Runtimes {
-		if f.Runtimes[i].Kind == registry.KindCompute {
-			computeIndex = i
-			break
-		}
-	}
-	if computeIndex == -1 {
-		return nil, fmt.Errorf("expected at least one compute runtime in the fixture, none found")
-	}
-
-	// Load the upgraded runtime binary.
-	newRuntimeBinary, err := sc.resolveRuntimeBinary("simple-keyvalue-upgrade")
-	if err != nil {
-		return nil, fmt.Errorf("error resolving upgraded binary: %w", err)
-	}
-
-	// Setup the upgraded runtime (first is keymanager, others should be generic compute).
-	runtimeFix := f.Runtimes[computeIndex]
-	runtimeFix.Binaries = append([]string{newRuntimeBinary}, runtimeFix.Binaries...)
-
-	// The upgraded runtime will be registered later.
-	runtimeFix.ExcludeFromGenesis = true
-	newComputeIndex := len(f.Runtimes)
-	f.Runtimes = append(f.Runtimes, runtimeFix)
-
-	// Add the upgraded compute runtimes to the compute workers, will be started later.
-	sc.firstNewWorker = len(f.ComputeWorkers)
-	for i := range f.ComputeWorkers {
-		f.ComputeWorkers[i].AllowEarlyTermination = true // Allow stopping the worker early.
-		f.ComputeWorkers[i].Runtimes = []int{computeIndex}
-	}
-	for i := 0; i < sc.firstNewWorker; i++ {
-		f.ComputeWorkers = append(f.ComputeWorkers, oasis.ComputeWorkerFixture{Entity: 1, NoAutoStart: true, Runtimes: []int{newComputeIndex}})
-	}
-
-	// The runtime ID stays the same, so pass only one instance to the storage workers.
-	for i := range f.StorageWorkers {
-		f.StorageWorkers[i].Runtimes = []int{computeIndex}
+	if sc.upgradedRuntimeIndex, err = sc.UpgradeComputeRuntimeFixture(f, true); err != nil {
+		return nil, err
 	}
 
 	return f, nil
@@ -90,184 +58,208 @@ func (sc *runtimeUpgradeImpl) Fixture() (*oasis.NetworkFixture, error) {
 
 func (sc *runtimeUpgradeImpl) Clone() scenario.Scenario {
 	return &runtimeUpgradeImpl{
-		runtimeImpl: *sc.runtimeImpl.Clone().(*runtimeImpl),
+		Scenario: *sc.Scenario.Clone().(*Scenario),
 	}
 }
 
-func (sc *runtimeUpgradeImpl) applyUpgradePolicy(childEnv *env.Env) error {
+func (sc *runtimeUpgradeImpl) Run(ctx context.Context, childEnv *env.Env) error {
 	cli := cli.New(childEnv, sc.Net, sc.Logger)
 
-	kmPolicyPath := filepath.Join(childEnv.Dir(), "km_policy.cbor")
-	kmPolicySig1Path := filepath.Join(childEnv.Dir(), "km_policy_sig1.pem")
-	kmPolicySig2Path := filepath.Join(childEnv.Dir(), "km_policy_sig2.pem")
-	kmPolicySig3Path := filepath.Join(childEnv.Dir(), "km_policy_sig3.pem")
-	kmUpdateTxPath := filepath.Join(childEnv.Dir(), "km_gen_update.json")
-
-	kmRuntime := sc.Net.Runtimes()[0]
-	oldRuntime := sc.Net.Runtimes()[1]
-	newRuntime := sc.Net.Runtimes()[2]
-	// Sanity check fixture.
-	if err := func() error {
-		if kmRuntime.Kind() != registry.KindKeyManager {
-			return fmt.Errorf("keymanager runtime not of kind KindKeyManager")
-		}
-		if oldRuntime.Kind() != registry.KindCompute {
-			return fmt.Errorf("old runtime not of kind KindCompute")
-		}
-		if newRuntime.Kind() != registry.KindCompute {
-			return fmt.Errorf("new runtime not of kind KindCompute")
-		}
-		if oldRuntime.ID() != newRuntime.ID() {
-			return fmt.Errorf("runtime ID mismatch")
-		}
-		return nil
-	}(); err != nil {
-		return fmt.Errorf("runtimes fixture sanity check: %w", err)
-	}
-
-	kmRuntimeEncID := kmRuntime.GetEnclaveIdentity()
-	oldRuntimeEncID := oldRuntime.GetEnclaveIdentity()
-	newRuntimeEncID := newRuntime.GetEnclaveIdentity()
-
-	if oldRuntimeEncID == nil && newRuntimeEncID == nil {
-		sc.Logger.Info("No SGX runtimes, skipping policy update")
-		return nil
-	}
-
-	// Ensure enclave IDs differ between the old and new runtimes.
-	oldEncID, _ := oldRuntimeEncID.MarshalText()
-	newEncID, _ := newRuntimeEncID.MarshalText()
-	if bytes.Equal(oldEncID, newEncID) {
-		return fmt.Errorf("expected different enclave identities, got: %s", newEncID)
-	}
-
-	// Build updated SGX policies.
-	sc.Logger.Info("building new KM SGX policy enclave policies map")
-	enclavePolicies := make(map[sgx.EnclaveIdentity]*keymanager.EnclavePolicySGX)
-
-	enclavePolicies[*kmRuntimeEncID] = &keymanager.EnclavePolicySGX{}
-	enclavePolicies[*kmRuntimeEncID].MayQuery = make(map[common.Namespace][]sgx.EnclaveIdentity)
-
-	// Allow new compute runtimes to query private data.
-	for _, rt := range sc.Net.Runtimes() {
-		if rt.Kind() != registry.KindCompute {
-			continue
-		}
-		if eid := rt.GetEnclaveIdentity(); eid != nil {
-			enclavePolicies[*kmRuntimeEncID].MayQuery[rt.ID()] = []sgx.EnclaveIdentity{*eid}
-		}
-	}
-
-	sc.Logger.Info("initing updated KM policy")
-	if err := cli.Keymanager.InitPolicy(kmRuntime.ID(), 2, enclavePolicies, kmPolicyPath); err != nil {
+	// Start the network and run the test client.
+	if err := sc.StartNetworkAndWaitForClientSync(ctx); err != nil {
 		return err
 	}
-	sc.Logger.Info("signing updated KM policy")
-	if err := cli.Keymanager.SignPolicy("1", kmPolicyPath, kmPolicySig1Path); err != nil {
-		return err
-	}
-	if err := cli.Keymanager.SignPolicy("2", kmPolicyPath, kmPolicySig2Path); err != nil {
-		return err
-	}
-	if err := cli.Keymanager.SignPolicy("3", kmPolicyPath, kmPolicySig3Path); err != nil {
+	if err := sc.RunTestClientAndCheckLogs(ctx, childEnv); err != nil {
 		return err
 	}
 
-	sc.Logger.Info("updating KM policy")
-	if err := cli.Keymanager.GenUpdate(sc.nonce, kmPolicyPath, []string{kmPolicySig1Path, kmPolicySig2Path, kmPolicySig3Path}, kmUpdateTxPath); err != nil {
-		return err
-	}
-	if err := cli.Consensus.SubmitTx(kmUpdateTxPath); err != nil {
-		return fmt.Errorf("failed to update KM policy: %w", err)
-	}
-	sc.nonce++
-
-	return nil
-}
-
-func (sc *runtimeUpgradeImpl) Run(childEnv *env.Env) error {
-	ctx := context.Background()
-	cli := cli.New(childEnv, sc.Net, sc.Logger)
-
-	clientErrCh, cmd, err := sc.runtimeImpl.start(childEnv)
-	if err != nil {
-		return err
-	}
-	sc.Logger.Info("waiting for client to exit")
-	// Wait for the client to exit.
-	select {
-	case err = <-sc.runtimeImpl.Net.Errors():
-		_ = cmd.Process.Kill()
-	case err = <-clientErrCh:
-	}
+	// Discover bundles.
+	bundles, err := findBundles(sc.Net.BasePath())
 	if err != nil {
 		return err
 	}
 
-	// Generate and update a policy that will allow the new runtime to run.
-	if err = sc.applyUpgradePolicy(childEnv); err != nil {
-		return fmt.Errorf("updating policies: %w", err)
+	// Determine the port on which the nodes are trying to fetch bundles.
+	rawURL := sc.Net.Clients()[0].Config.Runtime.Registries[0]
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+	port := parsedURL.Port()
+
+	// Start serving bundles.
+	server := newBundleServer(port, bundles, sc.Logger)
+	server.Start()
+	defer server.Stop()
+
+	// Upgrade the compute runtime.
+	if err := sc.UpgradeComputeRuntime(ctx, childEnv, cli, sc.upgradedRuntimeIndex, 0); err != nil {
+		return err
 	}
 
-	// Stop old compute workers, making sure they deregister.
-	sc.Logger.Info("stopping old runtimes")
-	for i := 0; i < sc.firstNewWorker; i++ {
-		worker := sc.Net.ComputeWorkers()[i]
-		if err = worker.RequestShutdown(ctx, false); err != nil {
-			return fmt.Errorf("failed to request shutdown: %w", err)
-		}
-	}
-	// Wait for all old workers to exit.
-	for i := 0; i < sc.firstNewWorker; i++ {
-		worker := sc.Net.ComputeWorkers()[i]
-		if err = <-worker.Exit(); err != env.ErrEarlyTerm {
-			return fmt.Errorf("compute worker exited with error: %w", err)
-		}
-	}
-
-	// Start the new compute workers.
-	sc.Logger.Info("starting new runtimes")
-	for i := sc.firstNewWorker; i < len(sc.Net.ComputeWorkers()); i++ {
-		newWorker := sc.Net.ComputeWorkers()[i]
-		if err = newWorker.Start(); err != nil {
-			return fmt.Errorf("starting new compute worker: %w", err)
-		}
-	}
-
-	// Update runtime to include the new enclave identity.
-	sc.Logger.Info("updating runtime descriptor")
-	newRt := sc.Net.Runtimes()[len(sc.Net.Runtimes())-1]
-	newRtDesc := newRt.ToRuntimeDescriptor()
-	newTxPath := filepath.Join(childEnv.Dir(), "register_update_compute_runtime.json")
-	if err = cli.Registry.GenerateRegisterRuntimeTx(sc.nonce, newRtDesc, newTxPath, ""); err != nil {
-		return fmt.Errorf("failed to generate register compute runtime tx: %w", err)
-	}
-	sc.nonce++
-	if err = cli.Consensus.SubmitTx(newTxPath); err != nil {
-		return fmt.Errorf("failed to update compute runtime: %w", err)
-	}
-
-	// Wait for the new nodes to register.
-	sc.Logger.Info("waiting for new compute workers to be ready")
-	for i := sc.firstNewWorker; i < len(sc.Net.ComputeWorkers()); i++ {
-		if err = sc.Net.ComputeWorkers()[i].WaitReady(ctx); err != nil {
-			return fmt.Errorf("error waiting for compute node to become ready: %w", err)
-		}
+	// Verify that all client and compute nodes requested bundle from the server.
+	n := 2 * (len(sc.Net.Clients()) + len(sc.Net.ComputeWorkers()))
+	if m := server.getRequestCount(); m != n {
+		return fmt.Errorf("invalid number of bundle requests (got: %d, expected: %d)", m, n)
 	}
 
 	// Run client again.
 	sc.Logger.Info("starting a second client to check if runtime works")
-	sc.runtimeImpl.clientArgs = []string{
-		"--key", "key2",
-		"--seed", "second_seed",
+	sc.Scenario.TestClient = NewTestClient().WithSeed("seed2").WithScenario(InsertRemoveEncWithSecretsScenarioV2)
+	return sc.RunTestClientAndCheckLogs(ctx, childEnv)
+}
+
+type bundleServer struct {
+	startOne cmSync.One
+
+	port   string
+	server *http.Server
+
+	bundles map[string]string
+
+	requestCount uint64
+
+	logger *logging.Logger
+}
+
+func newBundleServer(port string, bundles map[string]string, logger *logging.Logger) *bundleServer {
+	return &bundleServer{
+		startOne: cmSync.NewOne(),
+		port:     port,
+		bundles:  bundles,
+		logger:   logger,
 	}
-	cmd, err = sc.startClient(childEnv)
-	if err != nil {
-		return err
+}
+
+func (s *bundleServer) Start() {
+	s.startOne.TryStart(s.run)
+}
+
+func (s *bundleServer) Stop() {
+	s.startOne.TryStop()
+}
+
+func (s *bundleServer) run(ctx context.Context) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleRequest)
+
+	s.server = &http.Server{
+		Addr:              ":" + s.port,
+		Handler:           mux,
+		ReadHeaderTimeout: time.Minute,
 	}
-	client2ErrCh := make(chan error)
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	wg.Add(1)
 	go func() {
-		client2ErrCh <- cmd.Wait()
+		defer wg.Done()
+		_ = s.server.ListenAndServe()
 	}()
-	return sc.wait(childEnv, cmd, client2ErrCh)
+
+	<-ctx.Done()
+
+	s.server.Close()
+}
+
+func (s *bundleServer) handleRequest(w http.ResponseWriter, r *http.Request) {
+	s.logger.Info("handling request",
+		"path", r.URL.Path,
+	)
+
+	if strings.HasSuffix(r.URL.Path, bundle.FileExtension) {
+		s.handleGetBundle(w, r)
+	} else {
+		s.handleGetMetadata(w, r)
+	}
+}
+
+func (s *bundleServer) handleGetMetadata(w http.ResponseWriter, r *http.Request) {
+	manifestHash := path.Base(r.URL.Path)
+	content := []byte(fmt.Sprintf("http://127.0.0.1:%s/%s%s\n", s.port, manifestHash, bundle.FileExtension))
+
+	w.Header().Set("Content-Disposition", "attachment; filename=metadata.txt")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(content)
+
+	atomic.AddUint64(&s.requestCount, 1)
+}
+
+func (s *bundleServer) handleGetBundle(w http.ResponseWriter, r *http.Request) {
+	filename := path.Base(r.URL.Path)
+
+	path, ok := s.bundles[filename]
+	if !ok {
+		http.Error(w, "Bundle not found", http.StatusNotFound)
+		return
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		http.Error(w, "Error reading bundle", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Disposition", "attachment; filename=bundle.orc")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(content)
+
+	atomic.AddUint64(&s.requestCount, 1)
+}
+
+func (s *bundleServer) getRequestCount() int {
+	return int(atomic.LoadUint64(&s.requestCount))
+}
+
+func findBundles(dir string) (map[string]string, error) {
+	bundles := make(map[string]string)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "runtime-") {
+			subDir := filepath.Join(dir, entry.Name())
+
+			runtimeBundles, err := findBundlesIn(subDir)
+			if err != nil {
+				return nil, err
+			}
+
+			maps.Insert(bundles, maps.All(runtimeBundles))
+		}
+	}
+
+	return bundles, nil
+}
+
+func findBundlesIn(dir string) (map[string]string, error) {
+	bundles := make(map[string]string)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), bundle.FileExtension) {
+			continue
+		}
+
+		path := filepath.Join(dir, entry.Name())
+
+		bnd, err := bundle.Open(path)
+		if err != nil {
+			return nil, err
+		}
+
+		bundles[bnd.GenerateFilename()] = path
+	}
+
+	return bundles, nil
 }

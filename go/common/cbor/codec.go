@@ -10,7 +10,7 @@ import (
 )
 
 // Maximum message size.
-const maxMessageSize = 16 * 1024 * 1024 // 16 MiB
+const maxMessageSize = 64 * 1024 * 1024 // 64 MiB
 
 var (
 	errMessageTooLarge  = errors.New("codec: message too large")
@@ -56,7 +56,7 @@ func (c *MessageReader) Read(msg interface{}) error {
 
 	// Decode message bytes.
 	r := io.LimitReader(c.reader, int64(length))
-	dec := NewDecoder(r)
+	dec := NewDecoderRPC(r)
 	if err := dec.Decode(msg); err != nil {
 		return err
 	}

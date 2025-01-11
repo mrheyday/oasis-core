@@ -3,356 +3,108 @@ package runtime
 import (
 	"context"
 	"fmt"
-	"os/exec"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
-	"github.com/oasisprotocol/oasis-core/go/common/node"
-	"github.com/oasisprotocol/oasis-core/go/common/sgx"
-	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/cmd"
-	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
-	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/log"
-	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
-	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
-	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario/e2e"
-	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
+	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
+	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	runtimeClient "github.com/oasisprotocol/oasis-core/go/runtime/client/api"
-	runtimeTransaction "github.com/oasisprotocol/oasis-core/go/runtime/transaction"
-	"github.com/oasisprotocol/oasis-core/go/storage/database"
+	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
-const (
-	cfgClientBinaryDir  = "client.binary_dir"
-	cfgRuntimeBinaryDir = "runtime.binary_dir"
-	cfgRuntimeLoader    = "runtime.loader"
-	cfgTEEHardware      = "tee_hardware"
-	cfgIasMock          = "ias.mock"
-	cfgEpochInterval    = "epoch.interval"
-)
-
-var (
-	// RuntimeParamsDummy is a dummy instance of runtimeImpl used to register global e2e/runtime flags.
-	RuntimeParamsDummy *runtimeImpl = newRuntimeImpl("", "", []string{})
-
-	// Runtime is the basic network + client test case with runtime support.
-	Runtime scenario.Scenario = newRuntimeImpl("runtime", "simple-keyvalue-client", nil)
-	// RuntimeEncryption is the basic network + client with encryption test case.
-	RuntimeEncryption scenario.Scenario = newRuntimeImpl("runtime-encryption", "simple-keyvalue-enc-client", nil)
-
-	// DefaultRuntimeLogWatcherHandlerFactories is a list of default log watcher
-	// handler factories for the basic scenario.
-	DefaultRuntimeLogWatcherHandlerFactories = []log.WatcherHandlerFactory{
-		oasis.LogAssertNoTimeouts(),
-		oasis.LogAssertNoRoundFailures(),
-		oasis.LogAssertNoExecutionDiscrepancyDetected(),
-	}
-
-	runtimeID    common.Namespace
-	keymanagerID common.Namespace
-	_            = runtimeID.UnmarshalHex("8000000000000000000000000000000000000000000000000000000000000000")
-	_            = keymanagerID.UnmarshalHex("c000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff")
-)
-
-// runtimeImpl is a base class for tests involving oasis-node with runtime.
-type runtimeImpl struct {
-	e2e.E2E
-
-	clientBinary string
-	clientArgs   []string
+// TxnCall is a transaction call in the test runtime.
+type TxnCall struct {
+	// Nonce is a nonce.
+	Nonce uint64 `json:"nonce"`
+	// Method is the called method name.
+	Method string `json:"method"`
+	// Args are the method arguments.
+	Args interface{} `json:"args"`
 }
 
-func newRuntimeImpl(name, clientBinary string, clientArgs []string) *runtimeImpl {
-	// Empty scenario name is used for registering global parameters only.
-	fullName := "runtime"
-	if name != "" {
-		fullName += "/" + name
-	}
-
-	sc := &runtimeImpl{
-		E2E:          *e2e.NewE2E(fullName),
-		clientBinary: clientBinary,
-		clientArgs:   clientArgs,
-	}
-	sc.Flags.String(cfgClientBinaryDir, "", "path to the client binaries directory")
-	sc.Flags.String(cfgRuntimeBinaryDir, "", "path to the runtime binaries directory")
-	sc.Flags.String(cfgRuntimeLoader, "oasis-core-runtime-loader", "path to the runtime loader")
-	sc.Flags.String(cfgTEEHardware, "", "TEE hardware to use")
-	sc.Flags.Bool(cfgIasMock, true, "if mock IAS service should be used")
-	sc.Flags.Int64(cfgEpochInterval, 0, "epoch interval")
-
-	return sc
+// TxnOutput is a transaction call output in the test runtime.
+type TxnOutput struct {
+	// Success can be of any type.
+	Success cbor.RawMessage
+	// Error is a string describing the error message.
+	Error *string
 }
 
-func (sc *runtimeImpl) Clone() scenario.Scenario {
-	return &runtimeImpl{
-		E2E:          sc.E2E.Clone(),
-		clientBinary: sc.clientBinary,
-		clientArgs:   sc.clientArgs,
-	}
-}
-
-func (sc *runtimeImpl) PreInit(childEnv *env.Env) error {
-	return nil
-}
-
-func (sc *runtimeImpl) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := sc.E2E.Fixture()
-	if err != nil {
-		return nil, err
-	}
-
-	tee, err := sc.getTEEHardware()
-	if err != nil {
-		return nil, err
-	}
-	var mrSigner *sgx.MrSigner
-	if tee == node.TEEHardwareIntelSGX {
-		mrSigner = &sgx.FortanixDummyMrSigner
-	}
-	keyManagerBinary, err := sc.resolveDefaultKeyManagerBinary()
-	if err != nil {
-		return nil, err
-	}
-	runtimeBinary, err := sc.resolveRuntimeBinary("simple-keyvalue")
-	if err != nil {
-		return nil, err
-	}
-	runtimeLoader, _ := sc.Flags.GetString(cfgRuntimeLoader)
-	iasMock, _ := sc.Flags.GetBool(cfgIasMock)
-	epochInterval, _ := sc.Flags.GetInt64(cfgEpochInterval)
-	return &oasis.NetworkFixture{
-		TEE: oasis.TEEFixture{
-			Hardware: tee,
-			MrSigner: mrSigner,
-		},
-		Network: oasis.NetworkCfg{
-			NodeBinary:                        f.Network.NodeBinary,
-			RuntimeSGXLoaderBinary:            runtimeLoader,
-			DefaultLogWatcherHandlerFactories: DefaultRuntimeLogWatcherHandlerFactories,
-			Consensus:                         f.Network.Consensus,
-			IAS: oasis.IASCfg{
-				Mock: iasMock,
-			},
-			EpochtimeTendermintInterval: epochInterval,
-		},
-		Entities: []oasis.EntityCfg{
-			{IsDebugTestEntity: true},
-			{},
-		},
-		Runtimes: []oasis.RuntimeFixture{
-			// Key manager runtime.
-			{
-				ID:         keymanagerID,
-				Kind:       registry.KindKeyManager,
-				Entity:     0,
-				Keymanager: -1,
-				AdmissionPolicy: registry.RuntimeAdmissionPolicy{
-					AnyNode: &registry.AnyNodeRuntimeAdmissionPolicy{},
-				},
-				Binaries: []string{keyManagerBinary},
-			},
-			// Compute runtime.
-			{
-				ID:         runtimeID,
-				Kind:       registry.KindCompute,
-				Entity:     0,
-				Keymanager: 0,
-				Binaries:   []string{runtimeBinary},
-				Executor: registry.ExecutorParameters{
-					GroupSize:       2,
-					GroupBackupSize: 1,
-					RoundTimeout:    20,
-				},
-				TxnScheduler: registry.TxnSchedulerParameters{
-					Algorithm:         registry.TxnSchedulerSimple,
-					MaxBatchSize:      1,
-					MaxBatchSizeBytes: 1024,
-					BatchFlushTimeout: 1 * time.Second,
-					ProposerTimeout:   20,
-				},
-				Storage: registry.StorageParameters{
-					GroupSize:               2,
-					MinWriteReplication:     2,
-					MaxApplyWriteLogEntries: 100_000,
-					MaxApplyOps:             2,
-				},
-				AdmissionPolicy: registry.RuntimeAdmissionPolicy{
-					AnyNode: &registry.AnyNodeRuntimeAdmissionPolicy{},
-				},
-			},
-		},
-		Validators: []oasis.ValidatorFixture{
-			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true}},
-			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true}},
-			{Entity: 1, Consensus: oasis.ConsensusFixture{EnableConsensusRPCWorker: true}},
-		},
-		KeymanagerPolicies: []oasis.KeymanagerPolicyFixture{
-			{Runtime: 0, Serial: 1},
-		},
-		Keymanagers: []oasis.KeymanagerFixture{
-			{Runtime: 0, Entity: 1},
-		},
-		StorageWorkers: []oasis.StorageWorkerFixture{
-			{Backend: database.BackendNameBadgerDB, Entity: 1},
-			{Backend: database.BackendNameBadgerDB, Entity: 1},
-		},
-		ComputeWorkers: []oasis.ComputeWorkerFixture{
-			{Entity: 1, Runtimes: []int{1}},
-			{Entity: 1, Runtimes: []int{1}},
-			{Entity: 1, Runtimes: []int{1}},
-		},
-		Sentries: []oasis.SentryFixture{},
-		Seeds:    []oasis.SeedFixture{{}},
-		Clients: []oasis.ClientFixture{
-			{},
-		},
-	}, nil
-}
-
-func (sc *runtimeImpl) start(childEnv *env.Env) (<-chan error, *exec.Cmd, error) {
-	var err error
-	if err = sc.Net.Start(); err != nil {
-		return nil, nil, err
-	}
-
-	cmd, err := sc.startClient(childEnv)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	clientErrCh := make(chan error)
-	go func() {
-		clientErrCh <- cmd.Wait()
-	}()
-	return clientErrCh, cmd, nil
-}
-
-// getTEEHardware returns the configured TEE hardware.
-func (sc *runtimeImpl) getTEEHardware() (node.TEEHardware, error) {
-	teeStr, _ := sc.Flags.GetString(cfgTEEHardware)
-	var tee node.TEEHardware
-	if err := tee.FromString(teeStr); err != nil {
-		return node.TEEHardwareInvalid, err
-	}
-	return tee, nil
-}
-
-func (sc *runtimeImpl) resolveClientBinary(clientBinary string) string {
-	cbDir, _ := sc.Flags.GetString(cfgClientBinaryDir)
-	return filepath.Join(cbDir, clientBinary)
-}
-
-func (sc *runtimeImpl) resolveRuntimeBinary(runtimeBinary string) (string, error) {
-	tee, err := sc.getTEEHardware()
-	if err != nil {
-		return "", err
-	}
-
-	var runtimeExt string
-	switch tee {
-	case node.TEEHardwareInvalid:
-		runtimeExt = ""
-	case node.TEEHardwareIntelSGX:
-		runtimeExt = ".sgxs"
-	}
-
-	rtBinDir, _ := sc.Flags.GetString(cfgRuntimeBinaryDir)
-	return filepath.Join(rtBinDir, runtimeBinary+runtimeExt), nil
-}
-
-func (sc *runtimeImpl) resolveDefaultKeyManagerBinary() (string, error) {
-	return sc.resolveRuntimeBinary("simple-keymanager")
-}
-
-func (sc *runtimeImpl) startClient(childEnv *env.Env) (*exec.Cmd, error) {
-	clients := sc.Net.Clients()
-	if len(clients) == 0 {
-		return nil, fmt.Errorf("scenario/e2e: network has no client nodes")
-	}
-
-	d, err := childEnv.NewSubDir("client")
-	if err != nil {
-		return nil, err
-	}
-
-	w, err := d.NewLogWriter("client.log")
-	if err != nil {
-		return nil, err
-	}
-
-	args := []string{
-		"--node-address", "unix:" + clients[0].SocketPath(),
-		"--runtime-id", runtimeID.String(),
-	}
-	args = append(args, sc.clientArgs...)
-
-	binary := sc.resolveClientBinary(sc.clientBinary)
-	cmd := exec.Command(binary, args...)
-	cmd.SysProcAttr = env.CmdAttrs
-	cmd.Stdout = w
-	cmd.Stderr = w
-
-	sc.Logger.Info("launching client",
-		"binary", binary,
-		"args", strings.Join(args, " "),
-	)
-
-	if err = cmd.Start(); err != nil {
-		return nil, fmt.Errorf("scenario/e2e: failed to start client: %w", err)
-	}
-
-	return cmd, nil
-}
-
-func (sc *runtimeImpl) waitClient(childEnv *env.Env, cmd *exec.Cmd, clientErrCh <-chan error) error {
-	var err error
-	select {
-	case err = <-sc.Net.Errors():
-		_ = cmd.Process.Kill()
-	case err = <-clientErrCh:
-	}
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (sc *runtimeImpl) wait(childEnv *env.Env, cmd *exec.Cmd, clientErrCh <-chan error) error {
-	if err := sc.waitClient(childEnv, cmd, clientErrCh); err != nil {
-		return err
-	}
-	return sc.Net.CheckLogWatchers()
-}
-
-func (sc *runtimeImpl) Run(childEnv *env.Env) error {
-	clientErrCh, cmd, err := sc.start(childEnv)
-	if err != nil {
-		return err
-	}
-
-	return sc.wait(childEnv, cmd, clientErrCh)
-}
-
-func (sc *runtimeImpl) submitRuntimeTx(ctx context.Context, id common.Namespace, method string, args interface{}) (cbor.RawMessage, error) {
-	c := sc.Net.ClientController().RuntimeClient
-
+func (sc *Scenario) submitRuntimeTx(
+	ctx context.Context,
+	id common.Namespace,
+	nonce uint64,
+	method string,
+	args interface{},
+) (cbor.RawMessage, error) {
 	// Submit a transaction and check the result.
-	var rsp runtimeTransaction.TxnOutput
-	rawRsp, err := c.SubmitTx(ctx, &runtimeClient.SubmitTxRequest{
+	metaResp, err := sc.submitRuntimeTxMeta(ctx, id, nonce, method, args)
+	if err != nil {
+		return nil, err
+	}
+	rsp, err := unpackRawTxResp(metaResp.Output)
+	if err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (sc *Scenario) submitRuntimeQuery(
+	ctx context.Context,
+	id common.Namespace,
+	round uint64,
+	method string,
+	args interface{},
+) (cbor.RawMessage, error) {
+	ctrl := sc.Net.ClientController()
+	if ctrl == nil {
+		return nil, fmt.Errorf("client controller not available")
+	}
+	c := ctrl.RuntimeClient
+
+	resp, err := c.Query(ctx, &runtimeClient.QueryRequest{RuntimeID: id, Round: round, Method: method, Args: cbor.Marshal(args)})
+	if err != nil {
+		return nil, fmt.Errorf("query failed: %w", err)
+	}
+	return resp.Data, nil
+}
+
+func (sc *Scenario) submitRuntimeTxMeta(
+	ctx context.Context,
+	id common.Namespace,
+	nonce uint64,
+	method string,
+	args interface{},
+) (*runtimeClient.SubmitTxMetaResponse, error) {
+	ctrl := sc.Net.ClientController()
+	if ctrl == nil {
+		return nil, fmt.Errorf("client controller not available")
+	}
+	c := ctrl.RuntimeClient
+
+	resp, err := c.SubmitTxMeta(ctx, &runtimeClient.SubmitTxRequest{
 		RuntimeID: id,
-		Data: cbor.Marshal(&runtimeTransaction.TxnCall{
+		Data: cbor.Marshal(&TxnCall{
+			Nonce:  nonce,
 			Method: method,
 			Args:   args,
 		}),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to submit runtime tx: %w", err)
+		return nil, fmt.Errorf("failed to submit runtime meta tx: %w", err)
 	}
-	if err = cbor.Unmarshal(rawRsp, &rsp); err != nil {
+	if resp.CheckTxError != nil {
+		return nil, fmt.Errorf("check tx failed: %s", resp.CheckTxError.Message)
+	}
+
+	return resp, nil
+}
+
+func unpackRawTxResp(rawRsp []byte) (cbor.RawMessage, error) {
+	var rsp TxnOutput
+	if err := cbor.Unmarshal(rawRsp, &rsp); err != nil {
 		return nil, fmt.Errorf("malformed tx output from runtime: %w", err)
 	}
 	if rsp.Error != nil {
@@ -361,217 +113,76 @@ func (sc *runtimeImpl) submitRuntimeTx(ctx context.Context, id common.Namespace,
 	return rsp.Success, nil
 }
 
-func (sc *runtimeImpl) submitKeyValueRuntimeInsertTx(ctx context.Context, id common.Namespace, key, value string) error {
-	_, err := sc.submitRuntimeTx(ctx, id, "insert", struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
+func (sc *Scenario) submitConsensusXferTxMeta(
+	ctx context.Context,
+	xfer staking.Transfer,
+	nonce uint64,
+) (*runtimeClient.SubmitTxMetaResponse, error) {
+	return sc.submitRuntimeTxMeta(ctx, KeyValueRuntimeID, nonce, "consensus_transfer", struct {
+		Transfer staking.Transfer `json:"transfer"`
 	}{
-		Key:   key,
-		Value: value,
+		Transfer: xfer,
 	})
-	return err
 }
 
-func (sc *runtimeImpl) waitNodesSynced() error {
-	ctx := context.Background()
-
-	checkSynced := func(n *oasis.Node) error {
-		c, err := oasis.NewController(n.SocketPath())
-		if err != nil {
-			return fmt.Errorf("failed to create node controller: %w", err)
-		}
-		defer c.Close()
-
-		if err = c.WaitSync(ctx); err != nil {
-			return fmt.Errorf("failed to wait for node to sync: %w", err)
-		}
-		return nil
+func (sc *Scenario) submitRuntimeInMsg(ctx context.Context, id common.Namespace, nonce uint64, method string, args interface{}) error {
+	ctrl := sc.Net.ClientController()
+	if ctrl == nil {
+		return fmt.Errorf("client controller not available")
 	}
 
-	sc.Logger.Info("waiting for all nodes to be synced")
-
-	for _, n := range sc.Net.Validators() {
-		if err := checkSynced(&n.Node); err != nil {
-			return err
-		}
-	}
-	for _, n := range sc.Net.StorageWorkers() {
-		if err := checkSynced(&n.Node); err != nil {
-			return err
-		}
-	}
-	for _, n := range sc.Net.ComputeWorkers() {
-		if err := checkSynced(&n.Node); err != nil {
-			return err
-		}
-	}
-	for _, n := range sc.Net.Clients() {
-		if err := checkSynced(&n.Node); err != nil {
-			return err
-		}
+	// Queue a runtime message and wait for it to be processed.
+	tx := roothash.NewSubmitMsgTx(0, &transaction.Fee{Gas: 10_000}, &roothash.SubmitMsg{
+		ID:  id,
+		Tag: 42,
+		Data: cbor.Marshal(&TxnCall{
+			Nonce:  nonce,
+			Method: method,
+			Args:   args,
+		}),
+	})
+	signer := memorySigner.NewTestSigner("oasis in msg test signer: " + time.Now().String())
+	sigTx, err := transaction.Sign(signer, tx)
+	if err != nil {
+		return fmt.Errorf("failed to sign SubmitMsg transaction: %w", err)
 	}
 
-	sc.Logger.Info("nodes synced")
-	return nil
-}
+	// Start watching roothash events.
+	ch, sub, err := ctrl.Roothash.WatchEvents(ctx, id)
+	if err != nil {
+		return fmt.Errorf("failed to watch events: %w", err)
+	}
+	defer sub.Close()
 
-func (sc *runtimeImpl) initialEpochTransitions(fixture *oasis.NetworkFixture) error {
-	ctx := context.Background()
+	err = ctrl.Consensus.SubmitTx(ctx, sigTx)
+	if err != nil {
+		return fmt.Errorf("failed to submit SubmitMsg transaction: %w", err)
+	}
 
-	if len(sc.Net.Keymanagers()) > 0 {
-		// First wait for validator and key manager nodes to register. Then perform an epoch
-		// transition which will cause the compute and storage nodes to register.
-		sc.Logger.Info("waiting for validators to initialize",
-			"num_validators", len(sc.Net.Validators()),
-		)
-		for i, n := range sc.Net.Validators() {
-			if fixture.Validators[i].NoAutoStart {
-				// Skip nodes that don't auto start.
+	// Wait for processed event.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	sc.Logger.Info("waiting for incoming message processed event")
+	callerAddr := staking.NewAddress(signer.Public())
+	for {
+		select {
+		case ev := <-ch:
+			if ev.InMsgProcessed == nil {
 				continue
 			}
-			if err := n.WaitReady(ctx); err != nil {
-				return fmt.Errorf("failed to wait for a validator: %w", err)
+
+			if !ev.InMsgProcessed.Caller.Equal(callerAddr) {
+				return fmt.Errorf("unexpected caller address (got: %s expected: %s)", ev.InMsgProcessed.Caller, callerAddr)
 			}
-		}
-		sc.Logger.Info("waiting for key managers to initialize",
-			"num_keymanagers", len(sc.Net.Keymanagers()),
-		)
-		for i, n := range sc.Net.Keymanagers() {
-			if fixture.Keymanagers[i].NoAutoStart {
-				// Skip nodes that don't auto start.
-				continue
+			if ev.InMsgProcessed.Tag != 42 {
+				return fmt.Errorf("unexpected tag (got: %d expected: %d)", ev.InMsgProcessed.Tag, 42)
 			}
-			if err := n.WaitReady(ctx); err != nil {
-				return fmt.Errorf("failed to wait for a key manager: %w", err)
-			}
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		sc.Logger.Info("triggering epoch transition")
-		if err := sc.Net.Controller().SetEpoch(ctx, 1); err != nil {
-			return fmt.Errorf("failed to set epoch: %w", err)
-		}
-		sc.Logger.Info("epoch transition done")
-	}
 
-	// Wait for storage workers and compute workers to become ready.
-	sc.Logger.Info("waiting for storage workers to initialize",
-		"num_storage_workers", len(sc.Net.StorageWorkers()),
-	)
-	for i, n := range sc.Net.StorageWorkers() {
-		if fixture.StorageWorkers[i].NoAutoStart {
-			// Skip nodes that don't auto start.
-			continue
-		}
-		if err := n.WaitReady(ctx); err != nil {
-			return fmt.Errorf("failed to wait for a storage worker: %w", err)
-		}
-	}
-	sc.Logger.Info("waiting for compute workers to initialize",
-		"num_compute_workers", len(sc.Net.ComputeWorkers()),
-	)
-	for i, n := range sc.Net.ComputeWorkers() {
-		if fixture.ComputeWorkers[i].NoAutoStart {
-			// Skip nodes that don't auto start.
-			continue
-		}
-		if err := n.WaitReady(ctx); err != nil {
-			return fmt.Errorf("failed to wait for a compute worker: %w", err)
-		}
-	}
-
-	// Byzantine nodes can only registered. If defined, since we cannot control them directly, wait
-	// for all nodes to become registered.
-	if len(sc.Net.Byzantine()) > 0 {
-		sc.Logger.Info("waiting for (all) nodes to register",
-			"num_nodes", sc.Net.NumRegisterNodes(),
-		)
-		if err := sc.Net.Controller().WaitNodesRegistered(ctx, sc.Net.NumRegisterNodes()); err != nil {
-			return fmt.Errorf("failed to wait for nodes: %w", err)
-		}
-	}
-
-	// Then perform another epoch transition to elect the committees.
-	sc.Logger.Info("triggering epoch transition")
-	if err := sc.Net.Controller().SetEpoch(ctx, 2); err != nil {
-		return fmt.Errorf("failed to set epoch: %w", err)
-	}
-	sc.Logger.Info("epoch transition done")
-
-	return nil
-}
-
-// RegisterScenarios registers all end-to-end scenarios.
-func RegisterScenarios() error {
-	// Register non-scenario-specific parameters.
-	cmd.RegisterScenarioParams(RuntimeParamsDummy.Name(), RuntimeParamsDummy.Parameters())
-
-	// Register default scenarios which are executed, if no test names provided.
-	for _, s := range []scenario.Scenario{
-		// Runtime test.
-		Runtime,
-		RuntimeEncryption,
-		// Byzantine executor node.
-		ByzantineExecutorHonest,
-		ByzantineExecutorSchedulerHonest,
-		ByzantineExecutorWrong,
-		ByzantineExecutorSchedulerWrong,
-		ByzantineExecutorStraggler,
-		ByzantineExecutorSchedulerStraggler,
-		ByzantineExecutorFailureIndicating,
-		ByzantineExecutorSchedulerFailureIndicating,
-		// Byzantine storage node.
-		ByzantineStorageHonest,
-		ByzantineStorageFailApply,
-		ByzantineStorageFailApplyBatch,
-		ByzantineStorageFailRead,
-		// Storage sync test.
-		StorageSync,
-		// Sentry test.
-		Sentry,
-		SentryEncryption,
-		// Keymanager restart test.
-		KeymanagerRestart,
-		// Keymanager replicate test.
-		KeymanagerReplicate,
-		// Dump/restore test.
-		DumpRestore,
-		// Halt test.
-		HaltRestore,
-		// Multiple runtimes test.
-		MultipleRuntimes,
-		// Node shutdown test.
-		NodeShutdown,
-		// Gas fees tests.
-		GasFeesRuntimes,
-		// Runtime prune test.
-		RuntimePrune,
-		// Runtime dynamic registration test.
-		RuntimeDynamic,
-		// Transaction source test.
-		TxSourceMultiShort,
-		// ClientExpire test.
-		ClientExpire,
-		// Late start test.
-		LateStart,
-		// KeymanagerUpgrade test.
-		KeymanagerUpgrade,
-		// RuntimeUpgrade test.
-		RuntimeUpgrade,
-		// HistoryReindex test.
-		HistoryReindex,
-	} {
-		if err := cmd.Register(s); err != nil {
-			return err
-		}
-	}
-
-	// Register non-default scenarios which are executed on-demand only.
-	for _, s := range []scenario.Scenario{
-		// Transaction source test. Non-default, because it runs for ~6 hours.
-		TxSourceMulti,
-	} {
-		if err := cmd.RegisterNondefault(s); err != nil {
-			return err
-		}
+		break
 	}
 
 	return nil

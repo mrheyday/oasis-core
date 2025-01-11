@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
@@ -18,23 +17,32 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/sgx/ias"
+	"github.com/oasisprotocol/oasis-core/go/common/sgx/pcs"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	cmdSigner "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/signer"
 )
 
 const (
+	CfgConfigFile = "config"
+
 	// CfgDebugAllowTestKeys is the command line flag to enable the debug test
 	// keys.
 	CfgDebugAllowTestKeys = "debug.allow_test_keys"
+	// CfgDebugAllowDebugEnclaves is the command line flag to enable debug enclaves.
+	CfgDebugAllowDebugEnclaves = "debug.allow_debug_enclaves"
+	// CfgDebugTCBLaxVerify is the command line flag to enable lax verification of PCS TCB statuses.
+	CfgDebugTCBLaxVerify = "debug.tcb_lax_verify"
+	// CfgDebugSkipQuoteVerify is the command line flag to skip PCS quote verification.
+	CfgDebugSkipQuoteVerify = "debug.skip_quote_verify"
 
-	// CfgDebugRlimit is the command flag to set RLIMIT_NOFILE on launch.
-	CfgDebugRlimit = "debug.rlimit"
+	// RequiredRlimit is the minimum required RLIMIT_NOFILE as too low of a
+	// limit can cause problems with BadgerDB.
+	RequiredRlimit = 50_000
 
-	cfgConfigFile = "config"
-	CfgDataDir    = "datadir"
-
-	badDefaultRlimit = 1024
+	// InternalSocketName is the default name of the internal gRPC socket.
+	InternalSocketName = "internal.sock"
 )
 
 var (
@@ -42,8 +50,7 @@ var (
 
 	rootLog = logging.GetLogger("oasis-node")
 
-	debugAllowTestKeysFlag = flag.NewFlagSet("", flag.ContinueOnError)
-	debugRlimitFlag        = flag.NewFlagSet("", flag.ContinueOnError)
+	debugFlags = flag.NewFlagSet("", flag.ContinueOnError)
 
 	// RootFlags has the flags that are common across all commands.
 	RootFlags = flag.NewFlagSet("", flag.ContinueOnError)
@@ -53,7 +60,15 @@ var (
 
 // DataDir returns the data directory iff one is set.
 func DataDir() string {
-	return viper.GetString(CfgDataDir)
+	return config.GlobalConfig.Common.DataDir
+}
+
+// InternalSocketPath returns the path to the node's internal unix socket.
+func InternalSocketPath() string {
+	if config.GlobalConfig.Common.InternalSocketPath != "" {
+		return config.GlobalConfig.Common.InternalSocketPath
+	}
+	return filepath.Join(DataDir(), InternalSocketName)
 }
 
 // IsNodeCmd returns true iff the current command is the ekiden node.
@@ -93,6 +108,9 @@ func Init() error {
 		initDataDir,
 		initLogging,
 		initPublicKeyBlacklist,
+		initDebugEnclaves,
+		initDebugTCBLaxVerify,
+		initDebugSkipQuoteVerify,
 		initRlimit,
 	}
 
@@ -113,64 +131,49 @@ func Logger() *logging.Logger {
 }
 
 func init() {
-	initLoggingFlags()
+	debugFlags.Bool(CfgDebugAllowTestKeys, false, "allow test keys (UNSAFE)")
+	debugFlags.Bool(CfgDebugAllowDebugEnclaves, false, "allow debug enclaves (UNSAFE)")
+	debugFlags.Bool(CfgDebugTCBLaxVerify, false, "allow lax verification of TCB statuses (UNSAFE)")
+	debugFlags.Bool(CfgDebugSkipQuoteVerify, false, "skip quote verification (UNSAFE)")
+	_ = debugFlags.MarkHidden(CfgDebugAllowTestKeys)
+	_ = debugFlags.MarkHidden(CfgDebugAllowDebugEnclaves)
+	_ = debugFlags.MarkHidden(CfgDebugTCBLaxVerify)
+	_ = debugFlags.MarkHidden(CfgDebugSkipQuoteVerify)
+	_ = viper.BindPFlags(debugFlags)
 
-	debugAllowTestKeysFlag.Bool(CfgDebugAllowTestKeys, false, "allow test keys (UNSAFE)")
-	_ = debugAllowTestKeysFlag.MarkHidden(CfgDebugAllowTestKeys)
-	_ = viper.BindPFlags(debugAllowTestKeysFlag)
-
-	debugRlimitFlag.Uint64(CfgDebugRlimit, 0, "set RLIMIT_NOFILE")
-	_ = debugRlimitFlag.MarkHidden(CfgDebugRlimit)
-	_ = viper.BindPFlags(debugRlimitFlag)
-
-	RootFlags.StringVar(&cfgFile, cfgConfigFile, "", "config file")
-	RootFlags.String(CfgDataDir, "", "data directory")
+	RootFlags.StringVar(&cfgFile, CfgConfigFile, "", "config file")
 	_ = viper.BindPFlags(RootFlags)
 
-	RootFlags.AddFlagSet(loggingFlags)
-	RootFlags.AddFlagSet(debugAllowTestKeysFlag)
-	RootFlags.AddFlagSet(debugRlimitFlag)
+	RootFlags.AddFlagSet(debugFlags)
 	RootFlags.AddFlagSet(flags.DebugDontBlameOasisFlag)
 }
 
-// InitConfig initializes the command configuration.
-//
-// WARNING: This is exposed for the benefit of tests and the interface
-// is not guaranteed to be stable.
+// InitConfig initializes the global configuration.
 func InitConfig() {
 	if cfgFile != "" {
 		// Read the config file if one is provided, otherwise
 		// it is assumed that the combination of default values,
 		// command line flags and env vars is sufficient.
-		viper.SetConfigFile(cfgFile)
-		if err := viper.ReadInConfig(); err != nil {
+		if err := config.InitConfig(cfgFile); err != nil {
 			EarlyLogAndExit(err)
 		}
 	}
 
-	dataDir := viper.GetString(CfgDataDir)
-
 	// Force the DataDir to be an absolute path.
+	dataDir := config.GlobalConfig.Common.DataDir
 	if dataDir != "" {
 		var err error
 		dataDir, err = filepath.Abs(dataDir)
 		if err != nil {
 			EarlyLogAndExit(err)
 		}
-	}
 
-	// The command line flag values may be missing, but may be specified
-	// from other sources, write back to the common flag vars for
-	// convenience.
-	//
-	// Note: This is only for flags that are common across all
-	// sub-commands, so excludes things such as the gRPC/Metrics/etc
-	// configuration.
-	viper.Set(CfgDataDir, dataDir)
+		config.GlobalConfig.Common.DataDir = dataDir
+	}
 }
 
 func initDataDir() error {
-	dataDir := viper.GetString(CfgDataDir)
+	dataDir := config.GlobalConfig.Common.DataDir
 	if dataDir == "" {
 		return nil
 	}
@@ -179,7 +182,7 @@ func initDataDir() error {
 
 func normalizePath(f string) string {
 	if !filepath.IsAbs(f) {
-		dataDir := viper.GetString(CfgDataDir)
+		dataDir := config.GlobalConfig.Common.DataDir
 		f = filepath.Join(dataDir, f)
 		return filepath.Clean(f)
 	}
@@ -190,39 +193,33 @@ func initPublicKeyBlacklist() error {
 	allowTestKeys := flags.DebugDontBlameOasis() && viper.GetBool(CfgDebugAllowTestKeys)
 	signature.BuildPublicKeyBlacklist(allowTestKeys)
 	ias.BuildMrSignerBlacklist(allowTestKeys)
+	pcs.BuildMrSignerBlacklist(allowTestKeys)
 	return nil
 }
 
-func initRlimit() error {
-	// Suppress this for tooling, as it likely does not matter.
-	if !IsNodeCmd() {
-		return nil
+func initDebugEnclaves() error {
+	if flags.DebugDontBlameOasis() && viper.GetBool(CfgDebugAllowDebugEnclaves) {
+		rootLog.Warn("`debug.allow_debug_enclaves` set, enclaves in debug mode will be allowed")
+		ias.SetAllowDebugEnclaves()
+		pcs.SetAllowDebugEnclaves()
 	}
+	return nil
+}
 
-	var rlim syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlim); err != nil {
-		// Log, but don't return the error, this is only used for testing
-		// and to warn the user if it's set too low.
-		rootLog.Warn("failed to query RLIMIT_NOFILE",
-			"err", err,
-		)
-		return nil
+func initDebugTCBLaxVerify() error {
+	if flags.DebugDontBlameOasis() && viper.GetBool(CfgDebugTCBLaxVerify) {
+		rootLog.Warn("`debug.tcb_lax_verify` set, TCB lax verification will be done")
+		pcs.SetUnsafeLaxVerify()
 	}
+	return nil
+}
 
-	if rlim.Cur <= badDefaultRlimit {
-		rootLog.Warn("the node user has a very low RLIMIT_NOFILE, consider increasing",
-			"cur", rlim.Cur,
-			"max", rlim.Max,
-		)
+func initDebugSkipQuoteVerify() error {
+	if flags.DebugDontBlameOasis() && viper.GetBool(CfgDebugSkipQuoteVerify) {
+		rootLog.Warn("`debug.skip_quote_verify` set, PCS quotes will NOT be verified")
+		pcs.SetSkipVerify()
 	}
-
-	desiredLimit := viper.GetUint64(CfgDebugRlimit)
-	if !flags.DebugDontBlameOasis() || desiredLimit == 0 {
-		return nil
-	}
-
-	rlim.Cur = desiredLimit
-	return syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rlim)
+	return nil
 }
 
 // GetOutputWriter will create a file if the config string is set,
@@ -249,15 +246,19 @@ func GetInputReader(cmd *cobra.Command, cfg string) (io.ReadCloser, bool, error)
 	return r, true, err
 }
 
-// LoadEntity loads the entity and it's signer.
-func LoadEntity(signerBackend, entityDir string) (*entity.Entity, signature.Signer, error) {
+// LoadEntitySigner loads the entity and its signer.
+func LoadEntitySigner() (*entity.Entity, signature.Signer, error) {
 	if flags.DebugTestEntity() {
 		return entity.TestEntity()
 	}
-
-	factory, err := cmdSigner.NewFactory(signerBackend, entityDir, signature.SignerEntity)
+	entityDir, err := cmdSigner.CLIDirOrPwd()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to retrieve entity dir: %w", err)
+	}
+
+	factory, err := cmdSigner.NewFactory(cmdSigner.Backend(), entityDir, signature.SignerEntity)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create signer factory for %s: %w", cmdSigner.Backend(), err)
 	}
 
 	return entity.Load(entityDir, factory)
@@ -314,11 +315,17 @@ func GetUserConfirmation(prompt string) bool {
 // SetBasicVersionTemplate sets a basic custom version template for the given
 // cobra command that shows the version of Oasis Core and the Go toolchain.
 func SetBasicVersionTemplate(cmd *cobra.Command) {
-	cobra.AddTemplateFunc("additionalVersions", func() interface{} { return version.Versions })
+	cobra.AddTemplateFunc("toolchain", func() interface{} { return version.Toolchain })
 
 	cmd.SetVersionTemplate(`Software version: {{.Version}}
-{{- with additionalVersions }}
-Go toolchain version: {{ .Toolchain }}
-{{ end -}}
+Go toolchain version: {{ toolchain }}
 `)
+}
+
+// IsNotRootOrAllowed returns if the current user is allowed to run a node,
+// and if the effective user id is elevated or not.
+func IsNotRootOrAllowed() (canRun bool, isRoot bool) {
+	isRoot = os.Geteuid() == 0
+	canRun = !isRoot || flags.DebugAllowRoot()
+	return
 }

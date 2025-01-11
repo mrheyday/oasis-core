@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,7 +11,9 @@ import (
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	beaconTests "github.com/oasisprotocol/oasis-core/go/beacon/tests"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
@@ -20,40 +21,36 @@ import (
 	fileSigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/file"
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	cmnGrpc "github.com/oasisprotocol/oasis-core/go/common/grpc"
+	"github.com/oasisprotocol/oasis-core/go/common/identity"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	consensusAPI "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	tendermintCommon "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/common"
-	tendermintFull "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/full"
+	tmTestGenesis "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/tests/genesis"
 	consensusTests "github.com/oasisprotocol/oasis-core/go/consensus/tests"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
-	epochtimeTests "github.com/oasisprotocol/oasis-core/go/epochtime/tests"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
+	governanceTests "github.com/oasisprotocol/oasis-core/go/governance/tests"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdCommonFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/node"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	registryTests "github.com/oasisprotocol/oasis-core/go/registry/tests"
+	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	roothashTests "github.com/oasisprotocol/oasis-core/go/roothash/tests"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle"
 	runtimeClient "github.com/oasisprotocol/oasis-core/go/runtime/client/api"
 	clientTests "github.com/oasisprotocol/oasis-core/go/runtime/client/tests"
-	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
+	runtimeConfig "github.com/oasisprotocol/oasis-core/go/runtime/config"
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	schedulerTests "github.com/oasisprotocol/oasis-core/go/scheduler/tests"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 	stakingTests "github.com/oasisprotocol/oasis-core/go/staking/tests"
-	storageAPI "github.com/oasisprotocol/oasis-core/go/storage/api"
-	storageClient "github.com/oasisprotocol/oasis-core/go/storage/client"
-	storageClientTests "github.com/oasisprotocol/oasis-core/go/storage/client/tests"
 	storageTests "github.com/oasisprotocol/oasis-core/go/storage/tests"
-	workerCommon "github.com/oasisprotocol/oasis-core/go/worker/common"
-	"github.com/oasisprotocol/oasis-core/go/worker/compute"
-	"github.com/oasisprotocol/oasis-core/go/worker/compute/executor"
+	vault "github.com/oasisprotocol/oasis-core/go/vault/api"
+	vaultTests "github.com/oasisprotocol/oasis-core/go/vault/tests"
+	commonCommittee "github.com/oasisprotocol/oasis-core/go/worker/common/committee"
 	executorCommittee "github.com/oasisprotocol/oasis-core/go/worker/compute/executor/committee"
 	executorWorkerTests "github.com/oasisprotocol/oasis-core/go/worker/compute/executor/tests"
 	storageWorker "github.com/oasisprotocol/oasis-core/go/worker/storage"
 	storageWorkerTests "github.com/oasisprotocol/oasis-core/go/worker/storage/tests"
-)
-
-const (
-	workerClientPort = "9010"
 )
 
 var (
@@ -63,19 +60,7 @@ var (
 		key   string
 		value interface{}
 	}{
-		{"log.level.default", "DEBUG"},
-		{"log.format", "JSON"},
-		{cmdCommonFlags.CfgConsensusValidator, true},
 		{cmdCommonFlags.CfgDebugDontBlameOasis, true},
-		{storageWorker.CfgBackend, "badger"},
-		{compute.CfgWorkerEnabled, true},
-		{workerCommon.CfgRuntimeProvisioner, workerCommon.RuntimeProvisionerMock},
-		{workerCommon.CfgClientPort, workerClientPort},
-		{storageWorker.CfgWorkerEnabled, true},
-		{executor.CfgScheduleCheckTxEnabled, false},
-		{tendermintCommon.CfgCoreListenAddress, "tcp://0.0.0.0:27565"},
-		{tendermintFull.CfgSupplementarySanityEnabled, true},
-		{tendermintFull.CfgSupplementarySanityInterval, 1},
 		{cmdCommon.CfgDebugAllowTestKeys, true},
 	}
 
@@ -90,21 +75,25 @@ var (
 			RoundTimeout:    20,
 		},
 		TxnScheduler: registry.TxnSchedulerParameters{
-			Algorithm:         registry.TxnSchedulerSimple,
 			MaxBatchSize:      1,
 			MaxBatchSizeBytes: 1024,
 			BatchFlushTimeout: 20 * time.Second,
-			ProposerTimeout:   20,
-		},
-		Storage: registry.StorageParameters{
-			GroupSize:               1,
-			MinWriteReplication:     1,
-			MaxApplyWriteLogEntries: 100_000,
-			MaxApplyOps:             2,
+			ProposerTimeout:   40 * time.Second,
 		},
 		AdmissionPolicy: registry.RuntimeAdmissionPolicy{
 			AnyNode: &registry.AnyNodeRuntimeAdmissionPolicy{},
 		},
+		Constraints: map[scheduler.CommitteeKind]map[scheduler.Role]registry.SchedulingConstraints{
+			scheduler.KindComputeExecutor: {
+				scheduler.RoleWorker: {
+					MinPoolSize: &registry.MinPoolSizeConstraint{
+						Limit: 1,
+					},
+				},
+			},
+		},
+		GovernanceModel: registry.GovernanceEntity,
+		Deployments:     []*registry.VersionInfo{{}},
 	}
 
 	testRuntimeID common.Namespace
@@ -115,7 +104,9 @@ var (
 type testNode struct {
 	*node.Node
 
-	runtimeID             common.Namespace
+	runtimeID common.Namespace
+
+	commonCommitteeNode   *commonCommittee.Node
 	executorCommitteeNode *executorCommittee.Node
 
 	entity       *entity.Entity
@@ -143,11 +134,25 @@ func (n *testNode) Stop() {
 func newTestNode(t *testing.T) *testNode {
 	initConfigOnce.Do(func() {
 		cmdCommon.InitConfig()
+
+		config.GlobalConfig.Common.Log.Level = make(map[string]string)
+		config.GlobalConfig.Common.Log.Level["default"] = "debug"
+		config.GlobalConfig.Common.Log.Format = "json"
+
+		config.GlobalConfig.Consensus.Validator = true
+		config.GlobalConfig.Common.Debug.AllowRoot = true
+		config.GlobalConfig.Mode = config.ModeCompute
+		config.GlobalConfig.Runtime.Provisioner = runtimeConfig.RuntimeProvisionerMock
+		config.GlobalConfig.Storage.Backend = "badger"
+		config.GlobalConfig.Storage.PublicRPCEnabled = true
+		config.GlobalConfig.Consensus.ListenAddress = "tcp://0.0.0.0:27565"
+		config.GlobalConfig.Consensus.SupplementarySanity.Enabled = true
+		config.GlobalConfig.Consensus.SupplementarySanity.Interval = 1
 	})
 
 	require := require.New(t)
 
-	dataDir, err := ioutil.TempDir("", "oasis-node-test_")
+	dataDir, err := os.MkdirTemp("", "oasis-node-test_")
 	require.NoError(err, "create data dir")
 
 	signerFactory, err := fileSigner.NewFactory(dataDir, signature.SignerEntity)
@@ -155,17 +160,33 @@ func newTestNode(t *testing.T) *testNode {
 	entity, entitySigner, err := entity.Generate(dataDir, signerFactory, nil)
 	require.NoError(err, "create test entity")
 
-	viper.Set("datadir", dataDir)
-	viper.Set("log.file", filepath.Join(dataDir, "test-node.log"))
-	viper.Set(runtimeRegistry.CfgSupported, testRuntimeID.String())
-	viper.Set(runtimeRegistry.CfgTagIndexerBackend, "bleve")
-	viper.Set(workerCommon.CfgRuntimePaths, map[string]string{
-		testRuntimeID.String(): "mock-runtime",
+	config.GlobalConfig.Registration.Entity = filepath.Join(dataDir, "entity.json")
+
+	config.GlobalConfig.Common.DataDir = dataDir
+	config.GlobalConfig.Common.Log.File = filepath.Join(dataDir, "test-node.log")
+	viper.Set(bundle.CfgDebugMockIDs, []string{
+		testRuntimeID.String(),
 	})
-	viper.Set("worker.registration.entity", filepath.Join(dataDir, "entity.json"))
 	for _, kv := range testNodeStaticConfig {
 		viper.Set(kv.key, kv.value)
 	}
+
+	// Generate the test node identity.
+	nodeSignerFactory, err := fileSigner.NewFactory(dataDir, identity.RequiredSignerRoles...)
+	require.NoError(err, "create node file signer")
+	identity, err := identity.LoadOrGenerate(dataDir, nodeSignerFactory)
+	require.NoError(err, "create test node identity")
+	// Include node in entity.
+	entity.Nodes = append(entity.Nodes, identity.NodeSigner.Public())
+
+	// Generate genesis and save it to file.
+	genesisPath := filepath.Join(dataDir, "genesis.json")
+	genesis, err := tmTestGenesis.NewTestNodeGenesisProvider(identity, entity, entitySigner)
+	require.NoError(err, "test genesis provision")
+	doc, err := genesis.GetGenesisDocument()
+	require.NoError(err, "test entity genesis document")
+	require.NoError(doc.WriteFileJSON(genesisPath))
+	config.GlobalConfig.Genesis.File = genesisPath
 
 	n := &testNode{
 		runtimeID:    testRuntime.ID,
@@ -175,7 +196,7 @@ func newTestNode(t *testing.T) *testNode {
 		start:        time.Now(),
 	}
 	t.Logf("starting node, data directory: %v", dataDir)
-	n.Node, err = node.NewTestNode()
+	n.Node, err = node.NewNode()
 	require.NoError(err, "start node")
 
 	// Add the testNode to the newly generated entity's list of nodes
@@ -231,30 +252,23 @@ func TestNode(t *testing.T) {
 		// Runtime client tests also need a functional runtime.
 		{"RuntimeClient", testRuntimeClient},
 
+		// Governance requires a registered node that is a validator that was not slashed.
+		{"Governance", testGovernance},
+
 		// Staking requires a registered node that is a validator.
 		{"Staking", testStaking},
 		{"StakingClient", testStakingClient},
 
-		// TestStorageClientWithNode runs storage tests against a storage client
-		// connected to this node.
-		{"TestStorageClientWithNode", testStorageClientWithNode},
-
-		// Clean up and ensure the registry is empty for the following tests.
-		{"DeregisterTestEntityRuntime", testDeregisterEntityRuntime},
-
 		{"Consensus", testConsensus},
 		{"ConsensusClient", testConsensusClient},
-		{"EpochTime", testEpochTime},
+
 		{"Beacon", testBeacon},
 		{"Storage", testStorage},
 		{"Registry", testRegistry},
 		{"Scheduler", testScheduler},
 		{"SchedulerClient", testSchedulerClient},
 		{"RootHash", testRootHash},
-
-		// TestStorageClientWithoutNode runs client tests that use a mock storage
-		// node and mock committees.
-		{"TestStorageClientWithoutNode", testStorageClientWithoutNode},
+		{"Vault", testVault},
 	}
 
 	for _, tc := range testCases {
@@ -281,76 +295,15 @@ func testRegisterEntityRuntime(t *testing.T, node *testNode) {
 	require.NoError(err, "register test entity")
 
 	// Register the test runtime.
-	signedRt, err := registry.SignRuntime(testEntitySigner, registry.RegisterRuntimeSignatureContext, testRuntime)
-	require.NoError(err, "sign runtime descriptor")
-	tx = registry.NewRegisterRuntimeTx(0, nil, signedRt)
+	tx = registry.NewRegisterRuntimeTx(0, nil, testRuntime)
 	err = consensusAPI.SignAndSubmitTx(context.Background(), node.Consensus, testEntitySigner, tx)
 	require.NoError(err, "register test entity")
 
-	// Get the runtime and the corresponding executor committee node instance.
-	executorRT := node.ExecutorWorker.GetRuntime(testRuntime.ID)
-	require.NotNil(t, executorRT)
-	node.executorCommitteeNode = executorRT
-}
-
-func testDeregisterEntityRuntime(t *testing.T, node *testNode) {
-	// Stop the registration service and wait for it to fully stop. This is required
-	// as otherwise it will re-register the node on each epoch transition.
-	node.RegistrationWorker.Stop()
-	<-node.RegistrationWorker.Quit()
-
-	// Subscribe to node deregistration event.
-	nodeCh, sub, err := node.Node.Consensus.Registry().WatchNodes(context.Background())
-	require.NoError(t, err, "WatchNodes")
-	defer sub.Close()
-
-	// Perform an epoch transition to expire the node as otherwise there is no way
-	// to deregister the entity.
-	require.Implements(t, (*epochtime.SetableBackend)(nil), node.Consensus.EpochTime(), "epoch time backend is mock")
-	timeSource := (node.Consensus.EpochTime()).(epochtime.SetableBackend)
-	_ = epochtimeTests.MustAdvanceEpoch(t, timeSource, 2+1+1) // 2 epochs for expiry, 1 for debonding, 1 for removal.
-
-WaitLoop:
-	for {
-		select {
-		case ev := <-nodeCh:
-			// NOTE: There can be in-flight registrations from before the registration worker
-			//       was stopped. Make sure to skip them.
-			if ev.IsRegistration {
-				continue
-			}
-
-			require.Equal(t, ev.Node.ID, node.Identity.NodeSigner.Public(), "expected node deregistration event")
-			break WaitLoop
-		case <-time.After(1 * time.Second):
-			t.Fatalf("Failed to receive node deregistration event")
-		}
-	}
-
-	// Subscribe to entity deregistration event.
-	entityCh, sub, err := node.Node.Consensus.Registry().WatchEntities(context.Background())
-	require.NoError(t, err, "WatchEntities")
-	defer sub.Close()
-
-	tx := registry.NewDeregisterEntityTx(0, nil)
-	err = consensusAPI.SignAndSubmitTx(context.Background(), node.Consensus, node.entitySigner, tx)
-	require.NoError(t, err, "deregister test entity")
-
-	select {
-	case ev := <-entityCh:
-		require.False(t, ev.IsRegistration, "expected entity deregistration event")
-	case <-time.After(1 * time.Second):
-		t.Fatalf("Failed to receive entity deregistration event")
-	}
-
-	// Deregistering the test entity should fail as it has runtimes.
-	_, testEntitySigner, _ := entity.TestEntity()
-	tx = registry.NewDeregisterEntityTx(0, nil)
-	err = consensusAPI.SignAndSubmitTx(context.Background(), node.Consensus, testEntitySigner, tx)
-	require.Error(t, err, "deregister should fail when an entity has runtimes")
-	require.Equal(t, err, registry.ErrEntityHasRuntimes)
-
-	registryTests.EnsureRegistryEmpty(t, node.Node.Consensus.Registry())
+	// Get the runtime and the corresponding committee node instances.
+	node.executorCommitteeNode = node.ExecutorWorker.GetRuntime(testRuntime.ID)
+	node.commonCommitteeNode = node.CommonWorker.GetRuntime(testRuntime.ID)
+	require.NotNil(t, node.executorCommitteeNode)
+	require.NotNil(t, node.commonCommitteeNode)
 }
 
 func testConsensus(t *testing.T, node *testNode) {
@@ -359,62 +312,60 @@ func testConsensus(t *testing.T, node *testNode) {
 
 func testConsensusClient(t *testing.T, node *testNode) {
 	// Create a client backend connected to the local node's internal socket.
-	conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, "internal.sock"), grpc.WithInsecure())
+	conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, cmdCommon.InternalSocketName),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err, "Dial")
 
 	client := consensusAPI.NewConsensusClient(conn)
 	consensusTests.ConsensusImplementationTests(t, client)
 }
 
-func testEpochTime(t *testing.T, node *testNode) {
-	epochtimeTests.EpochtimeSetableImplementationTest(t, node.Consensus.EpochTime())
-}
-
 func testBeacon(t *testing.T, node *testNode) {
-	timeSource := (node.Consensus.EpochTime()).(epochtime.SetableBackend)
+	beaconTests.EpochtimeSetableImplementationTest(t, node.Consensus.Beacon())
 
-	beaconTests.BeaconImplementationTests(t, node.Consensus.Beacon(), timeSource)
+	timeSource := (node.Consensus.Beacon()).(beacon.SetableBackend)
+	beaconTests.BeaconImplementationTests(t, timeSource)
 }
 
-func testStorage(t *testing.T, node *testNode) {
-	dataDir, err := ioutil.TempDir("", "oasis-storage-test_")
+func testStorage(t *testing.T, _ *testNode) {
+	dataDir, err := os.MkdirTemp("", "oasis-storage-test_")
 	require.NoError(t, err, "TempDir")
 	defer os.RemoveAll(dataDir)
 
-	backend, err := storageWorker.NewLocalBackend(dataDir, testRuntimeID, node.Identity)
+	backend, err := storageWorker.NewLocalBackend(dataDir, testRuntimeID)
 	require.NoError(t, err, "storage.New")
 	defer backend.Cleanup()
-	// We are always testing a local storage backend here.
-	localBackend := backend.(storageAPI.LocalBackend)
 
-	storageTests.StorageImplementationTests(t, localBackend, backend, testRuntimeID, 0)
+	storageTests.StorageImplementationTests(t, backend, backend, testRuntimeID, 0)
 }
 
 func testRegistry(t *testing.T, node *testNode) {
-	registryTests.RegistryImplementationTests(t, node.Consensus.Registry(), node.Consensus)
+	registryTests.RegistryImplementationTests(t, node.Consensus.Registry(), node.Consensus, node.entity.ID)
 }
 
 func testScheduler(t *testing.T, node *testNode) {
-	schedulerTests.SchedulerImplementationTests(t, "", node.Consensus.Scheduler(), node.Consensus)
+	schedulerTests.SchedulerImplementationTests(t, "", node.Identity, node.Consensus.Scheduler(), node.Consensus)
 }
 
 func testSchedulerClient(t *testing.T, node *testNode) {
 	// Create a client backend connected to the local node's internal socket.
-	conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, "internal.sock"), grpc.WithInsecure())
+	conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, cmdCommon.InternalSocketName),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err, "Dial")
 	defer conn.Close()
 
 	client := scheduler.NewSchedulerClient(conn)
-	schedulerTests.SchedulerImplementationTests(t, "client", client, node.Consensus)
+	schedulerTests.SchedulerImplementationTests(t, "client", node.Identity, client, node.Consensus)
 }
 
 func testStaking(t *testing.T, node *testNode) {
-	stakingTests.StakingImplementationTests(t, node.Consensus.Staking(), node.Consensus, node.Identity, node.entity, node.entitySigner, testRuntimeID)
+	stakingTests.StakingImplementationTests(t, node.Consensus.Staking(), node.Consensus, node.Identity, node.entity)
 }
 
 func testStakingClient(t *testing.T, node *testNode) {
 	// Create a client backend connected to the local node's internal socket.
-	conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, "internal.sock"), grpc.WithInsecure())
+	conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, cmdCommon.InternalSocketName),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err, "Dial")
 	defer conn.Close()
 
@@ -423,21 +374,59 @@ func testStakingClient(t *testing.T, node *testNode) {
 }
 
 func testRootHash(t *testing.T, node *testNode) {
-	roothashTests.RootHashImplementationTests(t, node.Consensus.RootHash(), node.Consensus, node.Identity)
+	// Directly.
+	t.Run("Direct", func(t *testing.T) {
+		roothashTests.RootHashImplementationTests(t, node.Consensus.RootHash(), node.Consensus, node.Identity)
+	})
+
+	// Over gRPC.
+	t.Run("OverGrpc", func(t *testing.T) {
+		// Create a client backend connected to the local node's internal socket.
+		conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, cmdCommon.InternalSocketName),
+			grpc.WithTransportCredentials(insecure.NewCredentials()))
+		require.NoError(t, err, "Dial")
+		defer conn.Close()
+
+		client := roothash.NewRootHashClient(conn)
+		roothashTests.RootHashImplementationTests(t, client, node.Consensus, node.Identity)
+	})
+}
+
+func testGovernance(t *testing.T, node *testNode) {
+	// Directly.
+	t.Run("Direct", func(t *testing.T) {
+		governanceTests.GovernanceImplementationTests(t, node.Consensus.Governance(), node.Consensus, node.entity, node.entitySigner)
+	})
+
+	// Over gRPC.
+	t.Run("OverGrpc", func(t *testing.T) {
+		// Create a client backend connected to the local node's internal socket.
+		conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, cmdCommon.InternalSocketName),
+			grpc.WithTransportCredentials(insecure.NewCredentials()))
+		require.NoError(t, err, "Dial")
+		defer conn.Close()
+
+		client := governance.NewGovernanceClient(conn)
+		governanceTests.GovernanceImplementationTests(t, client, node.Consensus, node.entity, node.entitySigner)
+	})
 }
 
 func testExecutorWorker(t *testing.T, node *testNode) {
-	timeSource := (node.Consensus.EpochTime()).(epochtime.SetableBackend)
+	timeSource := (node.Consensus.Beacon()).(beacon.SetableBackend)
+
+	rt, err := node.RuntimeRegistry.GetRuntime(node.runtimeID)
+	require.NoError(t, err, "runtimeRegistry.GetRuntime")
 
 	require.NotNil(t, node.executorCommitteeNode)
 	executorWorkerTests.WorkerImplementationTests(
 		t,
 		node.ExecutorWorker,
 		node.runtimeID,
+		node.commonCommitteeNode,
 		node.executorCommitteeNode,
 		timeSource,
 		node.Consensus.RootHash(),
-		node.RuntimeRegistry.StorageRouter(),
+		rt.Storage(),
 	)
 }
 
@@ -446,15 +435,11 @@ func testStorageWorker(t *testing.T, node *testNode) {
 }
 
 func testRuntimeClient(t *testing.T, node *testNode) {
-	// Directly.
-	t.Run("Direct", func(t *testing.T) {
-		clientTests.ClientImplementationTests(t, node.RuntimeClient, node.runtimeID)
-	})
-
 	// Over gRPC.
 	t.Run("OverGrpc", func(t *testing.T) {
 		// Create a client backend connected to the local node's internal socket.
-		conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, "internal.sock"), grpc.WithInsecure())
+		conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, cmdCommon.InternalSocketName),
+			grpc.WithTransportCredentials(insecure.NewCredentials()))
 		require.NoError(t, err, "Dial")
 		defer conn.Close()
 
@@ -463,28 +448,23 @@ func testRuntimeClient(t *testing.T, node *testNode) {
 	})
 }
 
-func testStorageClientWithNode(t *testing.T, node *testNode) {
-	ctx := context.Background()
+func testVault(t *testing.T, node *testNode) {
+	// Directly.
+	t.Run("Direct", func(t *testing.T) {
+		vaultTests.VaultImplementationTests(t, node.Consensus.Vault(), node.Consensus)
+	})
 
-	// Get the local storage backend (the one that the client is connecting to).
-	rt, err := node.RuntimeRegistry.GetRuntime(testRuntimeID)
-	require.NoError(t, err, "GetRuntime")
-	localBackend := rt.Storage().(storageAPI.LocalBackend)
+	// Over gRPC.
+	t.Run("OverGrpc", func(t *testing.T) {
+		// Create a client backend connected to the local node's internal socket.
+		conn, err := cmnGrpc.Dial("unix:"+filepath.Join(node.dataDir, cmdCommon.InternalSocketName),
+			grpc.WithTransportCredentials(insecure.NewCredentials()))
+		require.NoError(t, err, "Dial")
+		defer conn.Close()
 
-	client, err := storageClient.NewStatic(ctx, testRuntimeID, node.Identity, node.Consensus.Registry(), node.Identity.NodeSigner.Public())
-	require.NoError(t, err, "NewStatic")
-
-	// Determine the current round. This is required so that we can commit into
-	// storage at the next (non-finalized) round.
-	blk, err := node.Consensus.RootHash().GetLatestBlock(ctx, testRuntimeID, consensusAPI.HeightLatest)
-	require.NoError(t, err, "GetLatestBlock")
-
-	storageTests.StorageImplementationTests(t, localBackend, client, testRuntimeID, blk.Header.Round+1)
-}
-
-func testStorageClientWithoutNode(t *testing.T, node *testNode) {
-	// Storage client tests without node.
-	storageClientTests.ClientWorkerTests(t, node.Identity, node.Consensus)
+		client := vault.NewVaultClient(conn)
+		vaultTests.VaultImplementationTests(t, client, node.Consensus)
+	})
 }
 
 func init() {

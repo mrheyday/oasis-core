@@ -3,18 +3,18 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
-	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
+	cmnBackoff "github.com/oasisprotocol/oasis-core/go/common/backoff"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host"
@@ -22,26 +22,36 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/runtime/host/sandbox/process"
 )
 
+var errRuntimeNotReady = errors.New("runtime is not yet ready")
+
 const (
-	runtimeConnectTimeout      = 5 * time.Second
 	runtimeInitTimeout         = 1 * time.Second
 	runtimeExtendedInitTimeout = 120 * time.Second
 	runtimeInterruptTimeout    = 1 * time.Second
-
-	bindHostSocketPath = "/host.sock"
+	resetTickerTimeout         = 15 * time.Minute
 
 	ctrlChannelBufferSize = 16
 )
 
+// GetSandboxConfigFunc is the function used to generate the sandbox configuration.
+type GetSandboxConfigFunc func(cfg host.Config, conn Connector, runtimeDir string) (process.Config, error)
+
 // Config contains the sandbox provisioner configuration options.
 type Config struct {
+	// Connector is the runtime connector factory that is used to establish a connection with the
+	// runtime via the Runtime Host Protocol.
+	Connector ConnectorFactoryFunc
+
 	// GetSandboxConfig is a function that generates the sandbox configuration. In case it is not
 	// specified a default function is used.
-	GetSandboxConfig func(cfg host.Config, socketPath, runtimeDir string) (process.Config, error)
+	GetSandboxConfig GetSandboxConfigFunc
+
+	// HostInfo provides information about the host environment.
+	HostInfo *protocol.HostInfo
 
 	// HostInitializer is a function that additionally initializes the runtime host. In case it is
 	// not specified a default function is used.
-	HostInitializer func(context.Context, host.Runtime, version.Version, process.Process, protocol.Connection) (*host.StartedEvent, error)
+	HostInitializer func(context.Context, *HostInitializerParams) (*host.StartedEvent, error)
 
 	// Logger is an optional logger to use with this provisioner. In case it is not specified a
 	// default logger will be created.
@@ -54,22 +64,45 @@ type Config struct {
 	InsecureNoSandbox bool
 }
 
+// HostInitializerParams contains parameters for the HostInitializer function.
+type HostInitializerParams struct {
+	Runtime    host.Runtime
+	Config     *host.Config
+	Version    version.Version
+	Process    process.Process
+	Connection protocol.Connection
+
+	NotifyUpdateCapabilityTEE <-chan struct{}
+}
+
 type provisioner struct {
 	cfg Config
 }
 
 // Implements host.Provisioner.
-func (p *provisioner) NewRuntime(ctx context.Context, cfg host.Config) (host.Runtime, error) {
+func (p *provisioner) NewRuntime(cfg host.Config) (host.Runtime, error) {
 	r := &sandboxedRuntime{
-		cfg:      p.cfg,
-		rtCfg:    cfg,
-		stopCh:   make(chan struct{}),
-		quitCh:   make(chan struct{}),
-		ctrlCh:   make(chan interface{}, ctrlChannelBufferSize),
-		notifier: pubsub.NewBroker(false),
-		logger:   p.cfg.Logger.With("runtime_id", cfg.RuntimeID),
+		cfg:                         p.cfg,
+		rtCfg:                       cfg,
+		id:                          cfg.ID,
+		stopCh:                      make(chan struct{}),
+		ctrlCh:                      make(chan interface{}, ctrlChannelBufferSize),
+		notifier:                    pubsub.NewBroker(false),
+		notifyUpdateCapabilityTEECh: make(chan struct{}, 1),
+		logger:                      p.cfg.Logger.With("runtime_id", cfg.ID),
 	}
+
+	err := cfg.MessageHandler.AttachRuntime(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to attach host: %w", err)
+	}
+
 	return r, nil
+}
+
+// Implements host.Provisioner.
+func (p *provisioner) Name() string {
+	return "sandbox"
 }
 
 // abortRequest is a request to the runtime manager goroutine to abort the runtime.
@@ -84,79 +117,139 @@ type sandboxedRuntime struct {
 
 	cfg   Config
 	rtCfg host.Config
+	id    common.Namespace
 
-	stopCh chan struct{}
-	quitCh chan struct{}
-	ctrlCh chan interface{}
+	startOnce sync.Once
+	stopOnce  sync.Once
+	stopCh    chan struct{}
+	ctrlCh    chan interface{}
 
-	started  bool
 	process  process.Process
 	conn     protocol.Connection
 	notifier *pubsub.Broker
+
+	notifyUpdateCapabilityTEECh chan struct{}
+	capabilityTEE               *node.CapabilityTEE
+
+	rtVersion *version.Version
 
 	logger *logging.Logger
 }
 
 // Implements host.Runtime.
 func (r *sandboxedRuntime) ID() common.Namespace {
-	return r.rtCfg.RuntimeID
+	return r.id
+}
+
+// GetInfo implements host.Runtime.
+func (r *sandboxedRuntime) GetActiveVersion() (*version.Version, error) {
+	r.RLock()
+	defer r.RUnlock()
+
+	if r.conn == nil {
+		return nil, errRuntimeNotReady
+	}
+	return r.rtVersion, nil
 }
 
 // Implements host.Runtime.
-func (r *sandboxedRuntime) Call(ctx context.Context, body *protocol.Body) (rsp *protocol.Body, err error) {
-	callFn := func() error {
-		r.RLock()
-		conn := r.conn
-		r.RUnlock()
-
-		if conn == nil {
-			return fmt.Errorf("runtime is not ready")
-		}
-		rsp, err = r.conn.Call(ctx, body)
-		if err != nil {
-			// All protocol-level errors are permanent.
-			return backoff.Permanent(err)
-		}
-		return nil
+func (r *sandboxedRuntime) GetInfo(ctx context.Context) (*protocol.RuntimeInfoResponse, error) {
+	conn, err := r.getConnection(ctx)
+	if err != nil {
+		return nil, err
 	}
 
-	// Retry call in case the runtime is not yet ready.
-	err = backoff.Retry(callFn, backoff.WithContext(backoff.NewExponentialBackOff(), ctx))
-	return
+	return conn.GetInfo()
 }
 
 // Implements host.Runtime.
-func (r *sandboxedRuntime) WatchEvents(ctx context.Context) (<-chan *host.Event, pubsub.ClosableSubscription, error) {
+func (r *sandboxedRuntime) GetCapabilityTEE() (*node.CapabilityTEE, error) {
+	r.RLock()
+	defer r.RUnlock()
+
+	if r.conn == nil {
+		return nil, errRuntimeNotReady
+	}
+	return r.capabilityTEE, nil
+}
+
+// Implements host.Runtime.
+func (r *sandboxedRuntime) Call(ctx context.Context, body *protocol.Body) (*protocol.Body, error) {
+	conn, err := r.getConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Take care to release lock before calling into the runtime as otherwise this could lead to a
+	// deadlock in case the runtime makes a call that acquires the cross node lock and at the same
+	// time SetVersion is being called to update the version with the cross node lock acquired.
+
+	return conn.Call(ctx, body)
+}
+
+func (r *sandboxedRuntime) getConnection(ctx context.Context) (protocol.Connection, error) {
+	var conn protocol.Connection
+	getConnFn := func() error {
+		r.RLock()
+		defer r.RUnlock()
+
+		if r.conn == nil {
+			return errRuntimeNotReady
+		}
+		conn = r.conn
+
+		return nil
+	}
+	// Retry call in case the runtime is not yet ready.
+	err := backoff.Retry(getConnFn, backoff.WithContext(cmnBackoff.NewExponentialBackOff(), ctx))
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+// Implements host.Runtime.
+func (r *sandboxedRuntime) UpdateCapabilityTEE() {
+	select {
+	case r.notifyUpdateCapabilityTEECh <- struct{}{}:
+	default:
+	}
+}
+
+// Implements host.Runtime.
+func (r *sandboxedRuntime) WatchEvents() (<-chan *host.Event, pubsub.ClosableSubscription) {
 	typedCh := make(chan *host.Event)
 	sub := r.notifier.Subscribe()
 	sub.Unwrap(typedCh)
 
-	return typedCh, sub, nil
+	return typedCh, sub
 }
 
 // Implements host.Runtime.
-func (r *sandboxedRuntime) Start() error {
-	r.Lock()
-	defer r.Unlock()
-
-	if r.started {
-		return nil
-	}
-	r.started = true
-
-	go r.manager()
-
-	return nil
+func (r *sandboxedRuntime) Start() {
+	r.startOnce.Do(func() {
+		go r.manager()
+	})
 }
 
 // Implements host.Runtime.
 func (r *sandboxedRuntime) Abort(ctx context.Context, force bool) error {
+	// Ignore abort requests when connection is not available.
+	r.RLock()
+	if r.conn == nil {
+		r.RUnlock()
+		return nil
+	}
+	r.RUnlock()
+
 	// Send internal request to the manager goroutine.
 	ch := make(chan error, 1)
 	select {
 	case r.ctrlCh <- &abortRequest{ch: ch, force: force}:
-	case <-ctx.Done():
-		return ctx.Err()
+	default:
+		// If the command channel is full, do not queue more abort requests.
+		return fmt.Errorf("command channel is full")
 	}
 
 	// Wait for response from the manager goroutine.
@@ -170,7 +263,9 @@ func (r *sandboxedRuntime) Abort(ctx context.Context, force bool) error {
 
 // Implements host.Runtime.
 func (r *sandboxedRuntime) Stop() {
-	close(r.stopCh)
+	r.stopOnce.Do(func() {
+		close(r.stopCh)
+	})
 }
 
 // Implements host.EmitEvent.
@@ -180,7 +275,7 @@ func (r *sandboxedRuntime) EmitEvent(ev *host.Event) {
 
 func (r *sandboxedRuntime) startProcess() (err error) {
 	// Create a temporary directory.
-	runtimeDir, err := ioutil.TempDir("", "oasis-runtime")
+	runtimeDir, err := os.MkdirTemp("", "oasis-runtime")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary directory: %w", err)
 	}
@@ -188,16 +283,12 @@ func (r *sandboxedRuntime) startProcess() (err error) {
 	// has been mounted into the sandbox and is no longer needed.
 	defer os.RemoveAll(runtimeDir)
 
-	// Create unix socket.
-	hostSocket := filepath.Join(runtimeDir, "host.sock")
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: hostSocket})
+	// Create a new connector.
+	connector, err := r.cfg.Connector(r.logger, runtimeDir, !r.cfg.InsecureNoSandbox)
 	if err != nil {
-		return fmt.Errorf("failed to create host socket: %w", err)
+		return err
 	}
-
-	// Since we only accept a single connection, we should close the listener
-	// in any case.
-	defer listener.Close()
+	defer connector.Close()
 
 	// Create the sandbox as configured.
 	var p process.Process
@@ -209,15 +300,18 @@ func (r *sandboxedRuntime) startProcess() (err error) {
 		}
 	}()
 
+	cfg, err := r.cfg.GetSandboxConfig(r.rtCfg, connector, runtimeDir)
+	if err != nil {
+		return fmt.Errorf("failed to configure process: %w", err)
+	}
+	if err = connector.Configure(&r.rtCfg, &cfg); err != nil {
+		return err
+	}
+
 	switch r.cfg.InsecureNoSandbox {
 	case true:
 		// No sandbox.
 		r.logger.Warn("starting an UNSANDBOXED runtime")
-
-		cfg, cErr := r.cfg.GetSandboxConfig(r.rtCfg, hostSocket, runtimeDir)
-		if cErr != nil {
-			return fmt.Errorf("failed to configure process: %w", cErr)
-		}
 
 		p, err = process.NewNaked(cfg)
 		if err != nil {
@@ -225,16 +319,6 @@ func (r *sandboxedRuntime) startProcess() (err error) {
 		}
 	case false:
 		// With sandbox.
-		cfg, cErr := r.cfg.GetSandboxConfig(r.rtCfg, bindHostSocketPath, runtimeDir)
-		if cErr != nil {
-			return fmt.Errorf("failed to configure sandbox: %w", cErr)
-		}
-
-		if cfg.BindRW == nil {
-			cfg.BindRW = make(map[string]string)
-		}
-		cfg.BindRW[hostSocket] = bindHostSocketPath
-
 		p, err = process.NewBubbleWrap(cfg)
 		if err != nil {
 			return fmt.Errorf("failed to spawn sandbox: %w", err)
@@ -246,44 +330,9 @@ func (r *sandboxedRuntime) startProcess() (err error) {
 		"pid", p.GetPID(),
 	)
 
-	// Spawn goroutine that waits for a connection to be established.
-	connCh := make(chan interface{})
-	go func() {
-		lerr := listener.SetDeadline(time.Now().Add(runtimeConnectTimeout))
-		if lerr != nil {
-			connCh <- lerr
-			return
-		}
-		conn, lerr := listener.Accept()
-		if lerr != nil {
-			connCh <- lerr
-			return
-		}
-
-		connCh <- conn
-		close(connCh)
-	}()
-
-	var conn net.Conn
-	select {
-	case res := <-connCh:
-		// Got a connection or timed out while accepting a connection.
-		switch r := res.(type) {
-		case error:
-			return fmt.Errorf("error while accepting runtime connection: %w", r)
-		case net.Conn:
-			conn = r
-		default:
-			panic("invalid type")
-		}
-	case <-p.Wait():
-		// Runtime has terminated before a connection was accepted.
-		r.logger.Debug("runtime process exited unexpectedly",
-			"pid", p.GetPID(),
-			"err", p.Error(),
-		)
-
-		return fmt.Errorf("terminated while waiting for runtime to connect")
+	conn, err := connector.Connect(p)
+	if err != nil {
+		return err
 	}
 
 	// Initialize the connection.
@@ -291,7 +340,7 @@ func (r *sandboxedRuntime) startProcess() (err error) {
 		"pid", p.GetPID(),
 	)
 
-	pc, err := protocol.NewConnection(r.logger, r.rtCfg.RuntimeID, r.rtCfg.MessageHandler)
+	pc, err := protocol.NewConnection(r.logger, r.id, r.rtCfg.MessageHandler)
 	if err != nil {
 		return fmt.Errorf("failed to create connection: %w", err)
 	}
@@ -313,25 +362,69 @@ func (r *sandboxedRuntime) startProcess() (err error) {
 	}()
 	defer cancel()
 
+	// Populate the runtime-specific parts of host information.
+	hi := r.cfg.HostInfo.Clone()
+	hi.LocalConfig = r.rtCfg.LocalConfig
+
 	// Perform common host initialization.
-	var rtVersion *version.Version
 	initCtx, cancelInit := context.WithTimeout(ctx, runtimeInitTimeout)
 	defer cancelInit()
-	if rtVersion, err = pc.InitHost(initCtx, conn); err != nil {
+
+	rtVersion, err := pc.InitHost(initCtx, conn, hi)
+	if err != nil {
 		return fmt.Errorf("failed to initialize connection: %w", err)
+	}
+
+	if comp := r.rtCfg.Components[0]; comp.ID().IsRONL() {
+		// Make sure the version matches what is configured in the bundle. This check is skipped for
+		// non-RONL components to support detached bundles.
+		if bndVersion := comp.Version; *rtVersion != bndVersion {
+			return fmt.Errorf("version mismatch (runtime reported: %s bundle: %s)", *rtVersion, bndVersion)
+		}
+	}
+
+	hp := &HostInitializerParams{
+		Runtime:                   r,
+		Config:                    &r.rtCfg,
+		Version:                   *rtVersion,
+		Process:                   p,
+		Connection:                pc,
+		NotifyUpdateCapabilityTEE: r.notifyUpdateCapabilityTEECh,
 	}
 
 	// Perform configuration-specific host initialization.
 	exInitCtx, cancelExInit := context.WithTimeout(ctx, runtimeExtendedInitTimeout)
 	defer cancelExInit()
-	ev, err := r.cfg.HostInitializer(exInitCtx, r, *rtVersion, p, pc)
+	ev, err := r.cfg.HostInitializer(exInitCtx, hp)
 	if err != nil {
 		return fmt.Errorf("failed to initialize connection: %w", err)
 	}
 
 	ok = true
 	r.process = p
+	r.Lock()
 	r.conn = pc
+	r.capabilityTEE = ev.CapabilityTEE
+	r.rtVersion = rtVersion
+	r.Unlock()
+
+	// Ensure the command queue is empty to avoid processing any stale requests after the
+	// runtime restarts.
+drainLoop:
+	for {
+		select {
+		case grq := <-r.ctrlCh:
+			switch rq := grq.(type) {
+			case *abortRequest:
+				rq.ch <- fmt.Errorf("runtime restarted")
+				close(rq.ch)
+			default:
+				// Ignore unknown requests.
+			}
+		default:
+			break drainLoop
+		}
+	}
 
 	// Notify subscribers that a runtime has been started.
 	r.notifier.Broadcast(&host.Event{Started: ev})
@@ -352,7 +445,7 @@ func (r *sandboxedRuntime) handleAbortRequest(rq *abortRequest) error {
 		return nil
 	}
 
-	r.logger.Warn("restarting runtime", "force_restart", rq.force, "abbort_err", err, "abort_resp", response)
+	r.logger.Warn("restarting runtime", "force_restart", rq.force, "abort_err", err, "abort_resp", response)
 
 	// Failed to gracefully interrupt the runtime. Kill the runtime and it will be automatically
 	// restarted by the manager after it dies.
@@ -370,10 +463,12 @@ func (r *sandboxedRuntime) handleAbortRequest(rq *abortRequest) error {
 
 	// Remove the process so it will be respanwed (it would be respawned either way, but with an
 	// additional "unexpected termination" message).
-	r.Lock()
 	r.conn.Close()
 	r.process = nil
+	r.Lock()
 	r.conn = nil
+	r.capabilityTEE = nil
+	r.rtVersion = nil
 	r.Unlock()
 
 	// Notify subscribers that the runtime has stopped.
@@ -383,13 +478,7 @@ func (r *sandboxedRuntime) handleAbortRequest(rq *abortRequest) error {
 }
 
 func (r *sandboxedRuntime) manager() {
-	// Initialize a ticker channel for restarting the process. Initialize it with a closed channel
-	// so that the first time, the process will be restarted immediately.
 	var ticker *backoff.Ticker
-	var tickerCh <-chan time.Time
-	ch := make(chan time.Time)
-	tickerCh = ch
-	close(ch)
 
 	defer func() {
 		r.logger.Warn("terminating runtime")
@@ -406,54 +495,58 @@ func (r *sandboxedRuntime) manager() {
 
 			r.Lock()
 			r.conn = nil
+			r.capabilityTEE = nil
 			r.Unlock()
-
-			// Notify subscribers that the runtime has stopped.
-			r.notifier.Broadcast(&host.Event{Stopped: &host.StoppedEvent{}})
 		}
 
-		close(r.quitCh)
+		// Notify subscribers that the runtime has stopped.
+		r.notifier.Broadcast(&host.Event{Stopped: &host.StoppedEvent{}})
 	}()
+
+	// Subscribe to own events to make sure the cached CapabilityTEE remains up-to-date.
+	evCh, evSub := r.WatchEvents()
+	defer evSub.Close()
 
 	var attempt int
 	for {
 		// Make sure to restart the process if terminated.
 		if r.process == nil {
+			firstTickCh := make(chan struct{}, 1)
+			if ticker == nil {
+				// Initialize a ticker for restarting the process. We use a separate channel
+				// to restart the process immediately on the first run, as we don't want to wait
+				// for the first tick.
+				ticker = backoff.NewTicker(cmnBackoff.NewExponentialBackOff())
+				firstTickCh <- struct{}{}
+				attempt = 0
+			}
+
 			select {
 			case <-r.stopCh:
 				r.logger.Warn("termination requested")
 				return
-			case <-tickerCh:
-				attempt++
-				r.logger.Info("starting runtime",
-					"attempt", attempt,
+			case <-firstTickCh:
+			case <-ticker.C:
+			}
+
+			attempt++
+			r.logger.Info("starting runtime",
+				"attempt", attempt,
+			)
+
+			if err := r.startProcess(); err != nil {
+				r.logger.Error("failed to start runtime",
+					"err", err,
 				)
 
-				if err := r.startProcess(); err != nil {
-					r.logger.Error("failed to start runtime",
-						"err", err,
-					)
+				// Notify subscribers that a runtime has failed to start.
+				r.notifier.Broadcast(&host.Event{
+					FailedToStart: &host.FailedToStartEvent{
+						Error: err,
+					},
+				})
 
-					// Notify subscribers that a runtime has failed to start.
-					r.notifier.Broadcast(&host.Event{
-						FailedToStart: &host.FailedToStartEvent{
-							Error: err,
-						},
-					})
-
-					if ticker == nil {
-						ticker = backoff.NewTicker(backoff.NewExponentialBackOff())
-						tickerCh = ticker.C
-					}
-					continue
-				}
-
-				// Runtime started successfully.
-				if ticker != nil {
-					ticker.Stop()
-					ticker = nil
-				}
-				attempt = 0
+				continue
 			}
 		}
 
@@ -469,7 +562,6 @@ func (r *sandboxedRuntime) manager() {
 				r.logger.Error("received unknown request type",
 					"request_type", fmt.Sprintf("%T", rq),
 				)
-				continue
 			}
 		case <-r.stopCh:
 			r.logger.Warn("termination requested")
@@ -480,50 +572,90 @@ func (r *sandboxedRuntime) manager() {
 				"err", r.process.Error(),
 			)
 
-			r.Lock()
 			r.conn.Close()
 			r.process = nil
+			r.Lock()
 			r.conn = nil
+			r.capabilityTEE = nil
+			r.rtVersion = nil
 			r.Unlock()
 
 			// Notify subscribers that the runtime has stopped.
 			r.notifier.Broadcast(&host.Event{Stopped: &host.StoppedEvent{}})
-			continue
+		case <-time.After(resetTickerTimeout):
+			// Reset the ticker if things work smoothly. Otherwise, keep on using the old ticker as
+			// it can happen that the runtime constantly terminates after a successful start.
+			if ticker != nil {
+				ticker.Stop()
+				ticker = nil
+			}
+		case ev := <-evCh:
+			// Update runtime's CapabilityTEE in case this is an update event.
+			if ue := ev.Updated; ue != nil {
+				r.Lock()
+				r.capabilityTEE = ue.CapabilityTEE
+				r.Unlock()
+			}
 		}
+	}
+}
+
+// DefaultGetSandboxConfig is the default function for generating sandbox configuration.
+func DefaultGetSandboxConfig(logger *logging.Logger, sandboxBinaryPath string) GetSandboxConfigFunc {
+	return func(hostCfg host.Config, _ Connector, _ string) (process.Config, error) {
+		comp, err := hostCfg.GetExplodedComponent()
+		if err != nil {
+			return process.Config{}, err
+		}
+
+		logWrapper := host.NewRuntimeLogWrapper(
+			logger,
+			"runtime_id", hostCfg.ID,
+			"runtime_name", hostCfg.Name,
+			"component", comp.ID(),
+			"provisioner", "sandbox",
+		)
+
+		executable := comp.Executable
+		if comp.ELF != nil {
+			executable = comp.ELF.Executable
+		}
+
+		return process.Config{
+			Path:              comp.ExplodedPath(executable),
+			SandboxBinaryPath: sandboxBinaryPath,
+			Stdout:            logWrapper,
+			Stderr:            logWrapper,
+			AllowNetwork:      comp.IsNetworkAllowed(),
+		}, nil
 	}
 }
 
 // New creates a new runtime provisioner that uses a local process sandbox.
 func New(cfg Config) (host.Provisioner, error) {
-	// Use a default GetSandboxConfig if none was provided.
-	if cfg.GetSandboxConfig == nil {
-		cfg.GetSandboxConfig = func(hostCfg host.Config, socketPath, runtimeDir string) (process.Config, error) {
-			return process.Config{
-				Path: hostCfg.Path,
-				Env: map[string]string{
-					"OASIS_WORKER_HOST": socketPath,
-				},
-				SandboxBinaryPath: cfg.SandboxBinaryPath,
-			}, nil
-		}
-	}
-	// Use a default HostInitializer if none was provided.
-	if cfg.HostInitializer == nil {
-		cfg.HostInitializer = func(
-			ctx context.Context,
-			rt host.Runtime,
-			version version.Version,
-			p process.Process,
-			conn protocol.Connection,
-		) (*host.StartedEvent, error) {
-			return &host.StartedEvent{
-				Version: version,
-			}, nil
-		}
-	}
 	// Use a default Logger if none was provided.
 	if cfg.Logger == nil {
 		cfg.Logger = logging.GetLogger("runtime/host/sandbox")
+	}
+	// Use a default Connector if none was provided.
+	if cfg.Connector == nil {
+		cfg.Connector = NewUnixSocketConnector
+	}
+	// Use a default GetSandboxConfig if none was provided.
+	if cfg.GetSandboxConfig == nil {
+		cfg.GetSandboxConfig = DefaultGetSandboxConfig(cfg.Logger, cfg.SandboxBinaryPath)
+	}
+	// Make sure host environment information was provided in HostInfo.
+	if cfg.HostInfo == nil {
+		return nil, fmt.Errorf("no host information provided")
+	}
+	// Use a default HostInitializer if none was provided.
+	if cfg.HostInitializer == nil {
+		cfg.HostInitializer = func(_ context.Context, hp *HostInitializerParams) (*host.StartedEvent, error) {
+			return &host.StartedEvent{
+				Version: hp.Version,
+			}, nil
+		}
 	}
 	return &provisioner{cfg: cfg}, nil
 }

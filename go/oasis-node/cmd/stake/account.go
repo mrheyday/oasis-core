@@ -11,15 +11,19 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/oasisprotocol/oasis-core/go/common/prettyprint"
-	genesisAPI "github.com/oasisprotocol/oasis-core/go/genesis/api"
+	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdConsensus "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/consensus"
+	cmdContext "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/context"
 	cmdFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	cmdGrpc "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/grpc"
 	"github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
 const (
+	// CfgHeight configures the consensus height.
+	CfgHeight = "height"
+
 	// CfgAccountAddr configures the account address.
 	CfgAccountAddr = "stake.account.address"
 
@@ -40,70 +44,107 @@ const (
 
 	// CfgCommissionScheduleBounds configures the commission schedule rate bound steps.
 	CfgCommissionScheduleBounds = "stake.commission_schedule.bounds"
+
+	// CfgAllowBeneficiary configures the beneficiary address.
+	CfgAllowBeneficiary = "stake.allow.beneficiary"
+
+	// CfgAllowAmountChange configures the allowance change.
+	CfgAllowAmountChange = "stake.allow.amount_change"
+
+	// CfgWithdrawSource configures the withdrawal source address.
+	CfgWithdrawSource = "stake.withdraw.source"
 )
 
 var (
-	accountInfoFlags        = flag.NewFlagSet("", flag.ContinueOnError)
+	commonAccountFlags      = flag.NewFlagSet("", flag.ContinueOnError)
 	amountFlags             = flag.NewFlagSet("", flag.ContinueOnError)
 	sharesFlags             = flag.NewFlagSet("", flag.ContinueOnError)
 	commonEscrowFlags       = flag.NewFlagSet("", flag.ContinueOnError)
 	commissionScheduleFlags = flag.NewFlagSet("", flag.ContinueOnError)
+	accountInfoFlags        = flag.NewFlagSet("", flag.ContinueOnError)
 	accountTransferFlags    = flag.NewFlagSet("", flag.ContinueOnError)
 	accountBurnFlags        = flag.NewFlagSet("", flag.ContinueOnError)
+	accountAllowFlags       = flag.NewFlagSet("", flag.ContinueOnError)
+	accountWithdrawFlags    = flag.NewFlagSet("", flag.ContinueOnError)
 
 	accountCmd = &cobra.Command{
-		Use:   "account",
-		Short: "account management commands",
+		Use:        "account",
+		Short:      "account management commands",
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	accountInfoCmd = &cobra.Command{
-		Use:   "info",
-		Short: "query account info",
-		Run:   doAccountInfo,
+		Use:        "info",
+		Short:      "get account info",
+		Run:        doAccountInfo,
+		Deprecated: "use the `oasis` CLI instead.",
+	}
+
+	accountNonceCmd = &cobra.Command{
+		Use:        "nonce",
+		Short:      "get account nonce",
+		Run:        doAccountNonce,
+		Deprecated: "use the `oasis` CLI instead.",
+	}
+
+	accountValidateAddressCmd = &cobra.Command{
+		Use:        "validate_address",
+		Short:      "validate account address",
+		Run:        doValidateAddress,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	accountTransferCmd = &cobra.Command{
-		Use:   "gen_transfer",
-		Short: "generate a transfer transaction",
-		Run:   doAccountTransfer,
+		Use:        "gen_transfer",
+		Short:      "generate a transfer transaction",
+		Run:        doAccountTransfer,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	accountBurnCmd = &cobra.Command{
-		Use:   "gen_burn",
-		Short: "Generate a burn transaction",
-		Run:   doAccountBurn,
+		Use:        "gen_burn",
+		Short:      "generate a burn transaction",
+		Run:        doAccountBurn,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	accountEscrowCmd = &cobra.Command{
-		Use:   "gen_escrow",
-		Short: "Generate an escrow (stake) transaction",
-		Run:   doAccountEscrow,
+		Use:        "gen_escrow",
+		Short:      "generate an escrow (stake) transaction",
+		Run:        doAccountEscrow,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	accountReclaimEscrowCmd = &cobra.Command{
-		Use:   "gen_reclaim_escrow",
-		Short: "Generate a reclaim_escrow (unstake) transaction",
-		Run:   doAccountReclaimEscrow,
+		Use:        "gen_reclaim_escrow",
+		Short:      "generate a reclaim escrow (unstake) transaction",
+		Run:        doAccountReclaimEscrow,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	accountAmendCommissionScheduleCmd = &cobra.Command{
-		Use:   "gen_amend_commission_schedule",
-		Short: "Generate an amend_commission_schedule transaction",
-		Run:   doAccountAmendCommissionSchedule,
+		Use:        "gen_amend_commission_schedule",
+		Short:      "generate an amend commission schedule transaction",
+		Run:        doAccountAmendCommissionSchedule,
+		Deprecated: "use the `oasis` CLI instead.",
+	}
+
+	accountAllowCmd = &cobra.Command{
+		Use:        "gen_allow",
+		Short:      "generate an allow transaction",
+		Run:        doAccountAllow,
+		Deprecated: "use the `oasis` CLI instead.",
+	}
+
+	accountWithdrawCmd = &cobra.Command{
+		Use:        "gen_withdraw",
+		Short:      "generate a withdraw transaction",
+		Run:        doAccountWithdraw,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 )
 
-// getCtxWithInfo returns a new context with values that contain additional
-// information (ticker symbol, value base-10 exponent, genesis document's hash).
-func getCtxWithInfo(genesis *genesisAPI.Document) context.Context {
-	ctx := context.Background()
-	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenSymbol, genesis.Staking.TokenSymbol)
-	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenValueExponent, genesis.Staking.TokenValueExponent)
-	ctx = context.WithValue(ctx, prettyprint.ContextKeyGenesisHash, genesis.Hash())
-	return ctx
-}
-
-func doAccountInfo(cmd *cobra.Command, args []string) {
+func doAccountInfo(cmd *cobra.Command, _ []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -119,16 +160,120 @@ func doAccountInfo(cmd *cobra.Command, args []string) {
 	conn, client := doConnect(cmd)
 	defer conn.Close()
 
+	height := viper.GetInt64(CfgHeight)
+
+	consensusClient := consensus.NewConsensusClient(conn)
+
+	// If height is latest height, take height from latest block.
+	if height == consensus.HeightLatest {
+		blk, err := consensusClient.GetBlock(context.Background(), consensus.HeightLatest)
+		if err != nil {
+			logger.Error("failed to fetch latest block",
+				"err", err,
+			)
+			os.Exit(1)
+		}
+		height = blk.Height
+	}
+
 	ctx := context.Background()
-	acct := getAccount(ctx, cmd, addr, client)
-	symbol := getTokenSymbol(ctx, cmd, client)
-	exp := getTokenValueExponent(ctx, cmd, client)
+	acct := getAccount(ctx, addr, height, client)
+	outgoingDelegationInfos := getDelegationInfosFor(ctx, addr, height, client)
+	incomingDelegations := getDelegationsTo(ctx, addr, height, client)
+	outgoingDebondingDelegationInfos := getDebondingDelegationInfosFor(ctx, addr, height, client)
+	incomingDebondingDelegations := getDebondingDelegationsTo(ctx, addr, height, client)
+	symbol := getTokenSymbol(ctx, client)
+	exp := getTokenValueExponent(ctx, client)
 	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenSymbol, symbol)
 	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenValueExponent, exp)
-	acct.PrettyPrint(ctx, "", os.Stdout)
+
+	fmt.Printf("Account State for Height: %d\n", height)
+	fmt.Println("Balance:")
+	prettyPrintAccountBalanceAndDelegationsFrom(ctx, addr, acct.General, outgoingDelegationInfos, outgoingDebondingDelegationInfos, "  ", os.Stdout)
+	fmt.Println()
+
+	if len(acct.General.Allowances) > 0 {
+		fmt.Println("Allowances for this Account:")
+		prettyPrintAllowances(ctx, addr, acct.General.Allowances, "  ", os.Stdout)
+		fmt.Println()
+	}
+
+	if len(incomingDelegations) > 0 {
+		fmt.Println("Active Delegations to this Account:")
+		prettyPrintDelegationsTo(ctx, addr, acct.Escrow.Active, incomingDelegations, "  ", os.Stdout)
+		fmt.Println()
+	}
+
+	if len(incomingDebondingDelegations) > 0 {
+		fmt.Println("Debonding Delegations to this Account:")
+		prettyPrintDelegationsTo(ctx, addr, acct.Escrow.Debonding, incomingDebondingDelegations, "  ", os.Stdout)
+		fmt.Println()
+	}
+
+	cs := acct.Escrow.CommissionSchedule
+	if len(cs.Rates) > 0 || len(cs.Bounds) > 0 {
+		fmt.Println("Commission Schedule:")
+		cs.PrettyPrint(ctx, "  ", os.Stdout)
+		fmt.Println()
+	}
+
+	sa := acct.Escrow.StakeAccumulator
+	if len(sa.Claims) > 0 {
+		fmt.Println("Stake Accumulator:")
+		sa.PrettyPrint(ctx, "  ", os.Stdout)
+		fmt.Println()
+	}
+
+	fmt.Printf("Nonce: %d\n", acct.General.Nonce)
 }
 
-func doAccountTransfer(cmd *cobra.Command, args []string) {
+func doAccountNonce(cmd *cobra.Command, _ []string) {
+	if err := cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
+	}
+
+	var addr api.Address
+	if err := addr.UnmarshalText([]byte(viper.GetString(CfgAccountAddr))); err != nil {
+		logger.Error("failed to parse account address",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	conn, client := doConnect(cmd)
+	defer conn.Close()
+
+	height := consensus.HeightLatest
+
+	ctx := context.Background()
+	acct := getAccount(ctx, addr, height, client)
+	fmt.Println(acct.General.Nonce)
+}
+
+func doValidateAddress(*cobra.Command, []string) {
+	if err := cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
+	}
+
+	addrStr := viper.GetString(CfgAccountAddr)
+	var addr api.Address
+	err := addr.UnmarshalText([]byte(addrStr))
+
+	switch cmdFlags.Verbose() {
+	case true:
+		if err != nil {
+			fmt.Printf("account address '%s' is not valid: %v\n", addrStr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("account address '%s' is valid\n", addrStr)
+	default:
+		if err != nil {
+			os.Exit(1)
+		}
+	}
+}
+
+func doAccountTransfer(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -153,10 +298,10 @@ func doAccountTransfer(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := api.NewTransferTx(nonce, fee, &xfer)
 
-	cmdConsensus.SignAndSaveTx(getCtxWithInfo(genesis), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
-func doAccountBurn(cmd *cobra.Command, args []string) {
+func doAccountBurn(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -175,10 +320,10 @@ func doAccountBurn(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := api.NewBurnTx(nonce, fee, &burn)
 
-	cmdConsensus.SignAndSaveTx(getCtxWithInfo(genesis), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
-func doAccountEscrow(cmd *cobra.Command, args []string) {
+func doAccountEscrow(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -203,10 +348,10 @@ func doAccountEscrow(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := api.NewAddEscrowTx(nonce, fee, &escrow)
 
-	cmdConsensus.SignAndSaveTx(getCtxWithInfo(genesis), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
-func doAccountReclaimEscrow(cmd *cobra.Command, args []string) {
+func doAccountReclaimEscrow(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -231,7 +376,7 @@ func doAccountReclaimEscrow(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := api.NewReclaimEscrowTx(nonce, fee, &reclaim)
 
-	cmdConsensus.SignAndSaveTx(getCtxWithInfo(genesis), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
 func scanRateStep(dst *api.CommissionRateStep, raw string) error {
@@ -268,7 +413,7 @@ func scanBoundStep(dst *api.CommissionRateBoundStep, raw string) error {
 	return nil
 }
 
-func doAccountAmendCommissionSchedule(cmd *cobra.Command, args []string) {
+func doAccountAmendCommissionSchedule(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -309,22 +454,95 @@ func doAccountAmendCommissionSchedule(cmd *cobra.Command, args []string) {
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
 	tx := api.NewAmendCommissionScheduleTx(nonce, fee, &amendCommissionSchedule)
 
-	cmdConsensus.SignAndSaveTx(getCtxWithInfo(genesis), tx)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
+}
+
+func doAccountAllow(*cobra.Command, []string) {
+	if err := cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
+	}
+
+	genesis := cmdConsensus.InitGenesis()
+	cmdConsensus.AssertTxFileOK()
+
+	var allow api.Allow
+	if err := allow.Beneficiary.UnmarshalText([]byte(viper.GetString(CfgAllowBeneficiary))); err != nil {
+		logger.Error("failed to parse beneficiary account address",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	amountRaw := viper.GetString(CfgAllowAmountChange)
+	if len(amountRaw) < 1 {
+		logger.Error("malformed allowance change amount")
+		os.Exit(1)
+	}
+	if amountRaw[0] == '-' {
+		allow.Negative = true
+		amountRaw = amountRaw[1:]
+	}
+	if err := allow.AmountChange.UnmarshalText([]byte(amountRaw)); err != nil {
+		logger.Error("failed to parse allowance change amount",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	nonce, fee := cmdConsensus.GetTxNonceAndFee()
+	tx := api.NewAllowTx(nonce, fee, &allow)
+
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
+}
+
+func doAccountWithdraw(*cobra.Command, []string) {
+	if err := cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
+	}
+
+	genesis := cmdConsensus.InitGenesis()
+	cmdConsensus.AssertTxFileOK()
+
+	var withdraw api.Withdraw
+	if err := withdraw.From.UnmarshalText([]byte(viper.GetString(CfgWithdrawSource))); err != nil {
+		logger.Error("failed to parse source account address",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	if err := withdraw.Amount.UnmarshalText([]byte(viper.GetString(CfgAmount))); err != nil {
+		logger.Error("failed to parse withdraw amount",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	nonce, fee := cmdConsensus.GetTxNonceAndFee()
+	tx := api.NewWithdrawTx(nonce, fee, &withdraw)
+
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
 func registerAccountCmd() {
 	for _, v := range []*cobra.Command{
 		accountInfoCmd,
+		accountNonceCmd,
+		accountValidateAddressCmd,
 		accountTransferCmd,
 		accountBurnCmd,
 		accountEscrowCmd,
 		accountReclaimEscrowCmd,
 		accountAmendCommissionScheduleCmd,
+		accountAllowCmd,
+		accountWithdrawCmd,
 	} {
 		accountCmd.AddCommand(v)
 	}
 
+	accountInfoCmd.Flags().AddFlagSet(commonAccountFlags)
 	accountInfoCmd.Flags().AddFlagSet(accountInfoFlags)
+	accountNonceCmd.Flags().AddFlagSet(commonAccountFlags)
+	accountValidateAddressCmd.Flags().AddFlagSet(commonAccountFlags)
+	accountValidateAddressCmd.Flags().AddFlagSet(cmdFlags.VerboseFlags)
 	accountTransferCmd.Flags().AddFlagSet(accountTransferFlags)
 	accountBurnCmd.Flags().AddFlagSet(accountBurnFlags)
 	accountEscrowCmd.Flags().AddFlagSet(commonEscrowFlags)
@@ -332,18 +550,27 @@ func registerAccountCmd() {
 	accountReclaimEscrowCmd.Flags().AddFlagSet(commonEscrowFlags)
 	accountReclaimEscrowCmd.Flags().AddFlagSet(sharesFlags)
 	accountAmendCommissionScheduleCmd.Flags().AddFlagSet(commissionScheduleFlags)
+	accountAllowCmd.Flags().AddFlagSet(accountAllowFlags)
+	accountWithdrawCmd.Flags().AddFlagSet(accountWithdrawFlags)
 }
 
 func init() {
-	accountInfoFlags.String(CfgAccountAddr, "", "account address")
-	_ = viper.BindPFlags(accountInfoFlags)
-	accountInfoFlags.AddFlagSet(cmdGrpc.ClientFlags)
+	commonAccountFlags.String(CfgAccountAddr, "", "account address")
+	_ = viper.BindPFlags(commonAccountFlags)
+	commonAccountFlags.AddFlagSet(cmdGrpc.ClientFlags)
 
 	amountFlags.String(CfgAmount, "0", "amount of stake (in base units) for the transaction")
 	_ = viper.BindPFlags(amountFlags)
 
 	sharesFlags.String(CfgShares, "0", "amount of shares for the transaction")
 	_ = viper.BindPFlags(sharesFlags)
+
+	accountInfoFlags.Int64(
+		CfgHeight,
+		consensus.HeightLatest,
+		fmt.Sprintf("height at which to query for info (default %d, i.e. latest height)", consensus.HeightLatest),
+	)
+	_ = viper.BindPFlags(accountInfoFlags)
 
 	accountTransferFlags.String(CfgTransferDestination, "", "transfer destination account address")
 	_ = viper.BindPFlags(accountTransferFlags)
@@ -374,4 +601,16 @@ func init() {
 	_ = viper.BindPFlags(commissionScheduleFlags)
 	commissionScheduleFlags.AddFlagSet(cmdConsensus.TxFlags)
 	commissionScheduleFlags.AddFlagSet(cmdFlags.AssumeYesFlag)
+
+	accountAllowFlags.String(CfgAllowBeneficiary, "", "allowance beneficiary address")
+	accountAllowFlags.String(CfgAllowAmountChange, "0", "allowance change amount (in base units)")
+	_ = viper.BindPFlags(accountAllowFlags)
+	accountAllowFlags.AddFlagSet(cmdConsensus.TxFlags)
+	accountAllowFlags.AddFlagSet(cmdFlags.AssumeYesFlag)
+
+	accountWithdrawFlags.String(CfgWithdrawSource, "", "withdraw source address")
+	_ = viper.BindPFlags(accountWithdrawFlags)
+	accountWithdrawFlags.AddFlagSet(cmdConsensus.TxFlags)
+	accountWithdrawFlags.AddFlagSet(amountFlags)
+	accountWithdrawFlags.AddFlagSet(cmdFlags.AssumeYesFlag)
 }

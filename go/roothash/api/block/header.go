@@ -1,13 +1,11 @@
 package block
 
 import (
-	"bytes"
 	"errors"
+	"time"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 )
 
@@ -16,6 +14,28 @@ var ErrInvalidVersion = errors.New("roothash: invalid version")
 
 // HeaderType is the type of header.
 type HeaderType uint8
+
+// Timestamp is a custom time stamp type that encodes like time.Time when
+// marshaling to text.
+type Timestamp uint64
+
+// MarshalText encodes a Timestamp to text by converting it from Unix time to
+// local time.
+func (ts Timestamp) MarshalText() ([]byte, error) {
+	t := time.Unix(int64(ts), 0)
+	return t.MarshalText()
+}
+
+// UnmarshalText decodes a text slice into a Timestamp.
+func (ts *Timestamp) UnmarshalText(data []byte) error {
+	var t time.Time
+	err := t.UnmarshalText(data)
+	if err != nil {
+		return err
+	}
+	*ts = Timestamp(t.Unix())
+	return nil
+}
 
 const (
 	// Invalid is an invalid header type and should never be stored.
@@ -45,7 +65,7 @@ const (
 
 // Header is a block header.
 //
-// Keep this in sync with /runtime/src/common/roothash.rs.
+// Keep this in sync with /runtime/src/consensus/roothash/block.rs.
 type Header struct { // nolint: maligned
 	// Version is the protocol version number.
 	Version uint16 `json:"version"`
@@ -57,7 +77,7 @@ type Header struct { // nolint: maligned
 	Round uint64 `json:"round"`
 
 	// Timestamp is the block timestamp (POSIX time).
-	Timestamp uint64 `json:"timestamp"`
+	Timestamp Timestamp `json:"timestamp"`
 
 	// HeaderType is the header type.
 	HeaderType HeaderType `json:"header_type"`
@@ -71,12 +91,11 @@ type Header struct { // nolint: maligned
 	// StateRoot is the state merkle root.
 	StateRoot hash.Hash `json:"state_root"`
 
-	// Messages are the roothash messages sent in this round.
-	Messages []*Message `json:"messages"`
+	// MessagesHash is the hash of emitted runtime messages.
+	MessagesHash hash.Hash `json:"messages_hash"`
 
-	// StorageSignatures are the storage receipt signatures for the merkle
-	// roots.
-	StorageSignatures []signature.Signature `json:"storage_signatures"`
+	// InMessagesHash is the hash of processed incoming messages.
+	InMessagesHash hash.Hash `json:"in_msgs_hash"`
 }
 
 // IsParentOf returns true iff the header is the parent of a child header.
@@ -90,9 +109,7 @@ func (h *Header) IsParentOf(child *Header) bool {
 //
 // Locations where this matter should do the comparison manually.
 func (h *Header) MostlyEqual(cmp *Header) bool {
-	a, b := *h, *cmp
-	a.StorageSignatures, b.StorageSignatures = []signature.Signature{}, []signature.Signature{}
-	aHash, bHash := a.EncodedHash(), b.EncodedHash()
+	aHash, bHash := h.EncodedHash(), cmp.EncodedHash()
 	return aHash.Equal(&bHash)
 }
 
@@ -102,70 +119,29 @@ func (h *Header) EncodedHash() hash.Hash {
 }
 
 // StorageRoots returns the storage roots contained in this header.
-func (h *Header) StorageRoots() (roots []storage.Root) {
-	for _, rootHash := range []hash.Hash{
-		h.IORoot,
-		h.StateRoot,
-	} {
-		roots = append(roots, storage.Root{
-			Namespace: h.Namespace,
-			Version:   h.Round,
-			Hash:      rootHash,
-		})
-	}
-	return
-}
-
-// RootsForStorageReceipt gets the merkle roots that must be part of
-// a storage receipt.
-func (h *Header) RootsForStorageReceipt() []hash.Hash {
-	return []hash.Hash{
-		h.IORoot,
-		h.StateRoot,
+func (h *Header) StorageRoots() []storage.Root {
+	return []storage.Root{
+		h.StorageRootIO(),
+		h.StorageRootState(),
 	}
 }
 
-// VerifyStorageReceiptSignatures validates that the storage receipt signatures
-// match the signatures for the current merkle roots.
-//
-// Note: Ensuring that the signatures are signed by keypair(s) that are
-// expected is the responsibility of the caller.
-func (h *Header) VerifyStorageReceiptSignatures() error {
-	receiptBody := storage.ReceiptBody{
-		Version:   1,
+// StorageRootIO returns the full IO storage root.
+func (h *Header) StorageRootIO() storage.Root {
+	return storage.Root{
 		Namespace: h.Namespace,
-		Round:     h.Round,
-		Roots:     h.RootsForStorageReceipt(),
+		Version:   h.Round,
+		Type:      storage.RootTypeIO,
+		Hash:      h.IORoot,
 	}
-
-	if !signature.VerifyManyToOne(storage.ReceiptSignatureContext, cbor.Marshal(receiptBody), h.StorageSignatures) {
-		return signature.ErrVerifyFailed
-	}
-
-	return nil
 }
 
-// VerifyStorageReceipt validates that the provided storage receipt
-// matches the header.
-func (h *Header) VerifyStorageReceipt(receipt *storage.ReceiptBody) error {
-	if !receipt.Namespace.Equal(&h.Namespace) {
-		return errors.New("roothash: receipt has unexpected namespace")
+// StorageRootState returns the full state storage root.
+func (h *Header) StorageRootState() storage.Root {
+	return storage.Root{
+		Namespace: h.Namespace,
+		Version:   h.Round,
+		Type:      storage.RootTypeState,
+		Hash:      h.StateRoot,
 	}
-
-	if receipt.Round != h.Round {
-		return errors.New("roothash: receipt has unexpected round")
-	}
-
-	roots := h.RootsForStorageReceipt()
-	if len(receipt.Roots) != len(roots) {
-		return errors.New("roothash: receipt has unexpected number of roots")
-	}
-
-	for idx, v := range roots {
-		if !bytes.Equal(v[:], receipt.Roots[idx][:]) {
-			return errors.New("roothash: receipt has unexpected roots")
-		}
-	}
-
-	return nil
 }

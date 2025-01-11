@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
@@ -33,45 +32,41 @@ var (
 	serviceName = cmnGrpc.NewServiceName("PingService")
 	// MethodPing is the Ping method.
 	MethodPing = serviceName.NewMethod("Ping", PingQuery{}).
-			WithNamespaceExtractor(func(ctx context.Context, req interface{}) (common.Namespace, error) {
+			WithNamespaceExtractor(func(_ context.Context, req interface{}) (common.Namespace, error) {
 			r, ok := req.(*PingQuery)
 			if !ok {
 				return common.Namespace{}, errInvalidRequestType
 			}
 			return r.Namespace, nil
-		}).WithAccessControl(func(ctx context.Context, req interface{}) (bool, error) {
-		return true, nil
-	})
+		}).WithAccessControl(cmnGrpc.AccessControlAlways)
 
 	// MethodWatchPings is the WatchPings method.
 	MethodWatchPings = serviceName.NewMethod("WatchPings", PingQuery{}).
-				WithNamespaceExtractor(func(ctx context.Context, req interface{}) (common.Namespace, error) {
+				WithNamespaceExtractor(func(_ context.Context, req interface{}) (common.Namespace, error) {
 			r, ok := req.(*PingQuery)
 			if !ok {
 				return common.Namespace{}, errInvalidRequestType
 			}
 			return r.Namespace, nil
-		}).WithAccessControl(func(ctx context.Context, req interface{}) (bool, error) {
-		return true, nil
-	})
+		}).WithAccessControl(cmnGrpc.AccessControlAlways)
 )
 
 // CreateCertificate creates gRPC TLS certificate for testing.
 func CreateCertificate(t *testing.T) (*tls.Certificate, *x509.Certificate) {
 	require := require.New(t)
 
-	dataDir, err := ioutil.TempDir("", "oasis-common-grpc-test_")
+	dataDir, err := os.MkdirTemp("", "oasis-common-grpc-test_")
 	require.NoError(err, "Failed to create a temporary directory")
 	defer os.RemoveAll(dataDir)
 
-	ident, err := identity.LoadOrGenerate(dataDir, memorySigner.NewFactory(), false)
+	ident, err := identity.LoadOrGenerate(dataDir, memorySigner.NewFactory())
 	require.NoError(err, "Failed to generate a new identity")
-	require.Len(ident.GetTLSCertificate().Certificate, 1, "The generated identity contains more than 1 TLS certificate in the chain")
+	require.Len(ident.TLSCertificate.Certificate, 1, "The generated identity contains more than 1 TLS certificate in the chain")
 
-	x509Cert, err := x509.ParseCertificate(ident.GetTLSCertificate().Certificate[0])
+	x509Cert, err := x509.ParseCertificate(ident.TLSCertificate.Certificate[0])
 	require.NoError(err, "Failed to parse X.509 certificate from TLS certificate")
 
-	return ident.GetTLSCertificate(), x509Cert
+	return ident.TLSCertificate, x509Cert
 }
 
 // PingQuery is the PingServer query.
@@ -80,8 +75,7 @@ type PingQuery struct {
 }
 
 // PingResponse is the response of the PingServer.
-type PingResponse struct {
-}
+type PingResponse struct{}
 
 // PingServer is a testing ping server interface.
 type PingServer interface {
@@ -90,18 +84,18 @@ type PingServer interface {
 }
 
 type pingServer struct {
-	authFunc func(ctx context.Context, fullMethodName string, req interface{}) error
+	authFunc func(ctx context.Context, req interface{}) error
 }
 
-func (s *pingServer) AuthFunc(ctx context.Context, fullMethodName string, req interface{}) error {
-	return s.authFunc(ctx, fullMethodName, req)
+func (s *pingServer) AuthFunc(ctx context.Context, req interface{}) error {
+	return s.authFunc(ctx, req)
 }
 
-func (s *pingServer) Ping(ctx context.Context, query *PingQuery) (*PingResponse, error) {
+func (s *pingServer) Ping(context.Context, *PingQuery) (*PingResponse, error) {
 	return &PingResponse{}, nil
 }
 
-func (s *pingServer) WatchPings(ctx context.Context, query *PingQuery) (<-chan *PingResponse, pubsub.ClosableSubscription, error) {
+func (s *pingServer) WatchPings(ctx context.Context, _ *PingQuery) (<-chan *PingResponse, pubsub.ClosableSubscription, error) {
 	pingNotifier := pubsub.NewBroker(true)
 	go func() {
 		for {
@@ -126,7 +120,7 @@ func RegisterService(server *grpc.Server, service PingServer) {
 }
 
 // NewPingServer retruns a new Ping server.
-func NewPingServer(authFunc func(ctx context.Context, fullMethodName string, req interface{}) error) PingServer {
+func NewPingServer(authFunc func(ctx context.Context, req interface{}) error) PingServer {
 	ps := &pingServer{authFunc}
 	return ps
 }
@@ -139,7 +133,7 @@ func NewPingClient(conn *grpc.ClientConn) PingClient {
 // PingClient is a testing PingServer client.
 type PingClient interface {
 	Ping(ctx context.Context, in *PingQuery, opts ...grpc.CallOption) (*PingResponse, error)
-	WatchPings(ctx context.Context, in *PingQuery, opts ...grpc.CallOption) (<-chan *PingResponse, pubsub.ClosableSubscription, error)
+	WatchPings(ctx context.Context) (<-chan *PingResponse, pubsub.ClosableSubscription, error)
 	MissingMethod(ctx context.Context, in *PingQuery, opts ...grpc.CallOption) (*PingResponse, error)
 }
 
@@ -156,7 +150,7 @@ func (c *pingClient) Ping(ctx context.Context, in *PingQuery, opts ...grpc.CallO
 	return out, nil
 }
 
-func (c *pingClient) WatchPings(ctx context.Context, in *PingQuery, opts ...grpc.CallOption) (<-chan *PingResponse, pubsub.ClosableSubscription, error) {
+func (c *pingClient) WatchPings(ctx context.Context) (<-chan *PingResponse, pubsub.ClosableSubscription, error) {
 	ctx, sub := pubsub.NewContextSubscription(ctx)
 
 	stream, err := c.cc.NewStream(ctx, &ServiceDesc.Streams[0], MethodWatchPings.FullName())
@@ -219,7 +213,7 @@ var ServiceDesc = grpc.ServiceDesc{
 	},
 }
 
-func pingHandler( // nolint: golint
+func pingHandler(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,

@@ -5,15 +5,22 @@ import (
 	"fmt"
 	"regexp"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
+	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	"github.com/oasisprotocol/oasis-core/go/staking/api/token"
 )
 
 // SanityCheck performs a sanity check on the consensus parameters.
 func (p *ConsensusParameters) SanityCheck() error {
+	if !flags.DebugDontBlameOasis() {
+		if p.DebugBypassStake {
+			return fmt.Errorf("one or more unsafe debug flags set")
+		}
+	}
+
 	// Thresholds.
-	for kind := KindEntity; kind <= KindMax; kind++ {
+	for _, kind := range ThresholdKinds {
 		val, ok := p.Thresholds[kind]
 		if !ok {
 			return fmt.Errorf("threshold for kind '%s' not defined", kind)
@@ -37,6 +44,49 @@ func (p *ConsensusParameters) SanityCheck() error {
 		return fmt.Errorf("fee split proportions are all zero")
 	}
 
+	// MinCommissionRate bound.
+	if p.CommissionScheduleRules.MinCommissionRate.Cmp(CommissionRateDenominator) > 0 {
+		return fmt.Errorf("minimum commission %v/%v over unity", p.CommissionScheduleRules, CommissionRateDenominator)
+	}
+
+	// Reward schedule steps must be sequential.
+	var prevUntil beacon.EpochTime
+	for _, step := range p.RewardSchedule {
+		if !step.Scale.IsValid() || step.Scale.Cmp(RewardAmountDenominator) == 1 {
+			return fmt.Errorf("reward scale must be a non-negative integer smaller than %s", RewardAmountDenominator.String())
+		}
+		if step.Until == beacon.EpochInvalid {
+			return fmt.Errorf("reward until field must be a valid epoch")
+		}
+		if step.Until <= prevUntil {
+			return fmt.Errorf("reward schedule steps must be sequential (previous is %d, current is %d)", prevUntil, step.Until)
+		}
+		prevUntil = step.Until
+	}
+
+	return nil
+}
+
+// SanityCheck performs a sanity check on the consensus parameter changes.
+func (c *ConsensusParameterChanges) SanityCheck() error {
+	if c.DebondingInterval == nil &&
+		c.RewardSchedule == nil &&
+		c.GasCosts == nil &&
+		c.MinDelegationAmount == nil &&
+		c.MinTransferAmount == nil &&
+		c.MinTransactBalance == nil &&
+		c.MinCommissionRate == nil &&
+		c.DisableTransfers == nil &&
+		c.DisableDelegation == nil &&
+		c.AllowEscrowMessages == nil &&
+		c.MaxAllowances == nil &&
+		c.FeeSplitWeightPropose == nil &&
+		c.FeeSplitWeightVote == nil &&
+		c.FeeSplitWeightNextPropose == nil &&
+		c.RewardFactorEpochSigned == nil &&
+		c.RewardFactorBlockProposed == nil {
+		return fmt.Errorf("consensus parameter changes should not be empty")
+	}
 	return nil
 }
 
@@ -45,9 +95,10 @@ func (p *ConsensusParameters) SanityCheck() error {
 func SanityCheckAccount(
 	total *quantity.Quantity,
 	parameters *ConsensusParameters,
-	now epochtime.EpochTime,
+	now beacon.EpochTime,
 	addr Address,
 	acct *Account,
+	totalSupply *quantity.Quantity,
 ) error {
 	if !addr.IsValid() {
 		return fmt.Errorf("staking: sanity check failed: account has invalid address: %s", addr)
@@ -74,7 +125,7 @@ func SanityCheckAccount(
 	_ = total.Add(&acct.Escrow.Debonding.Balance)
 
 	commissionScheduleShallowCopy := acct.Escrow.CommissionSchedule
-	if err := commissionScheduleShallowCopy.PruneAndValidateForGenesis(&parameters.CommissionScheduleRules, now); err != nil {
+	if err := commissionScheduleShallowCopy.PruneAndValidate(&parameters.CommissionScheduleRules, now); err != nil {
 		return fmt.Errorf(
 			"staking: sanity check failed: commission schedule for account %s is invalid: %+v",
 			addr, err,
@@ -87,6 +138,9 @@ func SanityCheckAccount(
 		}
 		if !allowance.IsValid() {
 			return fmt.Errorf("staking: sanity check failed: account %s allowance is invalid for beneficiary %s", addr, beneficiary)
+		}
+		if allowance.Cmp(totalSupply) > 0 {
+			return fmt.Errorf("staking: sanity check failed: account %s allowance is greater than total supply for beneficiary %s", addr, beneficiary)
 		}
 	}
 
@@ -107,7 +161,7 @@ func SanityCheckDelegations(addr Address, account *Account, delegations map[Addr
 				delegatorAddr, addr,
 			)
 		}
-		_ = shares.Add(&delegation.Shares)
+		_ = shares.Add(&delegation.Shares) //nolint:gosec
 		numDelegations++
 	}
 
@@ -148,7 +202,7 @@ func SanityCheckDebondingDelegations(addr Address, account *Account, delegations
 			)
 		}
 		for _, delegation := range dels {
-			_ = shares.Add(&delegation.Shares)
+			_ = shares.Add(&delegation.Shares) //nolint:gosec
 			numDebondingDelegations++
 		}
 	}
@@ -185,7 +239,7 @@ func SanityCheckAccountShares(
 	var shares quantity.Quantity
 	var numDelegations uint64
 	for _, d := range delegations {
-		_ = shares.Add(&d.Shares)
+		_ = shares.Add(&d.Shares) //nolint:gosec
 		numDelegations++
 	}
 	// Account's total active shares in escrow should match delegations.
@@ -210,7 +264,7 @@ func SanityCheckAccountShares(
 	var numDebondingDelegations uint64
 	for _, dels := range debondingDelegations {
 		for _, d := range dels {
-			_ = debondingShares.Add(&d.Shares)
+			_ = debondingShares.Add(&d.Shares) //nolint:gosec
 			numDebondingDelegations++
 		}
 	}
@@ -234,7 +288,7 @@ func SanityCheckAccountShares(
 }
 
 // SanityCheck does basic sanity checking on the genesis state.
-func (g *Genesis) SanityCheck(now epochtime.EpochTime) error { // nolint: gocyclo
+func (g *Genesis) SanityCheck(now beacon.EpochTime) error { // nolint: gocyclo
 	if err := g.Parameters.SanityCheck(); err != nil {
 		return fmt.Errorf("staking: sanity check failed: %w", err)
 	}
@@ -272,7 +326,7 @@ func (g *Genesis) SanityCheck(now epochtime.EpochTime) error { // nolint: gocycl
 	// Check all commission schedules.
 	var total quantity.Quantity
 	for addr, acct := range g.Ledger {
-		err := SanityCheckAccount(&total, &g.Parameters, now, addr, acct)
+		err := SanityCheckAccount(&total, &g.Parameters, now, addr, acct, &g.TotalSupply)
 		if err != nil {
 			return err
 		}
@@ -283,11 +337,12 @@ func (g *Genesis) SanityCheck(now epochtime.EpochTime) error { // nolint: gocycl
 			return fmt.Errorf("staking: non-empty stake accumulator in genesis")
 		}
 	}
+	_ = total.Add(&g.GovernanceDeposits)
 	_ = total.Add(&g.CommonPool)
 	_ = total.Add(&g.LastBlockFees)
 	if total.Cmp(&g.TotalSupply) != 0 {
 		return fmt.Errorf(
-			"staking: sanity check failed: balances in accounts plus common pool (%s) does not add up to total supply (%s)",
+			"staking: sanity check failed: balances in accounts, plus governance deposits, plus common pool, plus last block fees (%s), does not add up to total supply (%s)",
 			total.String(), g.TotalSupply.String(),
 		)
 	}
@@ -319,10 +374,138 @@ func (g *Genesis) SanityCheck(now epochtime.EpochTime) error { // nolint: gocycl
 		}
 	}
 
+	// The burn address is actually "unused" for reasonable definitions of "unused".
+	if ba := g.Ledger[BurnAddress]; ba != nil {
+		if !ba.General.Balance.IsZero() {
+			return fmt.Errorf(
+				"staking: sanity check failed: burn address has non-zero balance: %v", ba.General.Balance,
+			)
+		}
+		if ba.General.Nonce != 0 {
+			return fmt.Errorf(
+				"staking: sanity check failed: burn address has non-zero nonce: %v", ba.General.Nonce,
+			)
+		}
+		if len(ba.General.Allowances) != 0 {
+			return fmt.Errorf(
+				"staking: sanity check failed: burn address has non-empty allowances",
+			)
+		}
+	}
+
 	// Check the above two invariants for each account as well.
 	for addr, acct := range g.Ledger {
 		if err := SanityCheckAccountShares(addr, acct, g.Delegations[addr], g.DebondingDelegations[addr]); err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+// SanityCheckStake compares generated escrow accounts with actual ones.
+func SanityCheckStake(
+	accounts map[Address]*Account,
+	escrows map[Address]*EscrowAccount,
+	thresholds map[ThresholdKind]quantity.Quantity,
+	isGenesis bool,
+) error {
+	// For a Genesis document, check if accounts have enough stake for all its stake claims.
+	// NOTE: We can't perform this check at an arbitrary point since the entity could
+	// reclaim its stake from the escrow but its nodes and/or runtimes will only be
+	// ineligible/suspended at the next epoch transition.
+	if isGenesis {
+		// Populate escrow accounts with the same active balance and shares number.
+		for addr, escrow := range escrows {
+			acct, ok := accounts[addr]
+			if !ok {
+				continue
+			}
+
+			escrow.Active.Balance = acct.Escrow.Active.Balance
+			escrow.Active.TotalShares = acct.Escrow.Active.TotalShares
+		}
+
+		for addr, escrow := range escrows {
+			if err := escrow.CheckStakeClaims(thresholds); err != nil {
+				expected := "unknown"
+				expectedQty, err2 := escrow.StakeAccumulator.TotalClaims(thresholds, nil)
+				if err2 == nil {
+					expected = expectedQty.String()
+				}
+				return fmt.Errorf("insufficient stake for account %s (expected: %s got: %s): %w",
+					addr,
+					expected,
+					escrow.Active.Balance,
+					err,
+				)
+			}
+		}
+
+		return nil
+	}
+
+	// Otherwise, compare the expected accumulator state with the actual one.
+	// NOTE: We can't perform this check for the Genesis document since it is not allowed to
+	// have non-empty stake accumulators.
+	seen := make(map[Address]struct{})
+	for addr, escrow := range escrows {
+		seen[addr] = struct{}{}
+
+		var actualEscrow EscrowAccount
+		acct, ok := accounts[addr]
+		if ok {
+			actualEscrow = acct.Escrow
+		}
+
+		expectedClaims := escrow.StakeAccumulator.Claims
+		actualClaims := actualEscrow.StakeAccumulator.Claims
+		if len(expectedClaims) != len(actualClaims) {
+			return fmt.Errorf("incorrect number of stake claims for account %s (expected: %d got: %d)",
+				addr,
+				len(expectedClaims),
+				len(actualClaims),
+			)
+		}
+		for claim, expectedThresholds := range expectedClaims {
+			thresholds, ok := actualClaims[claim]
+			if !ok {
+				return fmt.Errorf("missing claim %s for account %s", claim, addr)
+			}
+			if len(thresholds) != len(expectedThresholds) {
+				return fmt.Errorf("incorrect number of thresholds for claim %s for account %s (expected: %d got: %d)",
+					claim,
+					addr,
+					len(expectedThresholds),
+					len(thresholds),
+				)
+			}
+			for i, expectedThreshold := range expectedThresholds {
+				threshold := thresholds[i]
+				if !threshold.Equal(&expectedThreshold) { // nolint: gosec
+					return fmt.Errorf("incorrect threshold in position %d for claim %s for account %s (expected: %s got: %s)",
+						i,
+						claim,
+						addr,
+						expectedThreshold,
+						threshold,
+					)
+				}
+			}
+		}
+	}
+
+	for addr, acct := range accounts {
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+
+		actualClaims := acct.Escrow.StakeAccumulator.Claims
+		if len(actualClaims) != 0 {
+			return fmt.Errorf("incorrect number of stake claims for account %s (expected: 0 got: %d)",
+				addr,
+				len(actualClaims),
+			)
 		}
 	}
 

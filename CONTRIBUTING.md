@@ -4,8 +4,8 @@ Thank you for your interest in contributing to Oasis Core! There are many ways
 to contribute, and this document should not be considered encompassing.
 
 If you have a general question on how to use and deploy our software, please
-read our [Operator Docs](https://docs.oasis.dev/) or join our
-[community Slack](oasiscommunity.slack.com).
+read our [General Documentation](https://docs.oasis.io) or join our
+[Oasis Network Community server on Discord](https://oasis.io/discord).
 
 For concrete feature requests and/or bug reports, please file an issue in this
 repository as described below.
@@ -49,7 +49,7 @@ accepted into the project.*
 
 <!-- markdownlint-disable line-length -->
 [new Feature request]: https://github.com/oasisprotocol/oasis-core/issues/new?template=feature_request.md
-[proposing an ADR]: docs/adr/index.md
+[proposing an ADR]: https://github.com/oasisprotocol/adrs/blob/main/README.md
 <!-- markdownlint-enable line-length -->
 
 ## Bug Reports
@@ -161,7 +161,7 @@ https://github.com/oasisprotocol/oasis-core/blob/master/README.md).
   * Anyone else with write permissions should be able to close the issue if not
     addressed within a week.
 
-[developer documentation]: docs/index.md
+[developer documentation]: docs/README.md
 
 ### Contributing Documentation
 

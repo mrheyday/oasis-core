@@ -1,17 +1,16 @@
-use io_context::Context;
-
 use crate::storage::mkvs::{
     interop::{Driver, ProtocolServer},
-    sync::*,
-    tree::*,
-    LogEntry,
+    sync::NoopReadSyncer,
+    LogEntry, Root, RootType, Tree,
 };
 
 #[test]
 fn test_nil_pointers() {
-    let server = ProtocolServer::new();
+    let server = ProtocolServer::new(None);
 
-    let mut tree = Tree::make().new(Box::new(NoopReadSyncer));
+    let mut tree = Tree::builder()
+        .with_root_type(RootType::State)
+        .build(Box::new(NoopReadSyncer));
 
     // Arbitrary sequence of operations. The point is to produce a tree with
     // an internal node where at least one of the children is a null pointer.
@@ -25,32 +24,26 @@ fn test_nil_pointers() {
     ];
 
     for entry in write_log.iter() {
-        tree.insert(
-            Context::background(),
-            &entry.key,
-            &entry.value.as_ref().unwrap(),
-        )
-        .expect("insert");
+        tree.insert(&entry.key, &entry.value.as_ref().unwrap())
+            .expect("insert");
     }
 
     // Verify at least one null pointer somewhere.
     //println!("full tree: {:#?}", tree);
 
-    let (_, root) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let root = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
 
     server.apply(&write_log, root, Default::default(), 0);
 
-    let mut remote = Tree::make()
+    let mut remote = Tree::builder()
         .with_root(Root {
+            root_type: RootType::State,
             hash: root,
             ..Default::default()
         })
-        .new(server.read_sync());
+        .build(server.read_sync());
 
     // Now try inserting a k-v pair that will force the tree to traverse through the nil node
     // and dereference it.
-    remote
-        .insert(Context::background(), b"insert", b"key")
-        .expect("insert");
+    remote.insert(b"insert", b"key").expect("insert");
 }

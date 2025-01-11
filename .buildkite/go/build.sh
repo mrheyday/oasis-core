@@ -22,8 +22,16 @@ pushd go
   make generate
   if [ -n "$(git status --porcelain)" ]; then
     echo -e "${RED}ERROR: go/ directory is dirty after 'go generate'${OFF}"
+    git diff
     exit 1
   fi
 
   make all GO_BUILD_E2E_COVERAGE=1
+popd
+
+pushd tests/upgrade
+  # Use legacy Go toolchain for pre-upgrade tests.
+  OASIS_GO=go1.20.2 make -C pre
+  # Use regular Go toolchain for post-upgrade tests.
+  make -C post
 popd

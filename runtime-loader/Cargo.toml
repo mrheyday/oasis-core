@@ -1,18 +1,20 @@
 [package]
 name = "oasis-core-runtime-loader"
-version = "0.3.0-alpha"
-authors = ["Oasis Labs Inc. <info@oasislabs.com>"]
+version = "0.0.0"
+authors = ["Oasis Protocol Foundation <info@oasisprotocol.org>"]
 edition = "2018"
 
 [dependencies]
-aesm-client = { version = "0.5.1", features = ["sgxs"] }
-enclave-runner = "0.4.0"
-sgxs-loaders = "0.3.0"
-clap = "2.29.1"
-failure = "0.1.5"
-futures = { version = "0.3.7", features = ["compat", "io-compat"] }
-tokio = { version = "0.2", features = ["full"] }
+clap = "4.5.20"
+anyhow = "1.0"
+futures = { version = "0.3.31", features = ["compat", "io-compat"] }
+tokio = { version = "1.40", features = ["full"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aesm-client = { version = "0.6.0", features = ["sgxs"] }
+enclave-runner = { version = "0.6.0" }
+sgxs-loaders = { version = "0.4.0" }
 
 [[bin]]
 name = "oasis-core-runtime-loader"
-path ="bin/main.rs"
+path = "bin/main.rs"

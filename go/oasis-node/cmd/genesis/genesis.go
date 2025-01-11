@@ -4,11 +4,10 @@ package genesis
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -21,17 +20,20 @@ import (
 	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	"github.com/oasisprotocol/oasis-core/go/common/diff"
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
+	"github.com/oasisprotocol/oasis-core/go/common/quantity"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
+	cmt "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/api"
 	consensusGenesis "github.com/oasisprotocol/oasis-core/go/consensus/genesis"
-	tendermint "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
 	genesisFile "github.com/oasisprotocol/oasis-core/go/genesis/file"
-	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
+	"github.com/oasisprotocol/oasis-core/go/keymanager/secrets"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	cmdCmnGenesis "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/genesis"
@@ -41,6 +43,7 @@ import (
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 )
 
+// nolint: revive
 const (
 	cfgEntity        = "entity"
 	cfgRuntime       = "runtime"
@@ -49,64 +52,77 @@ const (
 	cfgKeyManager    = "keymanager"
 	cfgStaking       = "staking"
 	cfgBlockHeight   = "height"
-	cfgChainID       = "chain.id"
-	cfgHaltEpoch     = "halt.epoch"
-	cfgInitialHeight = "initial_height"
+	CfgChainID       = "chain.id"
+	CfgInitialHeight = "initial_height"
 
 	// Registry config flags.
 	CfgRegistryMaxNodeExpiration                      = "registry.max_node_expiration"
 	CfgRegistryDisableRuntimeRegistration             = "registry.disable_runtime_registration"
-	cfgRegistryDebugAllowUnroutableAddresses          = "registry.debug.allow_unroutable_addresses"
+	CfgRegistryDebugAllowUnroutableAddresses          = "registry.debug.allow_unroutable_addresses"
 	CfgRegistryDebugAllowTestRuntimes                 = "registry.debug.allow_test_runtimes"
-	cfgRegistryDebugAllowEntitySignedNodeRegistration = "registry.debug.allow_entity_signed_registration"
-	cfgRegistryDebugBypassStake                       = "registry.debug.bypass_stake" // nolint: gosec
+	CfgRegistryEnableRuntimeGovernanceModels          = "registry.enable_runtime_governance_models"
+	CfgRegistryTEEFeaturesSGXPCS                      = "registry.tee_features.sgx.pcs"
+	CfgRegistryTEEFeaturesSGXSignedAttestations       = "registry.tee_features.sgx.signed_attestations"
+	CfgRegistryTEEFeaturesSGXDefaultMaxAttestationAge = "registry.tee_features.sgx.default_max_attestation_age"
+	CfgRegistryTEEFeaturesFreshnessProofs             = "registry.tee_features.freshness_proofs"
 
 	// Scheduler config flags.
 	cfgSchedulerMinValidators          = "scheduler.min_validators"
 	cfgSchedulerMaxValidators          = "scheduler.max_validators"
-	cfgSchedulerMaxValidatorsPerEntity = "scheduler.max_validators_per_entity"
+	CfgSchedulerMaxValidatorsPerEntity = "scheduler.max_validators_per_entity"
 	cfgSchedulerDebugBypassStake       = "scheduler.debug.bypass_stake" // nolint: gosec
-	cfgSchedulerDebugStaticValidators  = "scheduler.debug.static_validators"
+	CfgSchedulerDebugForceElect        = "scheduler.debug.force_elect"
+	CfgSchedulerDebugAllowWeakAlpha    = "scheduler.debug.allow_weak_alpha"
+
+	// Governance config flags.
+	CfgGovernanceMinProposalDeposit             = "governance.min_proposal_deposit"
+	CfgGovernanceStakeThreshold                 = "governance.stake_threshold"
+	CfgGovernanceUpgradeCancelMinEpochDiff      = "governance.upgrade_cancel_min_epoch_diff"
+	CfgGovernanceUpgradeMinEpochDiff            = "governance.upgrade_min_epoch_diff"
+	CfgGovernanceVotingPeriod                   = "governance.voting_period"
+	CfgGovernanceEnableChangeParametersProposal = "governance.enable_change_parameters_proposal"
 
 	// Beacon config flags.
-	cfgBeaconDebugDeterministic = "beacon.debug.deterministic"
-
-	// EpochTime config flags.
-	cfgEpochTimeDebugMockBackend   = "epochtime.debug.mock_backend"
-	cfgEpochTimeTendermintInterval = "epochtime.tendermint.interval"
+	CfgBeaconBackend                  = "beacon.backend"
+	CfgBeaconDebugMockBackend         = "beacon.debug.mock_backend"
+	CfgBeaconInsecureCometBFTInterval = "beacon.insecure.cometbft.interval"
+	CfgBeaconVRFAlphaThreshold        = "beacon.vrf.alpha_threshold"
+	CfgBeaconVRFInterval              = "beacon.vrf.interval"
+	CfgBeaconVRFProofSubmissionDelay  = "beacon.vrf.submission_delay"
 
 	// Roothash config flags.
 	cfgRoothashDebugDoNotSuspendRuntimes = "roothash.debug.do_not_suspend_runtimes"
 	cfgRoothashDebugBypassStake          = "roothash.debug.bypass_stake" // nolint: gosec
+	CfgRoothashMaxRuntimeMessages        = "roothash.max_runtime_messages"
+	CfgRoothashMaxInRuntimeMessages      = "roothash.max_in_runtime_messages"
+	CfgRoothashMaxPastRootsStored        = "roothash.max_past_roots_stored"
 
 	// Staking config flags.
 	CfgStakingTokenSymbol        = "staking.token_symbol"
 	CfgStakingTokenValueExponent = "staking.token_value_exponent"
+	cfgStakingDebugBypassStake   = "staking.debug.bypass_stake" // nolint: gosec
 
-	// Tendermint config flags.
-	cfgConsensusTimeoutCommit            = "consensus.tendermint.timeout_commit"
-	cfgConsensusSkipTimeoutCommit        = "consensus.tendermint.skip_timeout_commit"
-	cfgConsensusEmptyBlockInterval       = "consensus.tendermint.empty_block_interval"
-	cfgConsensusMaxTxSizeBytes           = "consensus.tendermint.max_tx_size"
-	cfgConsensusMaxBlockSizeBytes        = "consensus.tendermint.max_block_size"
-	cfgConsensusMaxBlockGas              = "consensus.tendermint.max_block_gas"
-	cfgConsensusMaxEvidenceSizeBytes     = "consensus.tendermint.max_evidence_size"
+	// CometBFT config flags.
+	CfgConsensusTimeoutCommit            = "consensus.cometbft.timeout_commit"
+	cfgConsensusSkipTimeoutCommit        = "consensus.cometbft.skip_timeout_commit"
+	cfgConsensusEmptyBlockInterval       = "consensus.cometbft.empty_block_interval"
+	cfgConsensusMaxTxSizeBytes           = "consensus.cometbft.max_tx_size"
+	cfgConsensusMaxBlockSizeBytes        = "consensus.cometbft.max_block_size"
+	cfgConsensusMaxBlockGas              = "consensus.cometbft.max_block_gas"
+	cfgConsensusMaxEvidenceSizeBytes     = "consensus.cometbft.max_evidence_size"
 	CfgConsensusStateCheckpointInterval  = "consensus.state_checkpoint.interval"
 	CfgConsensusStateCheckpointNumKept   = "consensus.state_checkpoint.num_kept"
 	CfgConsensusStateCheckpointChunkSize = "consensus.state_checkpoint.chunk_size"
 	CfgConsensusGasCostsTxByte           = "consensus.gas_costs.tx_byte"
 	cfgConsensusBlacklistPublicKey       = "consensus.blacklist_public_key"
+	CfgConsensusFeatureVersion           = "consensus.feature_version"
 
 	// Consensus backend config flag.
-	cfgConsensusBackend = "consensus.backend"
+	CfgConsensusBackend = "consensus.backend"
 
 	// Our 'entity' flag overlaps with the common flag 'entity'.
 	// We bind it to a separate Viper key to disambiguate at runtime.
 	viperEntity = "provision_entity"
-
-	// Check command.
-	// Number of lines to print if document not in canonical form.
-	checkNotCanonicalLines = 10
 )
 
 var (
@@ -140,7 +156,7 @@ var (
 	logger = logging.GetLogger("cmd/genesis")
 )
 
-func doInitGenesis(cmd *cobra.Command, args []string) {
+func doInitGenesis(*cobra.Command, []string) {
 	var ok bool
 	defer func() {
 		if !ok {
@@ -158,7 +174,7 @@ func doInitGenesis(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	chainID := viper.GetString(cfgChainID)
+	chainID := viper.GetString(CfgChainID)
 	if chainID == "" {
 		logger.Error("genesis chain id missing")
 		return
@@ -166,10 +182,9 @@ func doInitGenesis(cmd *cobra.Command, args []string) {
 
 	// Build the genesis state, if any.
 	doc := &genesis.Document{
-		Height:    viper.GetInt64(cfgInitialHeight),
-		ChainID:   chainID,
-		Time:      time.Now(),
-		HaltEpoch: epochtime.EpochTime(viper.GetUint64(cfgHaltEpoch)),
+		Height:  viper.GetInt64(CfgInitialHeight),
+		ChainID: chainID,
+		Time:    time.Now(),
 	}
 	entities := viper.GetStringSlice(viperEntity)
 	runtimes := viper.GetStringSlice(cfgRuntime)
@@ -209,41 +224,83 @@ func doInitGenesis(cmd *cobra.Command, args []string) {
 		Parameters: scheduler.ConsensusParameters{
 			MinValidators:          viper.GetInt(cfgSchedulerMinValidators),
 			MaxValidators:          viper.GetInt(cfgSchedulerMaxValidators),
-			MaxValidatorsPerEntity: viper.GetInt(cfgSchedulerMaxValidatorsPerEntity),
+			MaxValidatorsPerEntity: viper.GetInt(CfgSchedulerMaxValidatorsPerEntity),
 			DebugBypassStake:       viper.GetBool(cfgSchedulerDebugBypassStake),
-			DebugStaticValidators:  viper.GetBool(cfgSchedulerDebugStaticValidators),
+			DebugAllowWeakAlpha:    viper.GetBool(CfgSchedulerDebugAllowWeakAlpha),
+		},
+	}
+	if forceElectCfg := viper.GetString(CfgSchedulerDebugForceElect); forceElectCfg != "" {
+		var m map[common.Namespace]map[signature.PublicKey]*scheduler.ForceElectCommitteeRole
+		if err := json.Unmarshal([]byte(forceElectCfg), &m); err != nil {
+			logger.Error("malformed forced scheduler elect configuration",
+				"err", err,
+			)
+			return
+		}
+		doc.Scheduler.Parameters.DebugForceElect = m
+	}
+
+	doc.Governance = governance.Genesis{
+		Parameters: governance.ConsensusParameters{
+			GasCosts:                       governance.DefaultGasCosts, // TODO: configurable.
+			MinProposalDeposit:             *quantity.NewFromUint64(viper.GetUint64(CfgGovernanceMinProposalDeposit)),
+			StakeThreshold:                 uint8(viper.GetInt(CfgGovernanceStakeThreshold)),
+			UpgradeCancelMinEpochDiff:      beacon.EpochTime(viper.GetUint64(CfgGovernanceUpgradeCancelMinEpochDiff)),
+			UpgradeMinEpochDiff:            beacon.EpochTime(viper.GetUint64(CfgGovernanceUpgradeMinEpochDiff)),
+			VotingPeriod:                   beacon.EpochTime(viper.GetUint64(CfgGovernanceVotingPeriod)),
+			EnableChangeParametersProposal: viper.GetBool(CfgGovernanceEnableChangeParametersProposal),
 		},
 	}
 
 	doc.Beacon = beacon.Genesis{
 		Parameters: beacon.ConsensusParameters{
-			DebugDeterministic: viper.GetBool(cfgBeaconDebugDeterministic),
+			Backend:          viper.GetString(CfgBeaconBackend),
+			DebugMockBackend: viper.GetBool(CfgBeaconDebugMockBackend),
 		},
 	}
-
-	doc.EpochTime = epochtime.Genesis{
-		Parameters: epochtime.ConsensusParameters{
-			DebugMockBackend: viper.GetBool(cfgEpochTimeDebugMockBackend),
-			Interval:         viper.GetInt64(cfgEpochTimeTendermintInterval),
-		},
+	switch doc.Beacon.Parameters.Backend {
+	case beacon.BackendInsecure:
+		doc.Beacon.Parameters.InsecureParameters = &beacon.InsecureParameters{
+			Interval: viper.GetInt64(CfgBeaconInsecureCometBFTInterval),
+		}
+	case beacon.BackendVRF:
+		doc.Beacon.Parameters.VRFParameters = &beacon.VRFParameters{
+			AlphaHighQualityThreshold: viper.GetUint64(CfgBeaconVRFAlphaThreshold),
+			Interval:                  viper.GetInt64(CfgBeaconVRFInterval),
+			ProofSubmissionDelay:      viper.GetInt64(CfgBeaconVRFProofSubmissionDelay),
+			GasCosts:                  beacon.DefaultVRFGasCosts, // TODO: configurable.
+		}
+	default:
+		logger.Error("unsupported beacon backend",
+			"backend", doc.Beacon.Parameters.Backend,
+		)
+		return
 	}
 
-	var pkBlacklist []signature.PublicKey
-	for _, pkStr := range viper.GetStringSlice(cfgConsensusBlacklistPublicKey) {
-		var pk signature.PublicKey
-		if err := pk.UnmarshalText([]byte(pkStr)); err != nil {
-			logger.Error("failed to parse blacklisted public key",
+	pkBlacklist, pkErr := parsePublicKeyStringSlice(cfgConsensusBlacklistPublicKey)
+	if pkErr != nil {
+		logger.Error("failed to parse blacklisted public key",
+			"err", pkErr,
+		)
+		return
+	}
+
+	var featureVersion *version.Version
+	if s := viper.GetString(CfgConsensusFeatureVersion); s != "" {
+		version, err := version.FromString(s)
+		if err != nil {
+			logger.Error("failed to parse consensus feature version",
 				"err", err,
 			)
 			return
 		}
-		pkBlacklist = append(pkBlacklist, pk)
+		featureVersion = &version
 	}
 
 	doc.Consensus = consensusGenesis.Genesis{
-		Backend: viper.GetString(cfgConsensusBackend),
+		Backend: viper.GetString(CfgConsensusBackend),
 		Parameters: consensusGenesis.Parameters{
-			TimeoutCommit:            viper.GetDuration(cfgConsensusTimeoutCommit),
+			TimeoutCommit:            viper.GetDuration(CfgConsensusTimeoutCommit),
 			SkipTimeoutCommit:        viper.GetBool(cfgConsensusSkipTimeoutCommit),
 			EmptyBlockInterval:       viper.GetDuration(cfgConsensusEmptyBlockInterval),
 			MaxTxSize:                uint64(viper.GetSizeInBytes(cfgConsensusMaxTxSizeBytes)),
@@ -257,6 +314,7 @@ func doInitGenesis(cmd *cobra.Command, args []string) {
 				consensusGenesis.GasOpTxByte: transaction.Gas(viper.GetUint64(CfgConsensusGasCostsTxByte)),
 			},
 			PublicKeyBlacklist: pkBlacklist,
+			FeatureVersion:     featureVersion,
 		},
 	}
 
@@ -268,9 +326,15 @@ func doInitGenesis(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	b, _ := json.MarshalIndent(doc, "", "  ")
-	if err := ioutil.WriteFile(f, b, 0o600); err != nil {
-		logger.Error("failed to save generated genesis document",
+	canonJSON, err := doc.CanonicalJSON()
+	if err != nil {
+		logger.Error("failed to get canonical form of genesis file",
+			"err", err,
+		)
+		return
+	}
+	if err := os.WriteFile(f, canonJSON, 0o600); err != nil {
+		logger.Error("failed to write genesis file",
 			"err", err,
 		)
 		return
@@ -284,17 +348,46 @@ func doInitGenesis(cmd *cobra.Command, args []string) {
 func AppendRegistryState(doc *genesis.Document, entities, runtimes, nodes []string, l *logging.Logger) error {
 	regSt := registry.Genesis{
 		Parameters: registry.ConsensusParameters{
-			DebugAllowUnroutableAddresses:          viper.GetBool(cfgRegistryDebugAllowUnroutableAddresses),
-			DebugAllowTestRuntimes:                 viper.GetBool(CfgRegistryDebugAllowTestRuntimes),
-			DebugAllowEntitySignedNodeRegistration: viper.GetBool(cfgRegistryDebugAllowEntitySignedNodeRegistration),
-			DebugBypassStake:                       viper.GetBool(cfgRegistryDebugBypassStake),
-			GasCosts:                               registry.DefaultGasCosts, // TODO: Make these configurable.
-			MaxNodeExpiration:                      viper.GetUint64(CfgRegistryMaxNodeExpiration),
-			DisableRuntimeRegistration:             viper.GetBool(CfgRegistryDisableRuntimeRegistration),
+			DebugAllowUnroutableAddresses: viper.GetBool(CfgRegistryDebugAllowUnroutableAddresses),
+			DebugAllowTestRuntimes:        viper.GetBool(CfgRegistryDebugAllowTestRuntimes),
+			GasCosts:                      registry.DefaultGasCosts, // TODO: Make these configurable.
+			MaxNodeExpiration:             viper.GetUint64(CfgRegistryMaxNodeExpiration),
+			DisableRuntimeRegistration:    viper.GetBool(CfgRegistryDisableRuntimeRegistration),
+			EnableRuntimeGovernanceModels: make(map[registry.RuntimeGovernanceModel]bool),
 		},
 		Entities: make([]*entity.SignedEntity, 0, len(entities)),
-		Runtimes: make([]*registry.SignedRuntime, 0, len(runtimes)),
+		Runtimes: make([]*registry.Runtime, 0, len(runtimes)),
 		Nodes:    make([]*node.MultiSignedNode, 0, len(nodes)),
+	}
+
+	if viper.GetBool(CfgRegistryTEEFeaturesSGXPCS) {
+		if regSt.Parameters.TEEFeatures == nil {
+			regSt.Parameters.TEEFeatures = &node.TEEFeatures{}
+		}
+		regSt.Parameters.TEEFeatures.SGX.PCS = true
+	}
+
+	if viper.GetBool(CfgRegistryTEEFeaturesFreshnessProofs) {
+		if regSt.Parameters.TEEFeatures == nil {
+			regSt.Parameters.TEEFeatures = &node.TEEFeatures{}
+		}
+		regSt.Parameters.TEEFeatures.FreshnessProofs = true
+	}
+
+	if viper.GetBool(CfgRegistryTEEFeaturesSGXSignedAttestations) {
+		if regSt.Parameters.TEEFeatures == nil {
+			regSt.Parameters.TEEFeatures = &node.TEEFeatures{}
+		}
+		regSt.Parameters.TEEFeatures.SGX.SignedAttestations = true
+		regSt.Parameters.TEEFeatures.SGX.DefaultMaxAttestationAge = viper.GetUint64(CfgRegistryTEEFeaturesSGXDefaultMaxAttestationAge)
+	}
+
+	for _, gmStr := range viper.GetStringSlice(CfgRegistryEnableRuntimeGovernanceModels) {
+		var gm registry.RuntimeGovernanceModel
+		if err := gm.UnmarshalText([]byte(strings.ToLower(gmStr))); err != nil {
+			return fmt.Errorf("%w: '%s'", err, gmStr)
+		}
+		regSt.Parameters.EnableRuntimeGovernanceModels[gm] = true
 	}
 
 	entMap := make(map[signature.PublicKey]bool)
@@ -310,7 +403,7 @@ func AppendRegistryState(doc *genesis.Document, entities, runtimes, nodes []stri
 	}
 
 	loadSignedEntity := func(fn string) (*entity.SignedEntity, *entity.Entity, error) {
-		b, err := ioutil.ReadFile(fn)
+		b, err := os.ReadFile(fn)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -373,7 +466,7 @@ func AppendRegistryState(doc *genesis.Document, entities, runtimes, nodes []stri
 	}
 
 	for _, v := range runtimes {
-		b, err := ioutil.ReadFile(v)
+		b, err := os.ReadFile(v)
 		if err != nil {
 			l.Error("failed to load genesis runtime registration",
 				"err", err,
@@ -382,7 +475,7 @@ func AppendRegistryState(doc *genesis.Document, entities, runtimes, nodes []stri
 			return err
 		}
 
-		var rt registry.SignedRuntime
+		var rt registry.Runtime
 		if err = json.Unmarshal(b, &rt); err != nil {
 			l.Error("failed to parse genesis runtime registration",
 				"err", err,
@@ -395,7 +488,7 @@ func AppendRegistryState(doc *genesis.Document, entities, runtimes, nodes []stri
 	}
 
 	for _, v := range nodes {
-		b, err := ioutil.ReadFile(v)
+		b, err := os.ReadFile(v)
 		if err != nil {
 			l.Error("failed to load genesis node registration",
 				"err", err,
@@ -425,18 +518,20 @@ func AppendRegistryState(doc *genesis.Document, entities, runtimes, nodes []stri
 // exported runtime states.
 func AppendRootHashState(doc *genesis.Document, exports []string, l *logging.Logger) error {
 	rootSt := roothash.Genesis{
-		RuntimeStates: make(map[common.Namespace]*registry.RuntimeGenesis),
+		RuntimeStates: make(map[common.Namespace]*roothash.GenesisRuntimeState),
 
 		Parameters: roothash.ConsensusParameters{
 			DebugDoNotSuspendRuntimes: viper.GetBool(cfgRoothashDebugDoNotSuspendRuntimes),
 			DebugBypassStake:          viper.GetBool(cfgRoothashDebugBypassStake),
-			// TODO: Make these configurable.
-			GasCosts: roothash.DefaultGasCosts,
+			MaxRuntimeMessages:        viper.GetUint32(CfgRoothashMaxRuntimeMessages),
+			MaxInRuntimeMessages:      viper.GetUint32(CfgRoothashMaxInRuntimeMessages),
+			MaxPastRootsStored:        viper.GetUint64(CfgRoothashMaxPastRootsStored),
+			GasCosts:                  roothash.DefaultGasCosts, // TODO: Make these configurable.
 		},
 	}
 
 	for _, v := range exports {
-		b, err := ioutil.ReadFile(v)
+		b, err := os.ReadFile(v)
 		if err != nil {
 			l.Error("failed to load genesis roothash runtime states",
 				"err", err,
@@ -445,7 +540,7 @@ func AppendRootHashState(doc *genesis.Document, exports []string, l *logging.Log
 			return err
 		}
 
-		var rtStates map[common.Namespace]*registry.RuntimeGenesis
+		var rtStates map[common.Namespace]*roothash.GenesisRuntimeState
 		if err = json.Unmarshal(b, &rtStates); err != nil {
 			l.Error("failed to parse genesis roothash runtime states",
 				"err", err,
@@ -475,10 +570,14 @@ func AppendRootHashState(doc *genesis.Document, exports []string, l *logging.Log
 // AppendKeyManagerState appends the key manager genesis state given a vector of
 // key manager statuses.
 func AppendKeyManagerState(doc *genesis.Document, statuses []string, l *logging.Logger) error {
-	var kmSt keymanager.Genesis
+	secretsGenesis := secrets.Genesis{
+		Parameters: secrets.ConsensusParameters{
+			GasCosts: secrets.DefaultGasCosts, // TODO: Make these configurable.
+		},
+	}
 
 	for _, v := range statuses {
-		b, err := ioutil.ReadFile(v)
+		b, err := os.ReadFile(v)
 		if err != nil {
 			l.Error("failed to load genesis key manager status",
 				"err", err,
@@ -487,7 +586,7 @@ func AppendKeyManagerState(doc *genesis.Document, statuses []string, l *logging.
 			return err
 		}
 
-		var status keymanager.Status
+		var status secrets.Status
 		if err = json.Unmarshal(b, &status); err != nil {
 			l.Error("failed to parse genesis key manager status",
 				"err", err,
@@ -496,10 +595,10 @@ func AppendKeyManagerState(doc *genesis.Document, statuses []string, l *logging.
 			return err
 		}
 
-		kmSt.Statuses = append(kmSt.Statuses, &status)
+		secretsGenesis.Statuses = append(secretsGenesis.Statuses, &status)
 	}
 
-	doc.KeyManager = kmSt
+	doc.KeyManager.Genesis = secretsGenesis
 
 	return nil
 }
@@ -537,14 +636,12 @@ func appendStakingState(doc *genesis.Document, statePath string) error {
 		st.State.TokenValueExponent = tokenValueExponent
 	}
 
-	if err = st.AppendTo(doc); err != nil {
-		return err
-	}
+	st.State.Parameters.DebugBypassStake = viper.GetBool(cfgStakingDebugBypassStake)
 
-	return nil
+	return st.AppendTo(doc)
 }
 
-func doDumpGenesis(cmd *cobra.Command, args []string) {
+func doDumpGenesis(cmd *cobra.Command, _ []string) {
 	ctx := context.Background()
 
 	if err := cmdCommon.Init(); err != nil {
@@ -562,7 +659,14 @@ func doDumpGenesis(cmd *cobra.Command, args []string) {
 
 	client := consensus.NewConsensusClient(conn)
 
-	doc, err := client.StateToGenesis(ctx, viper.GetInt64(cfgBlockHeight))
+	height, err := cmd.Flags().GetInt64(cfgBlockHeight)
+	if err != nil {
+		logger.Error("failed to read block height",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	doc, err := client.StateToGenesis(ctx, height)
 	if err != nil {
 		logger.Error("failed to generate genesis document",
 			"err", err,
@@ -581,14 +685,14 @@ func doDumpGenesis(cmd *cobra.Command, args []string) {
 		defer w.Close()
 	}
 
-	data, err := json.MarshalIndent(doc, "", "  ")
+	canonJSON, err := doc.CanonicalJSON()
 	if err != nil {
-		logger.Error("failed to marshal genesis document into JSON",
+		logger.Error("failed to get canonical form of genesis file",
 			"err", err,
 		)
 		os.Exit(1)
 	}
-	if _, err = w.Write(data); err != nil {
+	if _, err = w.Write(canonJSON); err != nil {
 		logger.Error("failed to write genesis file",
 			"err", err,
 		)
@@ -596,7 +700,7 @@ func doDumpGenesis(cmd *cobra.Command, args []string) {
 	}
 }
 
-func doCheckGenesis(cmd *cobra.Command, args []string) {
+func doCheckGenesis(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -607,48 +711,57 @@ func doCheckGenesis(cmd *cobra.Command, args []string) {
 		logger.Error("failed to open genesis file", "err", err)
 		os.Exit(1)
 	}
+	// NOTE: The genesis document sanity checks are performed inside the
+	// NewFileProvider() function.
 	doc, err := provider.GetGenesisDocument()
 	if err != nil {
 		logger.Error("failed to get genesis document", "err", err)
 		os.Exit(1)
 	}
 
-	err = doc.SanityCheck()
-	if err != nil {
-		logger.Error("genesis document sanity check failed", "err", err)
-		os.Exit(1)
-	}
-
-	// Load raw genesis file.
-	rawFile, err := ioutil.ReadFile(filename)
+	// Load genesis file to check if it is in the canonical form.
+	actualGenesis, err := os.ReadFile(filename)
 	if err != nil {
 		logger.Error("failed to read genesis file:", "err", err)
 		os.Exit(1)
 	}
-	// Create a marshalled genesis document in the canonical form with 2 space indents.
-	rawCanonical, err := json.MarshalIndent(doc, "", "  ")
+	// Get canonical form of the genesis document serialized into a file.
+	canonicalJSON, err := doc.CanonicalJSON()
 	if err != nil {
-		logger.Error("failed to marshal genesis document", "err", err)
+		logger.Error("failed to get canonical form of genesis file", "err", err)
 		os.Exit(1)
 	}
-	// Genesis file should equal the canonical form.
-	if !bytes.Equal(rawFile, rawCanonical) {
-		fileLines := strings.Split(string(rawFile), "\n")
-		if len(fileLines) > checkNotCanonicalLines {
-			fileLines = fileLines[:checkNotCanonicalLines]
+	// Actual genesis file should equal the canonical form.
+	if !bytes.Equal(actualGenesis, canonicalJSON) {
+		var err error
+		if len(strings.Split(strings.TrimSpace(string(actualGenesis)), "\n")) == 1 {
+			err = fmt.Errorf("genesis file has everything on a single line")
+		} else {
+			err = fmt.Errorf("genesis file is not in canonical form, see the diff on stderr")
 		}
-		canonicalLines := strings.Split(string(rawCanonical), "\n")
-		if len(canonicalLines) > checkNotCanonicalLines {
-			canonicalLines = canonicalLines[:checkNotCanonicalLines]
+		diff, derr := diff.UnifiedDiffString(
+			string(actualGenesis), string(canonicalJSON), "Actual", "Canonical")
+		if derr != nil {
+			err = fmt.Errorf("genesis file is not in canonical form, error computing diff: %w", derr)
 		}
-		logger.Error("genesis document is not marshalled in the canonical form")
-		fmt.Fprintf(os.Stderr,
-			"Error: genesis document is not marshalled in the canonical form:\n"+
-				"\nActual marshalled genesis document (trimmed):\n%s\n\n... trimmed ...\n"+
-				"\nExpected marshalled genesis document (trimmed):\n%s\n\n... trimmed ...\n",
-			strings.Join(fileLines, "\n"), strings.Join(canonicalLines, "\n"),
-		)
+		logger.Error("genesis file is not in canonical form", "err", err)
+		if derr == nil {
+			fmt.Fprintf(os.Stderr, "Diff:\n%s\n", diff)
+		}
 		os.Exit(1)
+	}
+
+	fmt.Println("genesis file is valid and in canonical form")
+	fmt.Printf("genesis document's hash: %s\n", doc.ChainContext())
+	fmt.Printf("genesis file's SHA256 checksum: ")
+
+	sha256Hasher := sha256.New()
+	_, herr := sha256Hasher.Write(actualGenesis)
+	switch herr {
+	case nil:
+		fmt.Printf("%x\n", sha256Hasher.Sum(nil))
+	default:
+		fmt.Println("[unknown]")
 	}
 }
 
@@ -659,10 +772,14 @@ func Register(parentCmd *cobra.Command) {
 	dumpGenesisCmd.PersistentFlags().AddFlagSet(cmdGrpc.ClientFlags)
 	checkGenesisCmd.Flags().AddFlagSet(checkGenesisFlags)
 
+	migrateGenesisCmd.PersistentFlags().AddFlagSet(flags.GenesisFileFlags)
+	migrateGenesisCmd.PersistentFlags().AddFlagSet(migrateGenesisFlags)
+
 	for _, v := range []*cobra.Command{
 		initGenesisCmd,
 		dumpGenesisCmd,
 		checkGenesisCmd,
+		migrateGenesisCmd,
 	} {
 		genesisCmd.AddCommand(v)
 	}
@@ -683,66 +800,82 @@ func init() {
 	initGenesisFlags.StringSlice(cfgRootHash, nil, "path to roothash genesis runtime states file")
 	initGenesisFlags.String(cfgStaking, "", "path to staking genesis file")
 	initGenesisFlags.StringSlice(cfgKeyManager, nil, "path to key manager genesis status file")
-	initGenesisFlags.String(cfgChainID, "", "genesis chain id")
-	initGenesisFlags.Uint64(cfgHaltEpoch, math.MaxUint64, "genesis halt epoch height")
-	initGenesisFlags.Int64(cfgInitialHeight, 1, "initial block height")
+	initGenesisFlags.String(CfgChainID, "", "genesis chain id")
+	initGenesisFlags.Int64(CfgInitialHeight, 1, "initial block height")
 
 	// Registry config flags.
 	initGenesisFlags.Uint64(CfgRegistryMaxNodeExpiration, 5, "maximum node registration lifespan in epochs")
 	initGenesisFlags.Bool(CfgRegistryDisableRuntimeRegistration, false, "disable non-genesis runtime registration")
-	initGenesisFlags.Bool(cfgRegistryDebugAllowUnroutableAddresses, false, "allow unroutable addreses (UNSAFE)")
+	initGenesisFlags.Bool(CfgRegistryDebugAllowUnroutableAddresses, false, "allow unroutable addreses (UNSAFE)")
 	initGenesisFlags.Bool(CfgRegistryDebugAllowTestRuntimes, false, "enable test runtime registration")
-	initGenesisFlags.Bool(cfgRegistryDebugAllowEntitySignedNodeRegistration, false, "allow entity signed node registration (UNSAFE)")
-	initGenesisFlags.Bool(cfgRegistryDebugBypassStake, false, "bypass all stake checks and operations (UNSAFE)")
-	_ = initGenesisFlags.MarkHidden(cfgRegistryDebugAllowUnroutableAddresses)
+	initGenesisFlags.StringSlice(CfgRegistryEnableRuntimeGovernanceModels, []string{"entity"}, "set of enabled runtime governance models")
+	initGenesisFlags.Bool(CfgRegistryTEEFeaturesSGXPCS, true, "enable PCS support for SGX TEEs")
+	initGenesisFlags.Bool(CfgRegistryTEEFeaturesSGXSignedAttestations, true, "enable SGX RAK-signed attestations")
+	initGenesisFlags.Uint64(CfgRegistryTEEFeaturesSGXDefaultMaxAttestationAge, 1200, "default max attestation age (SGX RAK-signed attestations must be enabled") // ~2 hours at 6 sec per block.
+	initGenesisFlags.Bool(CfgRegistryTEEFeaturesFreshnessProofs, true, "enable freshness proofs")
+	_ = initGenesisFlags.MarkHidden(CfgRegistryDebugAllowUnroutableAddresses)
 	_ = initGenesisFlags.MarkHidden(CfgRegistryDebugAllowTestRuntimes)
-	_ = initGenesisFlags.MarkHidden(cfgRegistryDebugAllowEntitySignedNodeRegistration)
-	_ = initGenesisFlags.MarkHidden(cfgRegistryDebugBypassStake)
 
 	// Scheduler config flags.
 	initGenesisFlags.Int(cfgSchedulerMinValidators, 1, "minimum number of validators")
 	initGenesisFlags.Int(cfgSchedulerMaxValidators, 100, "maximum number of validators")
-	initGenesisFlags.Int(cfgSchedulerMaxValidatorsPerEntity, 1, "maximum number of validators per entity")
+	initGenesisFlags.Int(CfgSchedulerMaxValidatorsPerEntity, 1, "maximum number of validators per entity")
 	initGenesisFlags.Bool(cfgSchedulerDebugBypassStake, false, "bypass all stake checks and operations (UNSAFE)")
-	initGenesisFlags.Bool(cfgSchedulerDebugStaticValidators, false, "bypass all validator elections (UNSAFE)")
+	initGenesisFlags.String(CfgSchedulerDebugForceElect, "", "force elect the (runtime, node, role) tuple(s) (UNSAFE)")
+	initGenesisFlags.Bool(CfgSchedulerDebugAllowWeakAlpha, false, "bypass alpha strength check for VRF elections (UNSAFE)")
 	_ = initGenesisFlags.MarkHidden(cfgSchedulerDebugBypassStake)
-	_ = initGenesisFlags.MarkHidden(cfgSchedulerDebugStaticValidators)
+	_ = initGenesisFlags.MarkHidden(CfgSchedulerDebugForceElect)
+	_ = initGenesisFlags.MarkHidden(CfgSchedulerDebugAllowWeakAlpha)
+
+	// Governance config flags.
+	initGenesisFlags.Uint64(CfgGovernanceMinProposalDeposit, 100, "proposal deposit for governance proposals")
+	initGenesisFlags.Uint8(CfgGovernanceStakeThreshold, 90, "required stake threshold for governance proposals to be accepted")
+	initGenesisFlags.Uint64(CfgGovernanceUpgradeCancelMinEpochDiff, 300, "minimum number of epochs in advance for canceling proposals")
+	initGenesisFlags.Uint64(CfgGovernanceUpgradeMinEpochDiff, 300, "minimum number of epochs the upgrade needs to be scheduled in advance")
+	initGenesisFlags.Uint64(CfgGovernanceVotingPeriod, 100, "voting period (in epochs)")
+	initGenesisFlags.Bool(CfgGovernanceEnableChangeParametersProposal, true, "enable change parameters proposals")
 
 	// Beacon config flags.
-	initGenesisFlags.Bool(cfgBeaconDebugDeterministic, false, "enable deterministic beacon output (UNSAFE)")
-	_ = initGenesisFlags.MarkHidden(cfgBeaconDebugDeterministic)
-
-	// EpochTime config flags.
-	initGenesisFlags.Bool(cfgEpochTimeDebugMockBackend, false, "use debug mock Epoch time backend")
-	initGenesisFlags.Int64(cfgEpochTimeTendermintInterval, 86400, "Epoch interval (in blocks)")
-	_ = initGenesisFlags.MarkHidden(cfgEpochTimeDebugMockBackend)
+	initGenesisFlags.String(CfgBeaconBackend, "insecure", "beacon backend")
+	initGenesisFlags.Bool(CfgBeaconDebugMockBackend, false, "use debug mock Epoch time backend")
+	initGenesisFlags.Int64(CfgBeaconInsecureCometBFTInterval, 86400, "Epoch interval (in blocks)")
+	initGenesisFlags.Uint64(CfgBeaconVRFAlphaThreshold, 1, "Number of proofs required to allow runtime elections")
+	initGenesisFlags.Int64(CfgBeaconVRFInterval, 86300, "Epoch interval (in blocks)")
+	initGenesisFlags.Int64(CfgBeaconVRFProofSubmissionDelay, 43150, "Proof submission delay (in blocks)")
+	_ = initGenesisFlags.MarkHidden(CfgBeaconDebugMockBackend)
 
 	// Roothash config flags.
 	initGenesisFlags.Bool(cfgRoothashDebugDoNotSuspendRuntimes, false, "do not suspend runtimes (UNSAFE)")
 	initGenesisFlags.Bool(cfgRoothashDebugBypassStake, false, "bypass all roothash stake checks and operations (UNSAFE)")
+	initGenesisFlags.Uint32(CfgRoothashMaxRuntimeMessages, 128, "maximum number of runtime messages submitted in a round")
+	initGenesisFlags.Uint32(CfgRoothashMaxInRuntimeMessages, 128, "maximum number of ququed incoming runtime messages")
+	initGenesisFlags.Uint64(CfgRoothashMaxPastRootsStored, 1200, "maximum number of past runtime state and I/O roots stored in consensus state")
 	_ = initGenesisFlags.MarkHidden(cfgRoothashDebugDoNotSuspendRuntimes)
 	_ = initGenesisFlags.MarkHidden(cfgRoothashDebugBypassStake)
 
 	// Staking config flags.
 	initGenesisFlags.String(CfgStakingTokenSymbol, "", "token's ticker symbol")
 	initGenesisFlags.Uint8(CfgStakingTokenValueExponent, 0, "token value's base-10 exponent")
+	initGenesisFlags.Bool(cfgStakingDebugBypassStake, false, "bypass all stake checks and operations (UNSAFE)")
+	_ = initGenesisFlags.MarkHidden(cfgStakingDebugBypassStake)
 
-	// Tendermint config flags.
-	initGenesisFlags.Duration(cfgConsensusTimeoutCommit, 1*time.Second, "tendermint commit timeout")
-	initGenesisFlags.Bool(cfgConsensusSkipTimeoutCommit, false, "skip tendermint commit timeout")
-	initGenesisFlags.Duration(cfgConsensusEmptyBlockInterval, 0*time.Second, "tendermint empty block interval")
-	initGenesisFlags.String(cfgConsensusMaxTxSizeBytes, "32kb", "tendermint maximum transaction size (in bytes)")
-	initGenesisFlags.String(cfgConsensusMaxBlockSizeBytes, "21mb", "tendermint maximum block size (in bytes)")
-	initGenesisFlags.Uint64(cfgConsensusMaxBlockGas, 0, "tendermint max gas used per block")
-	initGenesisFlags.String(cfgConsensusMaxEvidenceSizeBytes, "1mb", "tendermint max evidence size (in bytes)")
+	// CometBFT config flags.
+	initGenesisFlags.Duration(CfgConsensusTimeoutCommit, 1*time.Second, "cometbft commit timeout")
+	initGenesisFlags.Bool(cfgConsensusSkipTimeoutCommit, false, "skip cometbft commit timeout")
+	initGenesisFlags.Duration(cfgConsensusEmptyBlockInterval, 0*time.Second, "cometbft empty block interval")
+	initGenesisFlags.String(cfgConsensusMaxTxSizeBytes, "128kb", "cometbft maximum transaction size (in bytes)")
+	initGenesisFlags.String(cfgConsensusMaxBlockSizeBytes, "4mb", "cometbft maximum block size (in bytes)")
+	initGenesisFlags.Uint64(cfgConsensusMaxBlockGas, 0, "cometbft max gas used per block")
+	initGenesisFlags.String(cfgConsensusMaxEvidenceSizeBytes, "1mb", "cometbft max evidence size (in bytes)")
 	initGenesisFlags.Uint64(CfgConsensusStateCheckpointInterval, 10000, "consensus state checkpoint interval (in blocks)")
 	initGenesisFlags.Uint64(CfgConsensusStateCheckpointNumKept, 2, "number of kept consensus state checkpoints")
 	initGenesisFlags.String(CfgConsensusStateCheckpointChunkSize, "8mb", "consensus state checkpoint chunk size (in bytes)")
 	initGenesisFlags.Uint64(CfgConsensusGasCostsTxByte, 1, "consensus gas costs: each transaction byte")
 	initGenesisFlags.StringSlice(cfgConsensusBlacklistPublicKey, nil, "blacklist public key")
+	initGenesisFlags.String(CfgConsensusFeatureVersion, "", "latest consensus breaking software feature version")
 
 	// Consensus backend flag.
-	initGenesisFlags.String(cfgConsensusBackend, tendermint.BackendName, "consensus backend")
+	initGenesisFlags.String(CfgConsensusBackend, cmt.BackendName, "consensus backend")
 
 	_ = viper.BindPFlags(initGenesisFlags)
 	initGenesisFlags.StringSlice(cfgEntity, nil, "path to entity registration file")
@@ -750,4 +883,20 @@ func init() {
 	initGenesisFlags.AddFlagSet(flags.DebugTestEntityFlags)
 	initGenesisFlags.AddFlagSet(flags.GenesisFileFlags)
 	initGenesisFlags.AddFlagSet(flags.DebugDontBlameOasisFlag)
+}
+
+func parsePublicKeyStringSlice(cfg string) ([]signature.PublicKey, error) {
+	var pks []signature.PublicKey
+	for _, pkStr := range viper.GetStringSlice(cfg) {
+		var pk signature.PublicKey
+		if err := pk.UnmarshalText([]byte(pkStr)); err != nil {
+			logger.Error("failed to parse public key",
+				"err", err,
+			)
+			return nil, err
+		}
+		pks = append(pks, pk)
+	}
+
+	return pks, nil
 }

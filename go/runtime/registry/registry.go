@@ -5,22 +5,31 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
-	"github.com/spf13/viper"
-
 	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	"github.com/oasisprotocol/oasis-core/go/common/persistent"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
+	"github.com/oasisprotocol/oasis-core/go/common/service"
+	cmSync "github.com/oasisprotocol/oasis-core/go/common/sync"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
+	ias "github.com/oasisprotocol/oasis-core/go/ias/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle"
+	runtimeClient "github.com/oasisprotocol/oasis-core/go/runtime/client/api"
 	"github.com/oasisprotocol/oasis-core/go/runtime/history"
+	"github.com/oasisprotocol/oasis-core/go/runtime/host"
+	runtimeHost "github.com/oasisprotocol/oasis-core/go/runtime/host"
 	"github.com/oasisprotocol/oasis-core/go/runtime/localstorage"
-	"github.com/oasisprotocol/oasis-core/go/runtime/tagindexer"
 	storageAPI "github.com/oasisprotocol/oasis-core/go/storage/api"
-	"github.com/oasisprotocol/oasis-core/go/storage/client"
 )
 
 const (
@@ -32,35 +41,48 @@ const (
 	LocalStorageFile = "worker-local-storage.badger.db"
 )
 
+// ErrRuntimeHostNotConfigured is the error returned when the runtime host is not configured for a
+// specified runtime and a request is made to get the runtime host provisioner.
+var ErrRuntimeHostNotConfigured = errors.New("runtime/registry: runtime host not configured")
+
 // Registry is the running node's runtime registry interface.
 type Registry interface {
-	// GetRuntime returns the per-runtime interface if the runtime is supported.
+	service.BackgroundService
+
+	// GetRuntime returns the per-runtime interface.
 	GetRuntime(runtimeID common.Namespace) (Runtime, error)
 
-	// Runtimes returns a list of all supported runtimes.
+	// Runtimes returns a list of all runtimes.
 	Runtimes() []Runtime
 
-	// NewUnmanagedRuntime creates a new runtime that is not managed by this
-	// registry.
-	NewUnmanagedRuntime(ctx context.Context, runtimeID common.Namespace) (Runtime, error)
+	// NewRuntime creates a new runtime that may or may not be managed
+	// by this registry.
+	NewRuntime(ctx context.Context, runtimeID common.Namespace, managed bool) (Runtime, error)
 
-	// StorageRouter returns a storage backend which routes requests to the
-	// correct per-runtime storage backend based on the namespace contained
-	// in the request.
-	StorageRouter() storageAPI.Backend
+	// RegisterClient registers a runtime client service. If the service has already been registered
+	// this method returns an error.
+	RegisterClient(rc runtimeClient.RuntimeClient) error
 
-	// Cleanup performs post-termination cleanup.
-	Cleanup()
+	// Client returns the runtime client service if available.
+	Client() (runtimeClient.RuntimeClient, error)
 
-	// FinishInitialization finalizes setup for all runtimes and starts their
-	// tag indexers.
-	FinishInitialization(ctx context.Context) error
+	// FinishInitialization finalizes setup for all runtimes.
+	FinishInitialization() error
+
+	// GetBundleRegistry returns the bundle registry.
+	GetBundleRegistry() bundle.Registry
 }
 
 // Runtime is the running node's supported runtime interface.
 type Runtime interface {
 	// ID is the runtime identifier.
 	ID() common.Namespace
+
+	// DataDir returns the runtime-specific data directory.
+	DataDir() string
+
+	// IsManaged returns true iff the runtime is managed by the registry.
+	IsManaged() bool
 
 	// RegistryDescriptor waits for the runtime to be registered and
 	// then returns its registry descriptor.
@@ -69,69 +91,175 @@ type Runtime interface {
 	// WatchRegistryDescriptor subscribes to registry descriptor updates.
 	WatchRegistryDescriptor() (<-chan *registry.Runtime, pubsub.ClosableSubscription, error)
 
+	// ActiveDescriptor waits for runtime to be initialized and then returns
+	// currently active runtime descriptor.
+	ActiveDescriptor(ctx context.Context) (*registry.Runtime, error)
+
+	// WatchActiveDescriptor subscribes to runtime active descriptor updates.
+	WatchActiveDescriptor() (<-chan *registry.Runtime, pubsub.ClosableSubscription, error)
+
 	// RegisterStorage sets the given local storage backend for the runtime.
 	RegisterStorage(storage storageAPI.Backend)
 
 	// History returns the history for this runtime.
 	History() history.History
 
-	// TagIndexer returns the tag indexer backend.
-	TagIndexer() tagindexer.QueryableBackend
-
 	// Storage returns the per-runtime storage backend.
 	Storage() storageAPI.Backend
 
 	// LocalStorage returns the per-runtime local storage.
 	LocalStorage() localstorage.LocalStorage
+
+	// HostConfig returns the runtime host configuration for the given version
+	// when available. Otherwise returns nil.
+	HostConfig(version version.Version) *runtimeHost.Config
+
+	// HostProvisioner returns the runtime host provisioner when available. Otherwise returns nil.
+	HostProvisioner() runtimeHost.Provisioner
+
+	// HostVersions returns a list of supported runtime versions.
+	HostVersions() []version.Version
+
+	// WatchHostVersions returns a channel that produces a stream of versions
+	// as they are added to the runtime.
+	WatchHostVersions() (<-chan version.Version, *pubsub.Subscription)
 }
 
-type runtime struct {
+type runtime struct { // nolint: maligned
 	sync.RWMutex
+	startOne cmSync.One
 
-	id         common.Namespace
-	descriptor *registry.Runtime
+	id                   common.Namespace
+	dataDir              string
+	registryDescriptor   *registry.Runtime
+	activeDescriptor     *registry.Runtime
+	activeDescriptorHash hash.Hash
+	managed              bool
 
 	consensus    consensus.Backend
 	storage      storageAPI.Backend
 	localStorage localstorage.LocalStorage
 
-	history        history.History
-	tagIndexer     *tagindexer.Service
-	indexerStarted bool
+	history history.History
 
-	cancelCtx          context.CancelFunc
-	descriptorCh       chan struct{}
-	descriptorNotifier *pubsub.Broker
+	registryDescriptorCh       chan struct{}
+	registryDescriptorNotifier *pubsub.Broker
+	activeDescriptorCh         chan struct{}
+	activeDescriptorNotifier   *pubsub.Broker
+
+	hostProvisioner runtimeHost.Provisioner
+
+	bundleRegistry  bundle.Registry
+	bundleDiscovery *bundle.Discovery
 
 	logger *logging.Logger
 }
 
+func newRuntime(
+	runtimeID common.Namespace,
+	managed bool,
+	dataDir string,
+	consensus consensus.Backend,
+	provisioner runtimeHost.Provisioner,
+	bundleRegistry bundle.Registry,
+	bundleDiscovery *bundle.Discovery,
+) (*runtime, error) {
+	logger := logging.GetLogger("runtime/registry").With("runtime_id", runtimeID)
+
+	// Ensure runtime state directory exists.
+	rtDataDir, err := EnsureRuntimeStateDir(dataDir, runtimeID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create runtime-specific local storage backend.
+	localStorage, err := localstorage.New(rtDataDir, LocalStorageFile, runtimeID)
+	if err != nil {
+		return nil, fmt.Errorf("runtime/registry: cannot create local storage for runtime %s: %w", runtimeID, err)
+	}
+
+	return &runtime{
+		startOne:                   cmSync.NewOne(),
+		id:                         runtimeID,
+		dataDir:                    rtDataDir,
+		managed:                    managed,
+		consensus:                  consensus,
+		localStorage:               localStorage,
+		registryDescriptorCh:       make(chan struct{}),
+		registryDescriptorNotifier: pubsub.NewBroker(true),
+		activeDescriptorCh:         make(chan struct{}),
+		activeDescriptorNotifier:   pubsub.NewBroker(true),
+		hostProvisioner:            provisioner,
+		bundleRegistry:             bundleRegistry,
+		bundleDiscovery:            bundleDiscovery,
+		logger:                     logger,
+	}, nil
+}
+
+// ID implements Runtime.
 func (r *runtime) ID() common.Namespace {
 	return r.id
 }
 
+// DataDir implements Runtime.
+func (r *runtime) DataDir() string {
+	return r.dataDir
+}
+
+// IsManaged implements Runtime.
+func (r *runtime) IsManaged() bool {
+	return r.managed
+}
+
+// RegistryDescriptor implements Runtime.
 func (r *runtime) RegistryDescriptor(ctx context.Context) (*registry.Runtime, error) {
 	// Wait for the descriptor to be ready.
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-r.descriptorCh:
+	case <-r.registryDescriptorCh:
 	}
 
 	r.RLock()
-	d := r.descriptor
+	d := r.registryDescriptor
 	r.RUnlock()
 	return d, nil
 }
 
-func (r *runtime) WatchRegistryDescriptor() (<-chan *registry.Runtime, pubsub.ClosableSubscription, error) {
-	sub := r.descriptorNotifier.Subscribe()
+// ActiveDescriptor implements Runtime.
+func (r *runtime) ActiveDescriptor(ctx context.Context) (*registry.Runtime, error) {
+	// Wait for the descriptor to be ready.
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-r.activeDescriptorCh:
+	}
+
+	r.RLock()
+	d := r.activeDescriptor
+	r.RUnlock()
+	return d, nil
+}
+
+// WatchActiveDescriptor implements Runtime.
+func (r *runtime) WatchActiveDescriptor() (<-chan *registry.Runtime, pubsub.ClosableSubscription, error) {
+	sub := r.activeDescriptorNotifier.Subscribe()
 	ch := make(chan *registry.Runtime)
 	sub.Unwrap(ch)
 
 	return ch, sub, nil
 }
 
+// WatchRegistryDescriptor implements Runtime.
+func (r *runtime) WatchRegistryDescriptor() (<-chan *registry.Runtime, pubsub.ClosableSubscription, error) {
+	sub := r.registryDescriptorNotifier.Subscribe()
+	ch := make(chan *registry.Runtime)
+	sub.Unwrap(ch)
+
+	return ch, sub, nil
+}
+
+// RegisterStorage implements Runtime.
 func (r *runtime) RegisterStorage(storage storageAPI.Backend) {
 	r.Lock()
 	defer r.Unlock()
@@ -142,93 +270,231 @@ func (r *runtime) RegisterStorage(storage storageAPI.Backend) {
 	r.storage = storage
 }
 
+// History implements Runtime.
 func (r *runtime) History() history.History {
 	return r.history
 }
 
-func (r *runtime) TagIndexer() tagindexer.QueryableBackend {
-	return r.tagIndexer
-}
-
+// Storage implements Runtime.
 func (r *runtime) Storage() storageAPI.Backend {
 	r.RLock()
 	defer r.RUnlock()
 
-	if r.storage == nil {
+	if r.storage == nil && r.managed {
 		panic("runtime storage accessed before initialization")
 	}
 	return r.storage
 }
 
+// LocalStorage implements Runtime.
 func (r *runtime) LocalStorage() localstorage.LocalStorage {
 	return r.localStorage
 }
 
+// HostConfig implements Runtime.
+func (r *runtime) HostConfig(version version.Version) *runtimeHost.Config {
+	name, err := r.bundleRegistry.GetName(r.id, version)
+	if err != nil {
+		return nil
+	}
+
+	components, err := r.bundleRegistry.GetComponents(r.id, version)
+	if err != nil {
+		return nil
+	}
+
+	localConfig := getLocalConfig(r.id)
+
+	return &host.Config{
+		Name:           name,
+		ID:             r.id,
+		Components:     components,
+		Extra:          nil,
+		MessageHandler: nil,
+		LocalConfig:    localConfig,
+	}
+}
+
+// HostProvisioner implements Runtime.
+func (r *runtime) HostProvisioner() runtimeHost.Provisioner {
+	return r.hostProvisioner
+}
+
+// HostVersions implements Runtime.
+func (r *runtime) HostVersions() []version.Version {
+	return r.bundleRegistry.GetVersions(r.id)
+}
+
+// HostVersions implements Runtime.
+func (r *runtime) WatchHostVersions() (<-chan version.Version, *pubsub.Subscription) {
+	return r.bundleRegistry.WatchVersions(r.id)
+}
+
+// start starts the runtime worker.
+func (r *runtime) start() {
+	r.startOne.TryStart(r.run)
+}
+
+// stop halts the runtime worker.
 func (r *runtime) stop() {
 	// Stop watching runtime updates.
-	r.cancelCtx()
+	r.startOne.TryStop()
+
 	// Close local storage backend.
 	r.localStorage.Stop()
+
 	// Close storage backend.
 	if r.storage != nil {
 		r.storage.Cleanup()
 	}
-	// Close tag indexer service.
-	if r.tagIndexer != nil && r.indexerStarted {
-		r.tagIndexer.Stop()
-		<-r.tagIndexer.Quit()
-	}
+
 	// Close history keeper.
-	r.history.Close()
+	if r.history != nil {
+		r.history.Close()
+	}
 }
 
-func (r *runtime) watchUpdates(ctx context.Context, ch <-chan *registry.Runtime, sub pubsub.ClosableSubscription) {
+func (r *runtime) run(ctx context.Context) {
+	r.logger.Debug("waiting consensus sync")
+	select {
+	case <-ctx.Done():
+		return
+	case <-r.consensus.Synced():
+	}
+	r.logger.Debug("consensus synced")
+
+	// Subscribe to epoch transitions.
+	epoCh, sub, err := r.consensus.Beacon().WatchEpochs(ctx)
+	if err != nil {
+		r.logger.Error("failed to watch epochs",
+			"err", err,
+		)
+		return
+	}
 	defer sub.Close()
 
-	var initialized bool
+	// Subscribe to runtime updates.
+	regCh, regSub, err := r.consensus.Registry().WatchRuntimes(ctx)
+	if err != nil {
+		r.logger.Error("failed to watch runtime updates",
+			"err", err,
+		)
+		return
+	}
+	defer regSub.Close()
+
+	var regInitialized, activeInitialized bool
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case rt := <-ch:
+		case <-epoCh:
+			if up := r.updateActiveDescriptor(ctx); up && !activeInitialized {
+				close(r.activeDescriptorCh)
+				activeInitialized = true
+			}
+		case rt := <-regCh:
 			if !rt.ID.Equal(&r.id) {
 				continue
 			}
 
-			r.logger.Debug("updated runtime descriptor",
+			r.logger.Debug("updating registry runtime descriptor",
 				"runtime", rt,
+				"kind", rt.Kind,
 			)
 
 			r.Lock()
-			r.descriptor = rt
+			r.registryDescriptor = rt
 			r.Unlock()
 
-			if !initialized {
-				close(r.descriptorCh)
-				initialized = true
+			if !regInitialized {
+				close(r.registryDescriptorCh)
+				regInitialized = true
+			}
+			r.registryDescriptorNotifier.Broadcast(rt)
+
+			// If this is a compute runtime and the active descriptor is not
+			// initialized, update the active descriptor.
+			if !activeInitialized && rt.Kind == registry.KindCompute {
+				if up := r.updateActiveDescriptor(ctx); up && !activeInitialized {
+					close(r.activeDescriptorCh)
+					activeInitialized = true
+				}
 			}
 
-			r.descriptorNotifier.Broadcast(rt)
+			// Download bundles for the active and future versions.
+			now, err := r.consensus.Beacon().GetEpoch(ctx, consensus.HeightLatest)
+			if err != nil {
+				r.logger.Error("failed to get current epoch",
+					"err", err,
+				)
+				continue
+			}
+
+			var manifestHashes []hash.Hash
+			for i := len(rt.Deployments) - 1; i >= 0; i-- {
+				// Some deployments may lack a bundle manifest checksum,
+				// as it is optional.
+				if h := rt.Deployments[i].BundleChecksum; len(h) == hash.Size {
+					manifestHashes = append(manifestHashes, hash.Hash(h))
+				}
+
+				// Stop at the active deployment since versions follow
+				// chronological order.
+				if rt.Deployments[i].ValidFrom <= now {
+					break
+				}
+			}
+
+			r.bundleDiscovery.Queue(r.id, manifestHashes)
 		}
 	}
 }
 
-func (r *runtime) finishInitialization(ctx context.Context, ident *identity.Identity) error {
+func (r *runtime) updateActiveDescriptor(ctx context.Context) bool {
+	state, err := r.consensus.RootHash().GetRuntimeState(ctx, &roothash.RuntimeRequest{
+		RuntimeID: r.id,
+		Height:    consensus.HeightLatest,
+	})
+	if err != nil {
+		r.logger.Error("querying roothash state",
+			"err", err,
+		)
+		return false
+	}
+
+	h := hash.NewFrom(state.Runtime)
+	// This is only called from the `run` thread and `activeDescriptorHash`
+	// is only mutated bellow, so no need for a lock here.
+	if h.Equal(&r.activeDescriptorHash) {
+		r.logger.Debug("active runtime descriptor didn't change",
+			"runtime", state.Runtime,
+			"hash", h,
+		)
+		return false
+	}
+
+	r.logger.Debug("updating active runtime descriptor",
+		"runtime", state.Runtime,
+		"hash", h,
+	)
+	r.Lock()
+	r.activeDescriptor = state.Runtime
+	r.activeDescriptorHash = h
+	r.Unlock()
+
+	r.activeDescriptorNotifier.Broadcast(state.Runtime)
+
+	return true
+}
+
+func (r *runtime) finishInitialization() error {
 	r.Lock()
 	defer r.Unlock()
 
-	if r.storage == nil {
-		storageBackend, err := client.New(ctx, r.id, ident, r.consensus.Scheduler(), r.consensus.Registry(), r)
-		if err != nil {
-			return fmt.Errorf("runtime/registry: cannot create storage for runtime %s: %w", r.id, err)
-		}
-		r.storage = storageBackend
+	if r.storage == nil && r.managed {
+		return fmt.Errorf("runtime/registry: nobody provided a storage backend for runtime %s", r.id)
 	}
-
-	if err := r.tagIndexer.Start(r.storage); err != nil {
-		return fmt.Errorf("runtime/registry: cannot start tag indexer for runtime %s: %w", r.id, err)
-	}
-	r.indexerStarted = true
 
 	return nil
 }
@@ -236,45 +502,161 @@ func (r *runtime) finishInitialization(ctx context.Context, ident *identity.Iden
 type runtimeRegistry struct {
 	sync.RWMutex
 
+	quitCh chan struct{}
+
 	logger *logging.Logger
 
-	dataDir   string
+	dataDir string
+
 	consensus consensus.Backend
-	identity  *identity.Identity
+	client    runtimeClient.RuntimeClient
 
 	runtimes map[common.Namespace]*runtime
+
+	provisioner    runtimeHost.Provisioner
+	historyFactory history.Factory
+
+	bundleRegistry  bundle.Registry
+	bundleDiscovery *bundle.Discovery
 }
 
+// GetRuntime implements Registry.
 func (r *runtimeRegistry) GetRuntime(runtimeID common.Namespace) (Runtime, error) {
 	r.RLock()
 	defer r.RUnlock()
 
-	rt := r.runtimes[runtimeID]
-	if rt == nil {
-		return nil, fmt.Errorf("runtime/registry: runtime %s is not supported", runtimeID)
+	rt, ok := r.runtimes[runtimeID]
+	if !ok {
+		return nil, fmt.Errorf("runtime/registry: runtime %s not found", runtimeID)
 	}
 	return rt, nil
 }
 
+// Runtimes implements Registry.
 func (r *runtimeRegistry) Runtimes() []Runtime {
 	r.RLock()
 	defer r.RUnlock()
 
-	var rts []Runtime
+	rts := make([]Runtime, 0, len(r.runtimes))
 	for _, rt := range r.runtimes {
 		rts = append(rts, rt)
 	}
 	return rts
 }
 
-func (r *runtimeRegistry) NewUnmanagedRuntime(ctx context.Context, runtimeID common.Namespace) (Runtime, error) {
-	return newRuntime(ctx, runtimeID, r.consensus, r.logger)
+// NewRuntime implements Registry.
+func (r *runtimeRegistry) NewRuntime(ctx context.Context, runtimeID common.Namespace, managed bool) (Runtime, error) {
+	r.Lock()
+	defer r.Unlock()
+
+	r.logger.Info("adding runtime",
+		"id", runtimeID,
+		"managed", managed,
+	)
+
+	if len(r.runtimes) >= MaxRuntimeCount {
+		return nil, fmt.Errorf("runtime/registry: too many registered runtimes")
+	}
+
+	if _, ok := r.runtimes[runtimeID]; ok {
+		return nil, fmt.Errorf("runtime/registry: runtime already registered: %s", runtimeID)
+	}
+
+	rt, err := newRuntime(runtimeID, managed, r.dataDir, r.consensus, r.provisioner, r.bundleRegistry, r.bundleDiscovery)
+	if err != nil {
+		return nil, err
+	}
+
+	if managed {
+		// Create runtime history keeper.
+		history, err := r.historyFactory(runtimeID, rt.dataDir)
+		if err != nil {
+			return nil, fmt.Errorf("runtime/registry: cannot create block history for runtime %s: %w", runtimeID, err)
+		}
+		rt.history = history
+
+		// Start tracking this runtime.
+		if err = r.consensus.RootHash().TrackRuntime(ctx, history); err != nil {
+			return nil, fmt.Errorf("runtime/registry: cannot track runtime %s: %w", runtimeID, err)
+		}
+	}
+
+	r.runtimes[runtimeID] = rt
+
+	rt.start()
+
+	r.logger.Info("runtime added",
+		"id", runtimeID,
+		"managed", managed,
+	)
+
+	return rt, nil
 }
 
-func (r *runtimeRegistry) StorageRouter() storageAPI.Backend {
-	return &storageRouter{registry: r}
+// RegisterClient implements Registry.
+func (r *runtimeRegistry) RegisterClient(rc runtimeClient.RuntimeClient) error {
+	r.Lock()
+	defer r.Unlock()
+
+	if r.client != nil {
+		return fmt.Errorf("runtime/registry: client already registered for runtime")
+	}
+	r.client = rc
+	return nil
 }
 
+// Client implements Registry.
+func (r *runtimeRegistry) Client() (runtimeClient.RuntimeClient, error) {
+	r.RLock()
+	defer r.RUnlock()
+
+	if r.client == nil {
+		return nil, fmt.Errorf("runtime/registry: client not available for runtime")
+	}
+	return r.client, nil
+}
+
+// FinishInitialization implements Registry.
+func (r *runtimeRegistry) FinishInitialization() error {
+	r.RLock()
+	defer r.RUnlock()
+
+	for _, rt := range r.runtimes {
+		if err := rt.finishInitialization(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GetBundleRegistry implements Registry.
+func (r *runtimeRegistry) GetBundleRegistry() bundle.Registry {
+	return r.bundleRegistry
+}
+
+// Name implements BackgroundService.
+func (r *runtimeRegistry) Name() string {
+	return "runtime registry"
+}
+
+// Start implements BackgroundService.
+func (r *runtimeRegistry) Start() error {
+	r.bundleDiscovery.Start()
+	return nil
+}
+
+// Stop implements BackgroundService.
+func (r *runtimeRegistry) Stop() {
+	r.bundleDiscovery.Stop()
+	close(r.quitCh)
+}
+
+// Quit implements BackgroundService.
+func (r *runtimeRegistry) Quit() <-chan struct{} {
+	return r.quitCh
+}
+
+// Cleanup implements BackgroundService.
 func (r *runtimeRegistry) Cleanup() {
 	r.Lock()
 	defer r.Unlock()
@@ -284,141 +666,87 @@ func (r *runtimeRegistry) Cleanup() {
 	}
 }
 
-func (r *runtimeRegistry) FinishInitialization(ctx context.Context) error {
-	r.RLock()
-	defer r.RUnlock()
-
-	for _, rt := range r.runtimes {
-		if err := rt.finishInitialization(ctx, r.identity); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (r *runtimeRegistry) addSupportedRuntime(ctx context.Context, id common.Namespace, cfg *RuntimeConfig) (rerr error) {
-	r.Lock()
-	defer r.Unlock()
-
-	if len(r.runtimes) >= MaxRuntimeCount {
-		return fmt.Errorf("runtime/registry: too many registered runtimes")
-	}
-
-	if _, ok := r.runtimes[id]; ok {
-		return fmt.Errorf("runtime/registry: runtime already registered: %s", id)
-	}
-
-	path, err := EnsureRuntimeStateDir(r.dataDir, id)
+// Init initializes the runtime registry by adding runtimes from the global
+// runtime configuration to the registry.
+func (r *runtimeRegistry) Init(ctx context.Context) error {
+	runtimeIDs, err := getConfiguredRuntimeIDs(r.bundleRegistry)
 	if err != nil {
 		return err
 	}
 
-	rt, err := newRuntime(ctx, id, r.consensus, r.logger)
-	if err != nil {
-		return err
-	}
+	managed := config.GlobalConfig.Mode != config.ModeKeyManager
 
-	// Create runtime history keeper.
-	history, err := history.New(path, id, &cfg.History)
-	if err != nil {
-		return fmt.Errorf("runtime/registry: cannot create block history for runtime %s: %w", id, err)
-	}
-	defer func() {
-		if rerr != nil {
-			history.Close()
+	for _, runtimeID := range runtimeIDs {
+		if _, err := r.NewRuntime(ctx, runtimeID, managed); err != nil {
+			r.logger.Error("failed to add runtime",
+				"err", err,
+				"id", runtimeID,
+			)
+			return fmt.Errorf("failed to add runtime %s: %w", runtimeID, err)
 		}
-	}()
-
-	// Create runtime-specific local storage backend.
-	localStorage, err := localstorage.New(path, LocalStorageFile, id)
-	if err != nil {
-		return fmt.Errorf("runtime/registry: cannot create local storage for runtime %s: %w", id, err)
 	}
-	defer func() {
-		if rerr != nil {
-			localStorage.Stop()
-		}
-	}()
-
-	// Create runtime-specific storage backend.
-	var ns common.Namespace
-	copy(ns[:], id[:])
-
-	// Create runtime tag indexer (to be started later).
-	tagIndexer, err := tagindexer.New(path, cfg.TagIndexer, history, r.consensus.RootHash())
-	if err != nil {
-		return fmt.Errorf("runtime/registry: cannot create tag indexer for runtime %s: %w", id, err)
-	}
-
-	// Start tracking this runtime.
-	if err = r.consensus.RootHash().TrackRuntime(ctx, history); err != nil {
-		return fmt.Errorf("runtime/registry: cannot track runtime %s: %w", id, err)
-	}
-
-	rt.localStorage = localStorage
-	rt.history = history
-	rt.tagIndexer = tagIndexer
-	r.runtimes[id] = rt
 
 	return nil
-}
-
-func newRuntime(ctx context.Context, id common.Namespace, consensus consensus.Backend, logger *logging.Logger) (*runtime, error) {
-	// Start watching this runtime's descriptor.
-	ch, sub, err := consensus.Registry().WatchRuntimes(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("runtime/registry: failed to watch updates for runtime %s: %w", id, err)
-	}
-	watchCtx, cancel := context.WithCancel(ctx)
-
-	rt := &runtime{
-		id:                 id,
-		consensus:          consensus,
-		cancelCtx:          cancel,
-		descriptorCh:       make(chan struct{}),
-		descriptorNotifier: pubsub.NewBroker(true),
-		logger:             logger.With("runtime_id", id),
-	}
-	go rt.watchUpdates(watchCtx, ch, sub)
-
-	return rt, nil
 }
 
 // New creates a new runtime registry.
-func New(ctx context.Context, dataDir string, consensus consensus.Backend, identity *identity.Identity) (Registry, error) {
+func New(
+	ctx context.Context,
+	dataDir string,
+	commonStore *persistent.CommonStore,
+	identity *identity.Identity,
+	consensus consensus.Backend,
+	ias []ias.Endpoint,
+) (Registry, error) {
+	// Create bundle registry and discovery.
+	bundleRegistry := bundle.NewRegistry(dataDir)
+	bundleDiscovery := bundle.NewDiscovery(dataDir, bundleRegistry)
+
+	// Create history keeper factory.
+	historyFactory, err := createHistoryFactory()
+	if err != nil {
+		return nil, err
+	}
+
+	// Configure host environment information.
+	hostInfo, err := createHostInfo(consensus)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create the PCS client and quote service.
+	qs, err := createCachingQuoteService(commonStore)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create runtime provisioner.
+	provisioner, err := createProvisioner(commonStore, identity, consensus, hostInfo, ias, qs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create runtime registry.
 	r := &runtimeRegistry{
-		logger:    logging.GetLogger("runtime/registry"),
-		dataDir:   dataDir,
-		consensus: consensus,
-		identity:  identity,
-		runtimes:  make(map[common.Namespace]*runtime),
+		logger:          logging.GetLogger("runtime/registry"),
+		quitCh:          make(chan struct{}),
+		dataDir:         dataDir,
+		consensus:       consensus,
+		runtimes:        make(map[common.Namespace]*runtime),
+		provisioner:     provisioner,
+		historyFactory:  historyFactory,
+		bundleRegistry:  bundleRegistry,
+		bundleDiscovery: bundleDiscovery,
 	}
 
-	cfg, err := newConfig()
-	if err != nil {
+	// Fill the registry with local bundles.
+	if err := bundleDiscovery.Init(); err != nil {
 		return nil, err
 	}
 
-	runtimes, err := ParseRuntimeMap(viper.GetStringSlice(CfgSupported))
-	if err != nil {
+	// Initialize the runtime registry.
+	if err = r.Init(ctx); err != nil {
 		return nil, err
-	}
-	for id := range runtimes {
-		r.logger.Info("adding supported runtime",
-			"id", id,
-		)
-
-		if err := r.addSupportedRuntime(ctx, id, cfg); err != nil {
-			r.logger.Error("failed to add supported runtime",
-				"err", err,
-				"id", id,
-			)
-			return nil, fmt.Errorf("failed to add runtime %s: %w", id, err)
-		}
-	}
-
-	if len(runtimes) == 0 {
-		r.logger.Info("no supported runtimes configured")
 	}
 
 	return r, nil

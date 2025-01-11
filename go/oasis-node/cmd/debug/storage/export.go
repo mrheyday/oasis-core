@@ -7,22 +7,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdConsensus "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/consensus"
-	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 	storageAPI "github.com/oasisprotocol/oasis-core/go/storage/api"
-	storageClient "github.com/oasisprotocol/oasis-core/go/storage/client"
 	storageDatabase "github.com/oasisprotocol/oasis-core/go/storage/database"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs"
-	"github.com/oasisprotocol/oasis-core/go/worker/storage"
 )
 
 const cfgExportDir = "storage.export.dir"
@@ -37,7 +35,7 @@ var (
 	storageExportFlags = flag.NewFlagSet("", flag.ContinueOnError)
 )
 
-func doExport(cmd *cobra.Command, args []string) {
+func doExport(*cobra.Command, []string) {
 	var ok bool
 	defer func() {
 		if !ok {
@@ -83,7 +81,7 @@ func doExport(cmd *cobra.Command, args []string) {
 	ok = true
 }
 
-func exportRuntime(dataDir, destDir string, id common.Namespace, rtg *registry.RuntimeGenesis) error {
+func exportRuntime(dataDir, destDir string, id common.Namespace, rtg *roothash.GenesisRuntimeState) error {
 	dataDir = filepath.Join(dataDir, runtimeRegistry.RuntimesDir, id.String())
 
 	// Initialize the storage backend.
@@ -102,6 +100,7 @@ func exportRuntime(dataDir, destDir string, id common.Namespace, rtg *registry.R
 	root := storageAPI.Root{
 		Namespace: id,
 		Version:   rtg.Round,
+		Type:      storageAPI.RootTypeState,
 		Hash:      rtg.StateRoot,
 	}
 	tree := mkvs.NewWithRoot(storageBackend, nil, root)
@@ -159,23 +158,12 @@ func newDirectStorageBackend(dataDir string, namespace common.Namespace) (storag
 	// The right thing to do will be to use storage.New, but the backend config
 	// assumes that identity is valid, and we don't have one.
 	cfg := &storageAPI.Config{
-		Backend:           strings.ToLower(viper.GetString(storage.CfgBackend)),
-		DB:                dataDir,
-		ApplyLockLRUSlots: uint64(viper.GetInt(storage.CfgLRUSlots)),
-		Namespace:         namespace,
-		MaxCacheSize:      int64(viper.GetSizeInBytes(storage.CfgMaxCacheSize)),
+		Backend:      config.GlobalConfig.Storage.Backend,
+		Namespace:    namespace,
+		MaxCacheSize: int64(config.ParseSizeInBytes(config.GlobalConfig.Storage.MaxCacheSize)),
 	}
-
-	b := strings.ToLower(viper.GetString(storage.CfgBackend))
-	switch b {
-	case storageDatabase.BackendNameBadgerDB:
-		cfg.DB = filepath.Join(cfg.DB, storageDatabase.DefaultFileName(cfg.Backend))
-		return storageDatabase.New(cfg)
-	case storageClient.BackendName:
-		return storageClient.New(context.Background(), namespace, nil, nil, nil, nil)
-	default:
-		return nil, fmt.Errorf("storage: unsupported backend: '%v'", cfg.Backend)
-	}
+	cfg.DB = filepath.Join(dataDir, storageDatabase.DefaultFileName(cfg.Backend))
+	return storageDatabase.New(cfg)
 }
 
 func init() {

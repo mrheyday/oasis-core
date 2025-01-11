@@ -4,13 +4,64 @@ use anyhow::Result;
 
 use crate::{
     common::crypto::hash::Hash,
-    storage::mkvs::{marshal::*, tree::*},
+    storage::mkvs::{
+        marshal::Marshal,
+        tree::{
+            Depth, DepthTrait, InternalNode, Key, LeafNode, Node, NodeBox, NodeKind, NodePointer,
+            TreeError, Value,
+        },
+    },
 };
 
-/// Size of the encoded version.
-const VERSION_SIZE: usize = size_of::<u64>();
 /// Size of the encoded value length.
 const VALUE_LENGTH_SIZE: usize = size_of::<u32>();
+
+impl NodeBox {
+    pub fn compact_marshal_binary(&self, v: u16) -> Result<Vec<u8>> {
+        match self {
+            NodeBox::Internal(ref n) => n.compact_marshal_binary(v),
+            NodeBox::Leaf(ref n) => n.compact_marshal_binary(),
+        }
+    }
+}
+
+impl InternalNode {
+    pub fn compact_marshal_binary(&self, v: u16) -> Result<Vec<u8>> {
+        match v {
+            0 => {
+                // In version 0 of compact serialization, leaf node is included in the internal
+                // nodes serialization.
+                let leaf_node_binary = if self.leaf_node.borrow().is_null() {
+                    vec![NodeKind::None as u8]
+                } else {
+                    noderef_as!(self.leaf_node.borrow().get_node(), Leaf).marshal_binary()?
+                };
+
+                let mut result: Vec<u8> = Vec::with_capacity(
+                    1 + size_of::<u16>() + self.label.len() + leaf_node_binary.len(),
+                );
+                result.push(NodeKind::Internal as u8);
+                result.append(&mut self.label_bit_length.marshal_binary()?);
+                result.extend_from_slice(&self.label);
+                result.extend_from_slice(leaf_node_binary.as_ref());
+
+                Ok(result)
+            }
+            1 => {
+                // In version 1 of compact serialization, leaf node is not included.
+                let mut result: Vec<u8> =
+                    Vec::with_capacity(1 + size_of::<u16>() + self.label.len() + 1);
+                result.push(NodeKind::Internal as u8);
+                result.append(&mut self.label_bit_length.marshal_binary()?);
+                result.extend_from_slice(&self.label);
+                result.push(NodeKind::None as u8);
+
+                Ok(result)
+            }
+            _ => panic!("unsupported compact serialization version: {:?}", v),
+        }
+    }
+}
 
 impl Marshal for NodeBox {
     fn marshal_binary(&self) -> Result<Vec<u8>> {
@@ -21,7 +72,7 @@ impl Marshal for NodeBox {
     }
 
     fn unmarshal_binary(&mut self, data: &[u8]) -> Result<usize> {
-        if data.len() < 1 {
+        if data.is_empty() {
             Err(TreeError::MalformedNode.into())
         } else {
             let mut kind = NodeKind::None;
@@ -55,7 +106,7 @@ impl Marshal for NodeKind {
     }
 
     fn unmarshal_binary(&mut self, data: &[u8]) -> Result<usize> {
-        if data.len() < 1 {
+        if data.is_empty() {
             Err(TreeError::MalformedNode.into())
         } else {
             if data[0] == NodeKind::None as u8 {
@@ -74,18 +125,16 @@ impl Marshal for NodeKind {
 
 impl Marshal for InternalNode {
     fn marshal_binary(&self) -> Result<Vec<u8>> {
-        let leaf_node_binary: Vec<u8>;
-        if self.leaf_node.borrow().is_null() {
-            leaf_node_binary = vec![NodeKind::None as u8];
+        let leaf_node_binary = if self.leaf_node.borrow().is_null() {
+            vec![NodeKind::None as u8]
         } else {
-            leaf_node_binary =
-                noderef_as!(self.leaf_node.borrow().get_node(), Leaf).marshal_binary()?;
-        }
+            noderef_as!(self.leaf_node.borrow().get_node(), Leaf).marshal_binary()?
+        };
 
-        let mut result: Vec<u8> =
-            Vec::with_capacity(1 + VERSION_SIZE + leaf_node_binary.len() + 2 * Hash::len());
+        let mut result: Vec<u8> = Vec::with_capacity(
+            1 + size_of::<u16>() + self.label.len() + leaf_node_binary.len() + Hash::len() * 2,
+        );
         result.push(NodeKind::Internal as u8);
-        result.append(&mut self.version.marshal_binary()?);
         result.append(&mut self.label_bit_length.marshal_binary()?);
         result.extend_from_slice(&self.label);
         result.extend_from_slice(leaf_node_binary.as_ref());
@@ -97,16 +146,10 @@ impl Marshal for InternalNode {
 
     fn unmarshal_binary(&mut self, data: &[u8]) -> Result<usize> {
         let mut pos = 0;
-        if data.len() < 1 + VERSION_SIZE + size_of::<Depth>() + 1
-            || data[pos] != NodeKind::Internal as u8
-        {
+        if data.len() < 1 + size_of::<Depth>() + 1 || data[pos] != NodeKind::Internal as u8 {
             return Err(TreeError::MalformedNode.into());
         }
         pos += 1;
-
-        self.version
-            .unmarshal_binary(&data[pos..(pos + VERSION_SIZE)])?;
-        pos += VERSION_SIZE;
 
         pos += self.label_bit_length.unmarshal_binary(&data[pos..])?;
         self.label = vec![0; self.label_bit_length.to_bytes()];
@@ -173,20 +216,25 @@ impl Marshal for InternalNode {
     }
 }
 
-impl Marshal for LeafNode {
-    fn marshal_binary(&self) -> Result<Vec<u8>> {
-        let mut result: Vec<u8> = Vec::with_capacity(1 + VERSION_SIZE + VALUE_LENGTH_SIZE);
+impl LeafNode {
+    pub fn compact_marshal_binary(&self) -> Result<Vec<u8>> {
+        let mut result: Vec<u8> = Vec::with_capacity(1 + VALUE_LENGTH_SIZE);
         result.push(NodeKind::Leaf as u8);
-        result.append(&mut self.version.marshal_binary()?);
         result.append(&mut self.key.marshal_binary()?);
         result.append(&mut (self.value.len() as u32).marshal_binary()?);
         result.extend_from_slice(&self.value);
 
         Ok(result)
     }
+}
+
+impl Marshal for LeafNode {
+    fn marshal_binary(&self) -> Result<Vec<u8>> {
+        self.compact_marshal_binary()
+    }
 
     fn unmarshal_binary(&mut self, data: &[u8]) -> Result<usize> {
-        if data.len() < 1 + VERSION_SIZE + size_of::<Depth>() + VALUE_LENGTH_SIZE
+        if data.len() < 1 + size_of::<Depth>() + VALUE_LENGTH_SIZE
             || data[0] != NodeKind::Leaf as u8
         {
             return Err(TreeError::MalformedNode.into());
@@ -195,10 +243,6 @@ impl Marshal for LeafNode {
         self.clean = true;
 
         let mut pos = 1;
-        self.version
-            .unmarshal_binary(&data[pos..(pos + VERSION_SIZE)])?;
-        pos += VERSION_SIZE;
-
         self.key = Key::new();
         let key_len = self.key.unmarshal_binary(&data[pos..])?;
         pos += key_len;

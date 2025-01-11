@@ -1,11 +1,10 @@
-// Package genesis implements the consensus sub-commands.
+// Package consensus implements the consensus sub-commands.
 package consensus
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -32,26 +31,36 @@ var (
 	signerPub string
 
 	consensusCmd = &cobra.Command{
-		Use:   "consensus",
-		Short: "consensus backend commands",
+		Use:        "consensus",
+		Short:      "consensus backend commands",
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	submitTxCmd = &cobra.Command{
-		Use:   "submit_tx",
-		Short: "Submit a pre-signed transaction",
-		Run:   doSubmitTx,
+		Use:        "submit_tx",
+		Short:      "Submit a pre-signed transaction",
+		Run:        doSubmitTx,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	showTxCmd = &cobra.Command{
-		Use:   "show_tx",
-		Short: "Show the content a pre-signed transaction",
-		Run:   doShowTx,
+		Use:        "show_tx",
+		Short:      "Show the content a pre-signed transaction",
+		Run:        doShowTx,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	estimateGasCmd = &cobra.Command{
-		Use:   "estimate_gas",
-		Short: "Estimate how much gas a transactionw will use",
-		Run:   doEstimateGas,
+		Use:        "estimate_gas",
+		Short:      "Estimate how much gas a transaction will use",
+		Run:        doEstimateGas,
+		Deprecated: "use the `oasis` CLI instead.",
+	}
+
+	nextBlockStateCmd = &cobra.Command{
+		Use:        "next_block_state",
+		Run:        doNextBlockState,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	logger = logging.GetLogger("cmd/consensus")
@@ -71,7 +80,7 @@ func doConnect(cmd *cobra.Command) (*grpc.ClientConn, consensus.ClientBackend) {
 }
 
 func loadTx() *transaction.SignedTransaction {
-	rawTx, err := ioutil.ReadFile(viper.GetString(cmdConsensus.CfgTxFile))
+	rawTx, err := os.ReadFile(viper.GetString(cmdConsensus.CfgTxFile))
 	if err != nil {
 		logger.Error("failed to read raw serialized transaction",
 			"err", err,
@@ -91,7 +100,7 @@ func loadTx() *transaction.SignedTransaction {
 }
 
 func loadUnsignedTx() *transaction.Transaction {
-	rawUnsignedTx, err := ioutil.ReadFile(viper.GetString(cmdConsensus.CfgTxFile))
+	rawUnsignedTx, err := os.ReadFile(viper.GetString(cmdConsensus.CfgTxFile))
 	if err != nil {
 		logger.Error("failed to read raw serialized unsigned transaction",
 			"err", err,
@@ -110,7 +119,7 @@ func loadUnsignedTx() *transaction.Transaction {
 	return &tx
 }
 
-func doSubmitTx(cmd *cobra.Command, args []string) {
+func doSubmitTx(cmd *cobra.Command, _ []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -128,7 +137,7 @@ func doSubmitTx(cmd *cobra.Command, args []string) {
 	}
 }
 
-func doShowTx(cmd *cobra.Command, args []string) {
+func doShowTx(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -144,7 +153,7 @@ func doShowTx(cmd *cobra.Command, args []string) {
 	sigTx.PrettyPrint(ctx, "", os.Stdout)
 }
 
-func doEstimateGas(cmd *cobra.Command, args []string) {
+func doEstimateGas(cmd *cobra.Command, _ []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -172,12 +181,39 @@ func doEstimateGas(cmd *cobra.Command, args []string) {
 	fmt.Println(gas)
 }
 
+func doNextBlockState(cmd *cobra.Command, _ []string) {
+	if err := cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
+	}
+
+	conn, client := doConnect(cmd)
+	defer conn.Close()
+
+	// Use background context to block until the result comes in.
+	state, err := client.GetNextBlockState(context.Background())
+	if err != nil {
+		logger.Error("failed to query next block state",
+			"err", err,
+		)
+		os.Exit(128)
+	}
+	prettyStatus, err := cmdCommon.PrettyJSONMarshal(state)
+	if err != nil {
+		logger.Error("failed to get pretty JSON of next block state status",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	fmt.Println(string(prettyStatus))
+}
+
 // Register registers the consensus sub-command and all of it's children.
 func Register(parentCmd *cobra.Command) {
 	for _, v := range []*cobra.Command{
 		submitTxCmd,
 		showTxCmd,
 		estimateGasCmd,
+		nextBlockStateCmd,
 	} {
 		consensusCmd.AddCommand(v)
 	}
@@ -191,6 +227,8 @@ func Register(parentCmd *cobra.Command) {
 	estimateGasCmd.Flags().StringVar(&signerPub, CfgSignerPub, "", "public key of the signer, in base64")
 	estimateGasCmd.Flags().AddFlagSet(cmdConsensus.TxFileFlags)
 	estimateGasCmd.Flags().AddFlagSet(cmdGrpc.ClientFlags)
+
+	nextBlockStateCmd.Flags().AddFlagSet(cmdGrpc.ClientFlags)
 
 	parentCmd.AddCommand(consensusCmd)
 }

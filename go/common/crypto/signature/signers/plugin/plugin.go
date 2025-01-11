@@ -77,6 +77,15 @@ func NewFactory(config interface{}, roles ...signature.SignerRole) (signature.Si
 		return nil, fmt.Errorf("signature/signer/plugin: a plugin name must be specified")
 	}
 
+	// It's not like all the cheap HSMs people seem to like using is going
+	// to support ECVRF anytime soon, when they don't even fully support
+	// RFC 8032.
+	for _, role := range roles {
+		if role == signature.SignerVRF {
+			return nil, signature.ErrVRFNotSupported
+		}
+	}
+
 	// Why yes, the correct thing to do is to call `client.Kill`,
 	// when we are done with the plugin.  Alas there's no good
 	// way to do that while using `os.Exit`.
@@ -166,7 +175,11 @@ func (wf *wrapperFactory) EnsureRole(role signature.SignerRole) error {
 	return nil
 }
 
-func (wf *wrapperFactory) Generate(role signature.SignerRole, _rng io.Reader) (signature.Signer, error) {
+func (wf *wrapperFactory) Generate(role signature.SignerRole, _ io.Reader) (signature.Signer, error) {
+	if role == signature.SignerVRF {
+		return nil, signature.ErrVRFNotSupported
+	}
+
 	wf.Lock()
 	defer wf.Unlock()
 
@@ -183,6 +196,10 @@ func (wf *wrapperFactory) Generate(role signature.SignerRole, _rng io.Reader) (s
 }
 
 func (wf *wrapperFactory) Load(role signature.SignerRole) (signature.Signer, error) {
+	if role == signature.SignerVRF {
+		return nil, signature.ErrVRFNotSupported
+	}
+
 	wf.Lock()
 	defer wf.Unlock()
 
@@ -254,13 +271,13 @@ type signerPlugin struct {
 	impl Signer
 }
 
-func (p *signerPlugin) Server(_broker *plugin.MuxBroker) (interface{}, error) {
+func (p *signerPlugin) Server(*plugin.MuxBroker) (interface{}, error) {
 	return &rpcServer{
 		impl: p.impl,
 	}, nil
 }
 
-func (signerPlugin) Client(b *plugin.MuxBroker, c *rpc.Client) (interface{}, error) {
+func (signerPlugin) Client(_ *plugin.MuxBroker, c *rpc.Client) (interface{}, error) {
 	return &rpcClient{
 		client: c,
 	}, nil

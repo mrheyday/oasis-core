@@ -2,26 +2,20 @@
 members = [
     "runtime",
     "runtime-loader",
-    "client",
-    "keymanager-client",
-    "keymanager-api-common",
-    "keymanager-lib",
+    "keymanager",
+    "secret-sharing",
     "tools",
 
     # Test runtimes.
     "tests/runtimes/simple-keyvalue",
     "tests/runtimes/simple-keymanager",
-
-    # Test clients.
-    "tests/clients/simple-keyvalue",
-    "tests/clients/simple-keyvalue-enc",
-    "tests/clients/simple-keyvalue-ops",
-    "tests/clients/test-long-term",
+    "tests/runtimes/simple-rofl",
 ]
-
-[patch.crates-io]
-# TODO: Remove when merged upstream (briansmith/ring#738).
-ring = { git = "https://github.com/oasislabs/ring-sgx", branch = "sgx-target" }
+exclude = [
+    # Example TDX runtime.
+    "tests/runtimes/simple-rofl-tdx",
+]
+resolver = "2"
 
 [profile.release]
 panic = "abort"

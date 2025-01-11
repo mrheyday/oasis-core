@@ -11,15 +11,15 @@ import (
 
 // MultipleSeeds is the scenario where multiple seed nodes are used.
 var MultipleSeeds scenario.Scenario = &multipleSeeds{
-	E2E: *NewE2E("multiple-seeds"),
+	Scenario: *NewScenario("multiple-seeds"),
 }
 
 type multipleSeeds struct {
-	E2E
+	Scenario
 }
 
 func (sc *multipleSeeds) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := sc.E2E.Fixture()
+	f, err := sc.Scenario.Fixture()
 	if err != nil {
 		return nil, err
 	}
@@ -32,21 +32,21 @@ func (sc *multipleSeeds) Fixture() (*oasis.NetworkFixture, error) {
 		{DisableAddrBookFromGenesis: true},
 	}
 
+	f.Network.SetInsecureBeacon()
+
 	return f, nil
 }
 
 func (sc *multipleSeeds) Clone() scenario.Scenario {
 	return &multipleSeeds{
-		E2E: sc.E2E.Clone(),
+		Scenario: *sc.Scenario.Clone().(*Scenario),
 	}
 }
 
-func (sc *multipleSeeds) Run(childEnv *env.Env) error { // nolint: gocyclo
+func (sc *multipleSeeds) Run(ctx context.Context, _ *env.Env) error { // nolint: gocyclo
 	if err := sc.Net.Start(); err != nil {
 		return fmt.Errorf("net Start: %w", err)
 	}
-
-	ctx := context.Background()
 
 	sc.Logger.Info("waiting for network to come up")
 	if err := sc.Net.Controller().WaitNodesRegistered(ctx, 3); err != nil {

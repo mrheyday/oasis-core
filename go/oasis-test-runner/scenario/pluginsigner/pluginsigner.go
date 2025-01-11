@@ -17,7 +17,7 @@ const (
 	cfgPluginConfig = "config"
 )
 
-var pluginSignerParamsDummy *pluginSignerImpl = newPluginSignerImpl("")
+var pluginSignerParamsDummy = newPluginSignerImpl("")
 
 type pluginSignerImpl struct {
 	name   string
@@ -60,7 +60,7 @@ func (sc *pluginSignerImpl) Parameters() *env.ParameterFlagSet {
 	return sc.flags
 }
 
-func (sc *pluginSignerImpl) PreInit(childEnv *env.Env) error {
+func (sc *pluginSignerImpl) PreInit() error {
 	return nil
 }
 
@@ -68,7 +68,11 @@ func (sc *pluginSignerImpl) Fixture() (*oasis.NetworkFixture, error) {
 	return nil, nil
 }
 
-func (sc *pluginSignerImpl) Init(childEnv *env.Env, net *oasis.Network) error {
+func (sc *pluginSignerImpl) Network() *oasis.Network {
+	return nil
+}
+
+func (sc *pluginSignerImpl) Init(*env.Env, *oasis.Network) error {
 	return nil
 }
 

@@ -1,289 +1,456 @@
-use std::sync::Arc;
+//! A simple test runtime.
 
-use anyhow::{anyhow, Result};
-use io_context::Context as IoContext;
+pub mod crypto;
+pub mod methods;
+pub mod types;
 
-use oasis_core_keymanager_client::{KeyManagerClient, KeyPairId};
-use oasis_core_runtime::{
-    common::{
-        crypto::{
-            hash::Hash,
-            mrae::deoxysii::{DeoxysII, KEY_SIZE, NONCE_SIZE, TAG_SIZE},
-        },
-        runtime::RuntimeId,
-        version::Version,
-    },
-    executor::Executor,
-    rak::RAK,
-    register_runtime_txn_methods, runtime_context,
-    storage::{StorageContext, MKVS},
-    transaction::{dispatcher::CheckOnlySuccess, Context as TxnContext},
-    version_from_cargo, Protocol, RpcDemux, RpcDispatcher, TxnDispatcher, TxnMethDispatcher,
+use std::{
+    convert::TryInto,
+    sync::{atomic::AtomicBool, Arc},
 };
-use simple_keymanager::trusted_policy_signers;
-use simple_keyvalue_api::{with_api, Key, KeyValue};
 
-struct Context {
-    test_runtime_id: RuntimeId,
-    km_client: Arc<dyn KeyManagerClient>,
+use oasis_core_keymanager::client::KeyManagerClient;
+use oasis_core_runtime::{
+    common::{crypto::hash::Hash, version::Version},
+    config::Config,
+    consensus::{
+        roothash::{IncomingMessage, Message},
+        verifier::{TrustRoot, Verifier},
+    },
+    dispatcher::{PostInitState, PreInitState},
+    future::block_on,
+    protocol::HostInfo,
+    transaction::{
+        dispatcher::{ExecuteBatchResult, ExecuteTxResult},
+        tags::{Tag, Tags},
+        types::TxnBatch,
+        Context as TxnContext,
+    },
+    types::{CheckTxResult, Error as RuntimeError, FeatureScheduleControl, Features},
+    TxnDispatcher,
+};
+use simple_keymanager::trusted_signers;
+
+use methods::{BlockHandler, Methods};
+use types::*;
+
+/// Maximum number of transactions in a batch. Should be less than or equal to what is set in the
+/// runtime descriptor to avoid batches being rejected.
+const MAX_BATCH_SIZE: usize = 100;
+
+/// A simple context wrapper for processing test transaction batches.
+///
+/// For a proper dispatcher see the [Oasis SDK](https://github.com/oasisprotocol/oasis-sdk).
+pub struct Context<'a, 'core> {
+    pub core: &'a mut TxnContext<'core>,
+    pub host_info: &'a HostInfo,
+    pub key_manager: &'a dyn KeyManagerClient,
+    pub consensus_verifier: &'a dyn Verifier,
+    pub messages: Vec<Message>,
 }
 
-/// Return previously set runtime ID of this runtime.
-fn get_runtime_id(_args: &(), ctx: &mut TxnContext) -> Result<Option<String>> {
-    let rctx = runtime_context!(ctx, Context);
+/// A simple context wrapper for processing test transactions.
+///
+/// For a proper dispatcher see the [Oasis SDK](https://github.com/oasisprotocol/oasis-sdk).
+pub struct TxContext<'a, 'b, 'core> {
+    pub parent: &'a mut Context<'b, 'core>,
+    pub tags: Tags,
 
-    Ok(Some(rctx.test_runtime_id.to_string()))
+    check_only: bool,
 }
 
-/// Insert a key/value pair.
-fn insert(args: &KeyValue, ctx: &mut TxnContext) -> Result<Option<String>> {
-    if args.value.as_bytes().len() > 128 {
-        return Err(anyhow!("Value too big to be inserted."));
-    }
-    if ctx.check_only {
-        return Err(CheckOnlySuccess::default().into());
-    }
-    ctx.emit_txn_tag(b"kv_op", b"insert");
-    ctx.emit_txn_tag(b"kv_key", args.key.as_bytes());
-
-    let existing = StorageContext::with_current(|mkvs, _untrusted_local| {
-        mkvs.insert(
-            IoContext::create_child(&ctx.io_ctx),
-            args.key.as_bytes(),
-            args.value.as_bytes(),
-        )
-    });
-    Ok(existing.map(|v| String::from_utf8(v)).transpose()?)
-}
-
-/// Retrieve a key/value pair.
-fn get(args: &Key, ctx: &mut TxnContext) -> Result<Option<String>> {
-    if ctx.check_only {
-        return Err(CheckOnlySuccess::default().into());
-    }
-    ctx.emit_txn_tag(b"kv_op", b"get");
-    ctx.emit_txn_tag(b"kv_key", args.key.as_bytes());
-
-    let existing = StorageContext::with_current(|mkvs, _untrusted_local| {
-        mkvs.get(IoContext::create_child(&ctx.io_ctx), args.key.as_bytes())
-    });
-    Ok(existing.map(|v| String::from_utf8(v)).transpose()?)
-}
-
-/// Remove a key/value pair.
-fn remove(args: &Key, ctx: &mut TxnContext) -> Result<Option<String>> {
-    if ctx.check_only {
-        return Err(CheckOnlySuccess::default().into());
-    }
-    ctx.emit_txn_tag(b"kv_op", b"remove");
-    ctx.emit_txn_tag(b"kv_key", args.key.as_bytes());
-
-    let existing = StorageContext::with_current(|mkvs, _untrusted_local| {
-        mkvs.remove(IoContext::create_child(&ctx.io_ctx), args.key.as_bytes())
-    });
-    Ok(existing.map(|v| String::from_utf8(v)).transpose()?)
-}
-
-/// Helper for doing encrypted MKVS operations.
-fn get_encryption_context(ctx: &mut TxnContext, key: &[u8]) -> Result<EncryptionContext> {
-    let rctx = runtime_context!(ctx, Context);
-
-    // Derive key pair ID based on key.
-    let key_pair_id = KeyPairId::from(Hash::digest_bytes(key).as_ref());
-
-    // Fetch encryption keys.
-    let io_ctx = IoContext::create_child(&ctx.io_ctx);
-    let result = rctx.km_client.get_or_create_keys(io_ctx, key_pair_id);
-    let key = Executor::with_current(|executor| executor.block_on(result))?;
-
-    Ok(EncryptionContext::new(key.state_key.as_ref()))
-}
-
-/// (encrypted) Insert a key/value pair.
-fn enc_insert(args: &KeyValue, ctx: &mut TxnContext) -> Result<Option<String>> {
-    // NOTE: This is only for example purposes, the correct way would be
-    //       to also generate a (deterministic) nonce.
-    let nonce = [0u8; NONCE_SIZE];
-
-    let enc_ctx = get_encryption_context(ctx, args.key.as_bytes())?;
-    let existing = StorageContext::with_current(|mkvs, _untrusted_local| {
-        enc_ctx.insert(
-            mkvs,
-            IoContext::create_child(&ctx.io_ctx),
-            args.key.as_bytes(),
-            args.value.as_bytes(),
-            &nonce,
-        )
-    });
-    Ok(existing.map(|v| String::from_utf8(v)).transpose()?)
-}
-
-/// (encrypted) Retrieve a key/value pair.
-fn enc_get(args: &Key, ctx: &mut TxnContext) -> Result<Option<String>> {
-    let enc_ctx = get_encryption_context(ctx, args.key.as_bytes())?;
-    let existing = StorageContext::with_current(|mkvs, _untrusted_local| {
-        enc_ctx.get(
-            mkvs,
-            IoContext::create_child(&ctx.io_ctx),
-            args.key.as_bytes(),
-        )
-    });
-    Ok(existing.map(|v| String::from_utf8(v)).transpose()?)
-}
-
-/// (encrypted) Remove a key/value pair.
-fn enc_remove(args: &Key, ctx: &mut TxnContext) -> Result<Option<String>> {
-    let enc_ctx = get_encryption_context(ctx, args.key.as_bytes())?;
-    let existing = StorageContext::with_current(|mkvs, _untrusted_local| {
-        enc_ctx.remove(
-            mkvs,
-            IoContext::create_child(&ctx.io_ctx),
-            args.key.as_bytes(),
-        )
-    });
-    Ok(existing.map(|v| String::from_utf8(v)).transpose()?)
-}
-
-/// A keyed storage encryption context, for use with a MKVS instance.
-struct EncryptionContext {
-    d2: DeoxysII,
-}
-
-impl EncryptionContext {
-    /// Initialize a new EncryptionContext with the given MRAE key.
-    pub fn new(key: &[u8]) -> Self {
-        if key.len() != KEY_SIZE {
-            panic!("mkvs: invalid encryption key size {}", key.len());
+impl<'a, 'b, 'core> TxContext<'a, 'b, 'core> {
+    fn new(parent: &'a mut Context<'b, 'core>, check_only: bool) -> Self {
+        Self {
+            parent,
+            tags: vec![],
+            check_only,
         }
-        let mut raw_key = [0u8; KEY_SIZE];
-        raw_key.copy_from_slice(&key[..KEY_SIZE]);
-
-        let d2 = DeoxysII::new(&raw_key);
-        //raw_key.zeroize();
-
-        Self { d2 }
     }
 
-    /// Get encrypted MKVS entry.
-    pub fn get(&self, mkvs: &dyn MKVS, ctx: IoContext, key: &[u8]) -> Option<Vec<u8>> {
-        let key = self.derive_encrypted_key(key);
-        let ciphertext = match mkvs.get(ctx, &key) {
-            Some(ciphertext) => ciphertext,
-            None => return None,
-        };
-
-        self.open(&ciphertext)
+    fn is_check_only(&self) -> bool {
+        self.check_only
     }
 
-    /// Insert encrypted MKVS entry.
-    pub fn insert(
+    fn emit_message(&mut self, message: Message) -> u32 {
+        self.parent.messages.push(message);
+        (self.parent.messages.len() - 1) as u32
+    }
+
+    fn emit_tag(&mut self, key: &[u8], value: &[u8]) {
+        self.tags.push(Tag {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            ..Default::default()
+        });
+    }
+}
+
+/// A simple dispatcher used for this test runtime.
+///
+/// For a proper dispatcher see the [Oasis SDK](https://github.com/oasisprotocol/oasis-sdk).
+struct Dispatcher {
+    host_info: HostInfo,
+    key_manager: Arc<dyn KeyManagerClient>,
+    consensus_verifier: Arc<dyn Verifier>,
+}
+
+impl Dispatcher {
+    fn new(
+        host_info: HostInfo,
+        key_manager: Arc<dyn KeyManagerClient>,
+        consensus_verifier: Arc<dyn Verifier>,
+    ) -> Self {
+        Self {
+            host_info,
+            key_manager,
+            consensus_verifier,
+        }
+    }
+
+    fn dispatch_call<B, R, F>(
+        ctx: &mut TxContext,
+        args: cbor::Value,
+        f: F,
+    ) -> Result<cbor::Value, String>
+    where
+        B: cbor::Decode,
+        R: cbor::Encode,
+        F: FnOnce(&mut TxContext, B) -> Result<R, String>,
+    {
+        let args = cbor::from_value(args).map_err(|_| "malformed call arguments".to_string())?;
+
+        let result = f(ctx, args)?;
+        Ok(cbor::to_value(result))
+    }
+
+    fn decode_tx(tx: &[u8]) -> Result<Call, String> {
+        // In the test runtime all transactions are just CBOR-serialized Call structs. In reality
+        // one would want to have things like signatures etc.
+        cbor::from_slice(tx).map_err(|err| err.to_string())
+    }
+
+    fn dispatch_tx(ctx: &mut TxContext, tx: Call) -> Result<cbor::Value, String> {
+        Methods::check_nonce(ctx, tx.nonce)?;
+
+        match tx.method.as_str() {
+            "get_runtime_id" => Self::dispatch_call(ctx, tx.args, Methods::get_runtime_id),
+            "consensus_accounts" => Self::dispatch_call(ctx, tx.args, Methods::consensus_accounts),
+            "consensus_withdraw" => Self::dispatch_call(ctx, tx.args, Methods::consensus_withdraw),
+            "consensus_transfer" => Self::dispatch_call(ctx, tx.args, Methods::consensus_transfer),
+            "consensus_add_escrow" => {
+                Self::dispatch_call(ctx, tx.args, Methods::consensus_add_escrow)
+            }
+            "consensus_reclaim_escrow" => {
+                Self::dispatch_call(ctx, tx.args, Methods::consensus_reclaim_escrow)
+            }
+            "update_runtime" => Self::dispatch_call(ctx, tx.args, Methods::update_runtime),
+            "insert" => Self::dispatch_call(ctx, tx.args, Methods::insert),
+            "get" => Self::dispatch_call(ctx, tx.args, Methods::get),
+            "remove" => Self::dispatch_call(ctx, tx.args, Methods::remove),
+            "enc_insert" => Self::dispatch_call(ctx, tx.args, Methods::enc_insert_using_secrets),
+            "enc_get" => Self::dispatch_call(ctx, tx.args, Methods::enc_get_using_secrets),
+            "enc_remove" => Self::dispatch_call(ctx, tx.args, Methods::enc_remove_using_secrets),
+            "churp_insert" => Self::dispatch_call(ctx, tx.args, Methods::enc_insert_using_churp),
+            "churp_get" => Self::dispatch_call(ctx, tx.args, Methods::enc_get_using_churp),
+            "churp_remove" => Self::dispatch_call(ctx, tx.args, Methods::enc_remove_using_churp),
+            "encrypt" => Self::dispatch_call(ctx, tx.args, Methods::encrypt),
+            "decrypt" => Self::dispatch_call(ctx, tx.args, Methods::decrypt),
+            _ => Err("method not found".to_string()),
+        }
+    }
+
+    fn decode_and_dispatch_tx(ctx: &mut TxContext, tx: &[u8]) -> Result<cbor::Value, String> {
+        let tx = Self::decode_tx(tx)?;
+        Self::dispatch_tx(ctx, tx)
+    }
+
+    fn execute_tx(ctx: &mut Context<'_, '_>, tx: &[u8]) -> Result<ExecuteTxResult, RuntimeError> {
+        // During execution we reject malformed transactions as the proposer should do checks first.
+        let tx = Self::decode_tx(tx).map_err(|_| RuntimeError {
+            module: "test".to_string(),
+            code: 1,
+            message: "malformed transaction batch".to_string(),
+        })?;
+
+        let mut tx_ctx = TxContext::new(ctx, false);
+
+        match Self::dispatch_tx(&mut tx_ctx, tx) {
+            Ok(result) => Ok(ExecuteTxResult {
+                output: cbor::to_vec(CallOutput::Success(result)),
+                tags: tx_ctx.tags,
+            }),
+            Err(err) => Ok(ExecuteTxResult {
+                output: cbor::to_vec(CallOutput::Error(err)),
+                tags: vec![],
+            }),
+        }
+    }
+
+    fn execute_in_msg(ctx: &mut Context<'_, '_>, msg: &IncomingMessage) {
+        // Process incoming messages as transactions and ignore results.
+        let _ = Self::execute_tx(ctx, &msg.data);
+    }
+
+    fn check_tx(ctx: &mut Context<'_, '_>, tx: &[u8]) -> Result<CheckTxResult, RuntimeError> {
+        let mut tx_ctx = TxContext::new(ctx, true);
+
+        match Self::decode_and_dispatch_tx(&mut tx_ctx, tx) {
+            Ok(_) => Ok(CheckTxResult::default()),
+            Err(err) => Ok(CheckTxResult {
+                error: RuntimeError {
+                    module: "test".to_string(),
+                    code: 1,
+                    message: err,
+                },
+                meta: None,
+            }),
+        }
+    }
+
+    fn begin_block(ctx: &mut Context) -> Result<(), RuntimeError> {
+        BlockHandler::begin_block(ctx)
+    }
+}
+
+impl TxnDispatcher for Dispatcher {
+    fn query(
         &self,
-        mkvs: &mut dyn MKVS,
-        ctx: IoContext,
-        key: &[u8],
-        value: &[u8],
-        nonce: &[u8],
-    ) -> Option<Vec<u8>> {
-        let nonce = Self::derive_nonce(&nonce);
-        let mut ciphertext = self.d2.seal(&nonce, value.to_vec(), vec![]);
-        ciphertext.extend_from_slice(&nonce);
+        mut ctx: TxnContext,
+        method: &str,
+        args: Vec<u8>,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        // Verify consensus state and runtime state root integrity before execution.
+        // TODO: Make this async.
+        let _ = block_on(self.consensus_verifier.verify_for_query(
+            ctx.consensus_block.clone(),
+            ctx.header.clone(),
+            ctx.epoch,
+        ))?;
 
-        let key = self.derive_encrypted_key(key);
-        let ciphertext = match mkvs.insert(ctx, &key, &ciphertext) {
-            Some(ciphertext) => ciphertext,
-            None => return None,
+        // Ensure the runtime is still ready to process requests.
+        ctx.protocol.ensure_initialized()?;
+
+        let mut ctx = Context {
+            core: &mut ctx,
+            host_info: &self.host_info,
+            key_manager: &self.key_manager,
+            consensus_verifier: &self.consensus_verifier,
+            messages: vec![],
+        };
+        let mut ctx = TxContext::new(&mut ctx, false);
+
+        let res = match method {
+            "get_runtime_id" => Self::dispatch_call(
+                &mut ctx,
+                cbor::from_slice(&args).unwrap(),
+                Methods::get_runtime_id,
+            ),
+            "get" => Self::dispatch_call(&mut ctx, cbor::from_slice(&args).unwrap(), Methods::get),
+            _ => Err("method not found".to_string()),
         };
 
-        self.open(&ciphertext)
+        match res {
+            Ok(res) => Ok(cbor::to_vec(res)),
+            Err(err) => Err(RuntimeError {
+                module: "test".to_string(),
+                code: 1,
+                message: err,
+            }),
+        }
     }
 
-    /// Remove encrypted MKVS entry.
-    pub fn remove(&self, mkvs: &mut dyn MKVS, ctx: IoContext, key: &[u8]) -> Option<Vec<u8>> {
-        let key = self.derive_encrypted_key(key);
-        let ciphertext = match mkvs.remove(ctx, &key) {
-            Some(ciphertext) => ciphertext,
-            None => return None,
+    fn check_batch(
+        &self,
+        mut ctx: TxnContext,
+        batch: &TxnBatch,
+    ) -> Result<Vec<CheckTxResult>, RuntimeError> {
+        let mut ctx = Context {
+            core: &mut ctx,
+            host_info: &self.host_info,
+            key_manager: &self.key_manager,
+            consensus_verifier: &self.consensus_verifier,
+            messages: vec![],
         };
 
-        self.open(&ciphertext)
-    }
-
-    fn open(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
-        // ciphertext || tag || nonce.
-        if ciphertext.len() < TAG_SIZE + NONCE_SIZE {
-            return None;
+        let mut results = vec![];
+        for tx in batch.iter() {
+            results.push(Self::check_tx(&mut ctx, tx)?);
         }
 
-        let nonce_offset = ciphertext.len() - NONCE_SIZE;
-        let mut nonce = [0u8; NONCE_SIZE];
-        nonce.copy_from_slice(&ciphertext[nonce_offset..]);
-        let ciphertext = &ciphertext[..nonce_offset];
-
-        let plaintext = self.d2.open(&nonce, ciphertext.to_vec(), vec![]);
-        plaintext.ok()
+        Ok(results)
     }
 
-    fn derive_encrypted_key(&self, key: &[u8]) -> Vec<u8> {
-        // XXX: The plan is eventually to use a lighter weight transform
-        // for the key instead of a full fledged MRAE algorithm.  For now
-        // approximate it with a Deoxys-II call with an all 0 nonce.
+    fn execute_batch(
+        &self,
+        mut ctx: TxnContext,
+        batch: &TxnBatch,
+        in_msgs: &[IncomingMessage],
+    ) -> Result<ExecuteBatchResult, RuntimeError> {
+        let mut ctx = Context {
+            core: &mut ctx,
+            host_info: &self.host_info,
+            key_manager: &self.key_manager,
+            consensus_verifier: &self.consensus_verifier,
+            messages: vec![],
+        };
 
-        let nonce = [0u8; NONCE_SIZE];
-        self.d2.seal(&nonce, key.to_vec(), vec![])
-    }
+        Self::begin_block(&mut ctx)?;
 
-    fn derive_nonce(nonce: &[u8]) -> [u8; NONCE_SIZE] {
-        // Just a copy for type safety.
-        let mut n = [0u8; NONCE_SIZE];
-        if nonce.len() != NONCE_SIZE {
-            panic!("invalid nonce size: {}", nonce.len());
+        // Execute incoming messages. A real implementation should allocate resources for incoming
+        // messages and only execute as many messages as fits.
+        for in_msg in in_msgs {
+            Self::execute_in_msg(&mut ctx, in_msg);
         }
-        n.copy_from_slice(nonce);
 
-        n
+        // Execute transactions.
+        let mut results = vec![];
+        for tx in batch.iter() {
+            results.push(Self::execute_tx(&mut ctx, tx)?);
+        }
+
+        Ok(ExecuteBatchResult {
+            results,
+            messages: ctx.messages,
+            in_msgs_count: in_msgs.len(),
+            block_tags: vec![],
+            tx_reject_hashes: vec![],
+        })
     }
+
+    fn schedule_and_execute_batch(
+        &self,
+        mut ctx: TxnContext,
+        batch: &mut TxnBatch,
+        in_msgs: &[IncomingMessage],
+    ) -> Result<ExecuteBatchResult, RuntimeError> {
+        let mut ctx = Context {
+            core: &mut ctx,
+            host_info: &self.host_info,
+            key_manager: &self.key_manager,
+            consensus_verifier: &self.consensus_verifier,
+            messages: vec![],
+        };
+
+        Self::begin_block(&mut ctx)?;
+
+        // Execute incoming messages. A real implementation should allocate resources for incoming
+        // messages and only execute as many messages as fits.
+        for in_msg in in_msgs {
+            Self::execute_in_msg(&mut ctx, in_msg);
+        }
+
+        // Execute transactions.
+        // TODO: Actually do some batch reordering.
+        let mut new_batch = vec![];
+        let mut results = vec![];
+        let mut tx_reject_hashes = vec![];
+        for tx in batch.drain(..) {
+            if new_batch.len() >= MAX_BATCH_SIZE {
+                break;
+            }
+
+            // Reject any transactions that don't pass check tx.
+            if Self::check_tx(&mut ctx, &tx)?.error.code != 0 {
+                tx_reject_hashes.push(Hash::digest_bytes(&tx));
+                continue;
+            }
+
+            results.push(Self::execute_tx(&mut ctx, &tx)?);
+            new_batch.push(tx);
+        }
+
+        // Replace input batch with newly generated batch.
+        *batch = new_batch.into();
+
+        Ok(ExecuteBatchResult {
+            results,
+            messages: ctx.messages,
+            in_msgs_count: in_msgs.len(),
+            block_tags: vec![],
+            tx_reject_hashes,
+        })
+    }
+
+    fn set_abort_batch_flag(&mut self, _abort_batch: Arc<AtomicBool>) {}
 }
 
-pub fn main() {
+pub fn main_with_version(version: Version) {
     // Initializer.
-    let init = |protocol: &Arc<Protocol>,
-                rak: &Arc<RAK>,
-                _rpc_demux: &mut RpcDemux,
-                rpc: &mut RpcDispatcher|
-     -> Option<Box<dyn TxnDispatcher>> {
-        let mut txn = TxnMethDispatcher::new();
-        with_api! { register_runtime_txn_methods!(txn, api); }
+    let init = |state: PreInitState<'_>| -> PostInitState {
+        let hi = state.protocol.get_host_info();
 
         // Create the key manager client.
-        let rt_id = protocol.get_runtime_id();
-        let km_client = Arc::new(oasis_core_keymanager_client::RemoteClient::new_runtime(
-            rt_id,
-            protocol.clone(),
-            rak.clone(),
+        let km_client = Arc::new(oasis_core_keymanager::client::RemoteClient::new_runtime(
+            hi.runtime_id,
+            state.protocol.clone(),
+            state.consensus_verifier.clone(),
+            state.identity.clone(),
             1024,
-            trusted_policy_signers(),
+            trusted_signers(),
         ));
-        let initializer_km_client = km_client.clone();
 
-        #[cfg(not(target_env = "sgx"))]
-        let _ = rpc;
-        #[cfg(target_env = "sgx")]
-        rpc.set_keymanager_policy_update_handler(Some(Box::new(move |raw_signed_policy| {
-            km_client
-                .set_policy(raw_signed_policy)
-                .expect("failed to update km client policy");
-        })));
+        let key_manager = km_client.clone();
+        state
+            .rpc_dispatcher
+            .set_keymanager_status_update_handler(Some(Box::new(move |status| {
+                block_on(key_manager.set_status(status))
+                    .expect("failed to update km client status");
+            })));
 
-        txn.set_context_initializer(move |ctx: &mut TxnContext| {
-            ctx.runtime = Box::new(Context {
-                test_runtime_id: rt_id.clone(),
-                km_client: initializer_km_client.clone(),
-            })
-        });
+        let key_manager = km_client.clone();
+        state
+            .rpc_dispatcher
+            .set_keymanager_quote_policy_update_handler(Some(Box::new(move |policy| {
+                block_on(key_manager.set_quote_policy(policy));
+            })));
 
-        Some(Box::new(txn))
+        let dispatcher = Dispatcher::new(hi, km_client, state.consensus_verifier.clone());
+
+        PostInitState {
+            txn_dispatcher: Some(Box::new(dispatcher)),
+            ..Default::default()
+        }
     };
 
+    // Determine test trust root based on build settings.
+    #[allow(clippy::option_env_unwrap)]
+    let trust_root = option_env!("OASIS_TESTS_CONSENSUS_TRUST_HEIGHT").map(|height| {
+        let hash = option_env!("OASIS_TESTS_CONSENSUS_TRUST_HASH").unwrap();
+        let runtime_id = option_env!("OASIS_TESTS_CONSENSUS_TRUST_RUNTIME_ID").unwrap();
+        let chain_context = option_env!("OASIS_TESTS_CONSENSUS_TRUST_CHAIN_CONTEXT").unwrap();
+
+        TrustRoot {
+            height: height.parse::<u64>().unwrap(),
+            hash: hash.to_string(),
+            runtime_id: runtime_id.into(),
+            chain_context: chain_context.to_string(),
+        }
+    });
+
     // Start the runtime.
-    oasis_core_runtime::start_runtime(Box::new(init), version_from_cargo!());
+    oasis_core_runtime::start_runtime(
+        Box::new(init),
+        Config {
+            version,
+            trust_root,
+            features: Features {
+                // Enable the schedule control feature.
+                schedule_control: Some(FeatureScheduleControl {
+                    initial_batch_size: MAX_BATCH_SIZE.try_into().unwrap(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+}
+
+#[allow(dead_code)]
+pub fn main() {
+    main_with_version(Version {
+        major: 0,
+        minor: 0,
+        patch: 0,
+    })
 }

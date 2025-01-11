@@ -2,52 +2,47 @@ package oasis
 
 import (
 	"fmt"
+	"strconv"
 
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	fileSigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/file"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
-	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/crypto"
+	"github.com/oasisprotocol/oasis-core/go/config"
 )
 
 // SeedCfg is the Oasis seed node configuration.
 type SeedCfg struct {
+	Name string
+
 	DisableAddrBookFromGenesis bool
 }
 
 // Seed is an Oasis seed node.
 type Seed struct { // nolint: maligned
-	Node
+	*Node
 
 	disableAddrBookFromGenesis bool
 
-	tmAddress     string
-	consensusPort uint16
+	consensusPort  uint16
+	libp2pSeedPort uint16
 }
 
-func (seed *Seed) startNode() error {
-	otherSeeds := []*Seed{}
-	for _, s := range seed.net.seeds {
-		if s.Name == seed.Name {
-			continue
-		}
-		otherSeeds = append(otherSeeds, s)
-	}
+func (seed *Seed) AddArgs(*argBuilder) error {
+	return nil
+}
 
-	args := newArgBuilder().
-		debugDontBlameOasis().
-		debugAllowTestKeys().
-		workerCertificateRotation(true).
-		tendermintCoreAddress(seed.consensusPort).
-		appendSeedNodes(otherSeeds).
-		tendermintSeedMode()
+func (seed *Seed) ModifyConfig() error {
+	seed.Config.Mode = config.ModeSeed
+
+	seed.Config.Consensus.ListenAddress = allInterfacesAddr + ":" + strconv.Itoa(int(seed.consensusPort))
+	seed.Config.Consensus.ExternalAddress = localhostAddr + ":" + strconv.Itoa(int(seed.consensusPort))
 
 	if seed.disableAddrBookFromGenesis {
-		args = args.tendermintSeedDisableAddrBookFromGenesis()
+		seed.Config.Consensus.Debug.DisableAddrBookFromGenesis = true
 	}
 
-	if err := seed.net.startOasisNode(&seed.Node, nil, args); err != nil {
-		return fmt.Errorf("oasis/seed: failed to launch node %s: %w", seed.Name, err)
-	}
+	seed.Config.P2P.Port = seed.libp2pSeedPort
+
+	seed.AddSeedNodesToConfigExcept(seed.Name)
 
 	return nil
 }
@@ -55,41 +50,32 @@ func (seed *Seed) startNode() error {
 // NewSeed provisions a new seed node and adds it to the network.
 func (net *Network) NewSeed(cfg *SeedCfg) (*Seed, error) {
 	seedName := fmt.Sprintf("seed-%d", len(net.seeds))
-
-	seedDir, err := net.baseDir.NewSubDir(seedName)
+	host, err := net.GetNamedNode(seedName, nil)
 	if err != nil {
-		net.logger.Error("failed to create seed node subdir",
-			"err", err,
-		)
-		return nil, fmt.Errorf("oasis/seed: failed to create seed subdir: %w", err)
+		return nil, err
 	}
 
 	// Pre-provision the node identity, so that we can figure out what
 	// to pass all the actual nodes in advance, instead of having to
-	// start the node and fork out to `oasis-node debug tendermint show-node-id`.
-	signerFactory, err := fileSigner.NewFactory(seedDir.String(), signature.SignerNode, signature.SignerP2P, signature.SignerConsensus)
+	// start the node and fork out to `oasis-node debug cometbft show-node-id`.
+	signerFactory, err := fileSigner.NewFactory(host.dir.String(), identity.RequiredSignerRoles...)
 	if err != nil {
 		return nil, fmt.Errorf("oasis/seed: failed to create seed signer factory: %w", err)
 	}
-	seedIdentity, err := identity.LoadOrGenerate(seedDir.String(), signerFactory, false)
+	seedIdentity, err := identity.LoadOrGenerate(host.dir.String(), signerFactory)
 	if err != nil {
 		return nil, fmt.Errorf("oasis/seed: failed to provision seed identity: %w", err)
 	}
-	seedP2PPublicKey := seedIdentity.P2PSigner.Public()
+	host.p2pSigner = seedIdentity.P2PSigner.Public()
 
 	seedNode := &Seed{
-		Node: Node{
-			Name: seedName,
-			net:  net,
-			dir:  seedDir,
-		},
+		Node:                       host,
 		disableAddrBookFromGenesis: cfg.DisableAddrBookFromGenesis,
-		tmAddress:                  crypto.PublicKeyToTendermint(&seedP2PPublicKey).Address().String(),
-		consensusPort:              net.nextNodePort,
+		consensusPort:              host.getProvisionedPort(nodePortConsensus),
+		libp2pSeedPort:             host.getProvisionedPort(nodePortP2PSeed),
 	}
-	seedNode.doStartNode = seedNode.startNode
 	net.seeds = append(net.seeds, seedNode)
-	net.nextNodePort++
+	host.features = append(host.features, seedNode)
 
 	return seedNode, nil
 }

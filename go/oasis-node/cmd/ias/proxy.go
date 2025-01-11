@@ -3,6 +3,8 @@ package ias
 
 import (
 	"context"
+	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,15 +30,14 @@ import (
 )
 
 const (
-	envAuthAPIKey    = "OASIS_IAS_APIKEY"
-	cfgAuthAPIKey    = "ias.auth.api_key"
+	envAuthAPIKey    = "OASIS_IAS_APIKEY" //nolint:gosec
+	cfgAuthAPIKey    = "ias.auth.api_key" //nolint:gosec
 	cfgIsProduction  = "ias.production"
 	envSPID          = "OASIS_IAS_SPID"
 	cfgSPID          = "ias.spid"
 	cfgQuoteSigType  = "ias.quote.signature_type"
 	cfgDebugMock     = "ias.debug.mock"
 	cfgDebugSkipAuth = "ias.debug.skip_auth"
-	cfgUseGenesis    = "ias.use_genesis"
 	cfgWaitRuntimes  = "ias.wait_runtimes"
 
 	tlsKeyFilename  = "ias_proxy.pem"
@@ -76,7 +77,7 @@ func TLSCertPaths(dataDir string) (string, string) {
 	return certPath, keyPath
 }
 
-func doProxy(cmd *cobra.Command, args []string) {
+func doProxy(cmd *cobra.Command, _ []string) {
 	var startOk bool
 	defer func() {
 		if !startOk {
@@ -100,13 +101,38 @@ func doProxy(cmd *cobra.Command, args []string) {
 	}
 
 	tlsCertPath, tlsKeyPath := TLSCertPaths(dataDir)
-	cert, err := tlsCert.LoadOrGenerate(tlsCertPath, tlsKeyPath, iasProxy.CommonName)
+	cert, err := tlsCert.LoadFromKey(tlsKeyPath, iasProxy.CommonName)
+	switch {
+	case err == nil:
+	case errors.Is(err, os.ErrNotExist):
+		// Loading node's persistent TLS private key failed, generate a new
+		// private key and the corresponding TLS certificate.
+		cert, err = tlsCert.Generate(iasProxy.CommonName)
+		if err != nil {
+			logger.Error("failed to load or generate TLS cert",
+				"err", err,
+			)
+			return
+		}
+	default:
+		logger.Error("failed to load or generate TLS cert",
+			"err", err,
+		)
+		return
+	}
+
+	// Save re-generated TLS certificate (and private key) to disk.
+	err = tlsCert.Save(tlsCertPath, tlsKeyPath, cert)
 	if err != nil {
 		logger.Error("failed to load or generate TLS cert",
 			"err", err,
 		)
 		return
 	}
+
+	logger.Info("loaded/generated IAS TLS certificate",
+		"public_key", cert.PrivateKey.(ed25519.PrivateKey).Public().(ed25519.PublicKey),
+	)
 
 	endpoint, err := iasEndpointFromFlags()
 	if err != nil {
@@ -137,7 +163,7 @@ func doProxy(cmd *cobra.Command, args []string) {
 	env.svcMgr.Register(metrics)
 
 	// Initialize the profiling server.
-	profiling, err := pprof.New(env.svcMgr.Ctx)
+	profiling, err := pprof.New()
 	if err != nil {
 		logger.Error("failed to initialize pprof server",
 			"err", err,
@@ -231,9 +257,6 @@ func grpcAuthenticatorFromFlags(ctx context.Context, cmd *cobra.Command) (iasPro
 		logger.Warn("IAS gRPC authentication disabled, proxy is open")
 		return nil, nil
 	}
-	if viper.GetBool(cfgUseGenesis) {
-		return newGenesisAuthenticator()
-	}
 
 	return newRegistryAuthenticator(ctx, cmd)
 }
@@ -253,7 +276,6 @@ func init() {
 	proxyFlags.Bool(cfgIsProduction, false, "use the production IAS endpoint")
 	proxyFlags.Bool(cfgDebugMock, false, "generate mock IAS AVR responses (UNSAFE)")
 	proxyFlags.Bool(cfgDebugSkipAuth, false, "disable proxy authentication (UNSAFE)")
-	proxyFlags.Bool(cfgUseGenesis, false, "use a genesis document instead of the registry")
 	proxyFlags.Int(cfgWaitRuntimes, 0, "wait for N runtimes to be registered before servicing requests")
 
 	_ = proxyFlags.MarkHidden(cfgDebugMock)
@@ -263,11 +285,9 @@ func init() {
 	_ = viper.BindEnv(cfgSPID, envSPID)
 
 	_ = viper.BindPFlags(proxyFlags)
-	proxyFlags.AddFlagSet(metrics.Flags)
 	proxyFlags.AddFlagSet(cmdGrpc.ServerLocalFlags)
 	proxyFlags.AddFlagSet(cmdGrpc.ServerTCPFlags)
 	proxyFlags.AddFlagSet(cmdGrpc.ClientFlags)
 	proxyFlags.AddFlagSet(flags.GenesisFileFlags)
 	proxyFlags.AddFlagSet(flags.DebugDontBlameOasisFlag)
-	proxyFlags.AddFlagSet(pprof.Flags)
 }

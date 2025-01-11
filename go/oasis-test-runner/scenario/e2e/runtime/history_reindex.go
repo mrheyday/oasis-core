@@ -3,14 +3,15 @@ package runtime
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
+	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/log"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 )
 
 const (
@@ -21,23 +22,23 @@ const (
 var HistoryReindex scenario.Scenario = newHistoryReindexImpl()
 
 type historyReindexImpl struct {
-	runtimeImpl
+	Scenario
 }
 
 func newHistoryReindexImpl() scenario.Scenario {
 	return &historyReindexImpl{
-		runtimeImpl: *newRuntimeImpl("history-reindex", "simple-keyvalue-enc-client", nil),
+		Scenario: *NewScenario(
+			"history-reindex",
+			NewTestClient().WithScenario(InsertRemoveEncWithSecretsScenario),
+		),
 	}
 }
 
 func (sc *historyReindexImpl) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := sc.runtimeImpl.Fixture()
+	f, err := sc.Scenario.Fixture()
 	if err != nil {
 		return nil, err
 	}
-
-	// We need IAS proxy to use the registry as we are registering runtimes dynamically.
-	f.Network.IAS.UseRegistry = true
 
 	f.ComputeWorkers = []oasis.ComputeWorkerFixture{
 		{
@@ -68,18 +69,19 @@ func (sc *historyReindexImpl) Fixture() (*oasis.NetworkFixture, error) {
 	// Use a single compute node.
 	f.Runtimes[rtIdx].Executor.GroupSize = 1
 	f.Runtimes[rtIdx].Executor.GroupBackupSize = 0
+	f.Runtimes[rtIdx].Constraints[scheduler.KindComputeExecutor][scheduler.RoleWorker].MinPoolSize.Limit = 1
+	f.Runtimes[rtIdx].Constraints[scheduler.KindComputeExecutor][scheduler.RoleBackupWorker].MinPoolSize.Limit = 0
 
 	return f, nil
 }
 
 func (sc *historyReindexImpl) Clone() scenario.Scenario {
 	return &historyReindexImpl{
-		runtimeImpl: *sc.runtimeImpl.Clone().(*runtimeImpl),
+		Scenario: *sc.Scenario.Clone().(*Scenario),
 	}
 }
 
-func (sc *historyReindexImpl) Run(childEnv *env.Env) error {
-	ctx := context.Background()
+func (sc *historyReindexImpl) Run(ctx context.Context, childEnv *env.Env) error {
 	cli := cli.New(childEnv, sc.Net, sc.Logger)
 
 	// Start the network.
@@ -130,15 +132,18 @@ func (sc *historyReindexImpl) Run(childEnv *env.Env) error {
 		return err
 	}
 
+	// Fetch current epoch.
+	epoch, err := sc.Net.Controller().Beacon.GetEpoch(ctx, consensus.HeightLatest)
+	if err != nil {
+		return fmt.Errorf("failed to get current epoch: %w", err)
+	}
+
 	// Register runtime.
 	compRt := sc.Net.Runtimes()[rtIdx]
-	compRtDesc := compRt.ToRuntimeDescriptor()
-	txPath := filepath.Join(childEnv.Dir(), "register_compute_runtime.json")
-	if err := cli.Registry.GenerateRegisterRuntimeTx(0, compRtDesc, txPath, compRt.GetGenesisStatePath()); err != nil {
-		return fmt.Errorf("failed to generate register compute runtime tx: %w", err)
-	}
-	if err := cli.Consensus.SubmitTx(txPath); err != nil {
-		return fmt.Errorf("failed to register compute runtime: %w", err)
+	rtDsc := compRt.ToRuntimeDescriptor()
+	rtDsc.Deployments[0].ValidFrom = epoch + 1
+	if err = sc.RegisterRuntime(childEnv, cli, rtDsc, 0); err != nil {
+		return err
 	}
 
 	// Wait for the compute worker to be ready.
@@ -147,20 +152,11 @@ func (sc *historyReindexImpl) Run(childEnv *env.Env) error {
 	if err != nil {
 		return err
 	}
-	if err = computeCtrl.WaitReady(context.Background()); err != nil {
+	if err = computeCtrl.WaitReady(ctx); err != nil {
 		return err
 	}
 
 	// Run client to ensure runtime works.
 	sc.Logger.Info("Starting the basic client")
-	cmd, err := sc.startClient(childEnv)
-	if err != nil {
-		return err
-	}
-	clientErrCh := make(chan error)
-	go func() {
-		clientErrCh <- cmd.Wait()
-	}()
-
-	return sc.wait(childEnv, cmd, clientErrCh)
+	return sc.RunTestClientAndCheckLogs(ctx, childEnv)
 }

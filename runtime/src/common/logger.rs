@@ -3,9 +3,7 @@ use std::sync::{Mutex, Once};
 
 use lazy_static::lazy_static;
 use log::Level;
-use slog::{self, Drain};
-use slog_scope;
-use slog_stdlog;
+use slog::{o, Drain};
 
 lazy_static! {
     static ref LOGGER: slog::Logger = slog::Logger::root(
@@ -33,6 +31,6 @@ pub fn init_logger(level: Level) {
             .lock()
             .unwrap()
             .get_or_insert(slog_scope::set_global_logger(global_logger));
-        let _log_guard = slog_stdlog::init_with_level(level).unwrap();
+        slog_stdlog::init_with_level(level).unwrap();
     });
 }

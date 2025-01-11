@@ -1,7 +1,6 @@
 package persistent
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -9,15 +8,14 @@ import (
 )
 
 func TestPersistent(t *testing.T) {
-	dir, err := ioutil.TempDir("", "oasis-core-unittests")
+	dir, err := os.MkdirTemp("", "oasis-core-unittests")
 	assert.NoError(t, err)
 	defer os.RemoveAll(dir)
 
 	common, err := NewCommonStore(dir)
 	assert.NoError(t, err, "NewCommonStore")
 
-	svc, err := common.GetServiceStore("persistent_test")
-	assert.NoError(t, err, "GetServiceStore")
+	svc := common.GetServiceStore("persistent_test")
 
 	key := []byte("foo")
 	val := "bar"

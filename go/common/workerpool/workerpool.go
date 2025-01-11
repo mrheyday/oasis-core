@@ -19,8 +19,8 @@ type jobDescriptor struct {
 // Pool is a pool of goroutine workers.
 //
 // Notes:
-//  * The pool is always constructed with one active worker goroutine.
-//  * Once closed, it can not be used anymore.
+//   - The pool is always constructed with one active worker goroutine.
+//   - Once closed, it can not be used anymore.
 type Pool struct { // nolint: maligned
 	lock        sync.Mutex
 	workerGroup sync.WaitGroup
@@ -79,6 +79,10 @@ func (p *Pool) Stop() {
 	p.stopOnce.Do(func() {
 		close(p.stopCh)
 	})
+
+	for range p.jobCh.Out() { //nolint:revive
+		// Clear the channel to close all go routines and prevent memory leaks.
+	}
 }
 
 // Quit returns a channel that will be closed when the pool stops.
@@ -89,6 +93,13 @@ func (p *Pool) Quit() <-chan struct{} {
 // Submit adds a task to the pool's queue and returns a channel that will be closed
 // once the task is complete.
 func (p *Pool) Submit(job func()) <-chan struct{} {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if p.currentCount == 0 {
+		return nil
+	}
+
 	desc := &jobDescriptor{
 		job:        job,
 		completeCh: make(chan struct{}),

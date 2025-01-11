@@ -2,15 +2,25 @@ package oasis
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 
-	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	"github.com/oasisprotocol/oasis-core/go/config"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle"
+	runtimeConfig "github.com/oasisprotocol/oasis-core/go/runtime/config"
+)
+
+const (
+	clientIdentitySeedTemplate = "ekiden node client %d"
 )
 
 // Client is an Oasis client node.
 type Client struct {
-	Node
+	*Node
 
-	maxTransactionAge int64
+	runtimes           []int
+	runtimeProvisioner runtimeConfig.RuntimeProvisioner
+	runtimeConfig      map[int]map[string]interface{}
 
 	consensusPort uint16
 	p2pPort       uint16
@@ -20,75 +30,78 @@ type Client struct {
 type ClientCfg struct {
 	NodeCfg
 
-	MaxTransactionAge int64
+	Runtimes           []int
+	RuntimeProvisioner runtimeConfig.RuntimeProvisioner
+	RuntimeConfig      map[int]map[string]interface{}
 }
 
-func (client *Client) startNode() error {
-	args := newArgBuilder().
-		debugDontBlameOasis().
-		debugAllowTestKeys().
-		tendermintDebugDisableCheckTx(client.consensus.DisableCheckTx).
-		tendermintPrune(client.consensus.PruneNumKept).
-		tendermintRecoverCorruptedWAL(client.consensus.TendermintRecoverCorruptedWAL).
-		tendermintCoreAddress(client.consensusPort).
-		appendNetwork(client.net).
-		appendSeedNodes(client.net.seeds).
-		workerP2pPort(client.p2pPort).
-		workerP2pEnabled().
-		runtimeTagIndexerBackend("bleve")
+func (client *Client) AddArgs(args *argBuilder) error {
+	args.appendNetwork(client.net)
 
-	if client.maxTransactionAge != 0 {
-		args = args.runtimeClientMaxTransactionAge(client.maxTransactionAge)
-	}
-
-	for _, v := range client.net.runtimes {
-		if v.kind != registry.KindCompute {
-			continue
-		}
-		args = args.runtimeSupported(v.id).
-			appendRuntimePruner(&v.pruner)
-	}
-
-	if err := client.net.startOasisNode(&client.Node, nil, args); err != nil {
-		return fmt.Errorf("oasis/client: failed to launch node %s: %w", client.Name, err)
+	for _, idx := range client.runtimes {
+		v := client.net.runtimes[idx]
+		// XXX: could support configurable binary idx if ever needed.
+		client.addHostedRuntime(v, client.runtimeConfig[idx])
 	}
 
 	return nil
 }
 
-// Start starts an Oasis node.
-func (client *Client) Start() error {
-	return client.startNode()
+func (client *Client) ModifyConfig() error {
+	client.Config.Consensus.ListenAddress = allInterfacesAddr + ":" + strconv.Itoa(int(client.consensusPort))
+	client.Config.Consensus.ExternalAddress = localhostAddr + ":" + strconv.Itoa(int(client.consensusPort))
+
+	if client.supplementarySanityInterval > 0 {
+		client.Config.Consensus.SupplementarySanity.Enabled = true
+		client.Config.Consensus.SupplementarySanity.Interval = client.supplementarySanityInterval
+	}
+
+	client.Config.P2P.Port = client.p2pPort
+
+	if len(client.runtimes) > 0 {
+		client.Config.Mode = config.ModeClient
+		client.Config.Runtime.Provisioner = client.runtimeProvisioner
+	}
+
+	client.AddSeedNodesToConfig()
+
+	return nil
 }
 
 // NewClient provisions a new client node and adds it to the network.
 func (net *Network) NewClient(cfg *ClientCfg) (*Client, error) {
 	clientName := fmt.Sprintf("client-%d", len(net.clients))
-
-	clientDir, err := net.baseDir.NewSubDir(clientName)
+	host, err := net.GetNamedNode(clientName, &cfg.NodeCfg)
 	if err != nil {
-		net.logger.Error("failed to create client subdir",
-			"err", err,
-			"client_name", clientName,
-		)
-		return nil, fmt.Errorf("oasis/client: failed to create client subdir: %w", err)
+		return nil, err
+	}
+
+	if cfg.RuntimeProvisioner == "" {
+		cfg.RuntimeProvisioner = runtimeConfig.RuntimeProvisionerSandboxed
+	}
+
+	// Pre-provision the node identity so that we can identify the entity.
+	err = host.setProvisionedIdentity(fmt.Sprintf(clientIdentitySeedTemplate, len(net.clients)))
+	if err != nil {
+		return nil, fmt.Errorf("oasis/client: failed to provision node identity: %w", err)
 	}
 
 	client := &Client{
-		Node: Node{
-			Name:      clientName,
-			net:       net,
-			dir:       clientDir,
-			consensus: cfg.Consensus,
-		},
-		maxTransactionAge: cfg.MaxTransactionAge,
-		consensusPort:     net.nextNodePort,
-		p2pPort:           net.nextNodePort + 1,
+		Node:               host,
+		runtimes:           cfg.Runtimes,
+		runtimeProvisioner: cfg.RuntimeProvisioner,
+		runtimeConfig:      cfg.RuntimeConfig,
+		consensusPort:      host.getProvisionedPort(nodePortConsensus),
+		p2pPort:            host.getProvisionedPort(nodePortP2P),
 	}
-	client.doStartNode = client.startNode
+
+	// Remove any exploded bundles on cleanup.
+	net.env.AddOnCleanup(func() {
+		_ = os.RemoveAll(bundle.ExplodedPath(client.dir.String()))
+	})
 
 	net.clients = append(net.clients, client)
-	net.nextNodePort += 2
+	host.features = append(host.features, client)
 
 	return client, nil
 }

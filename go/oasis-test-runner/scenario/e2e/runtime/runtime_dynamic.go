@@ -3,56 +3,45 @@ package runtime
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"time"
 
-	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/cbor"
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
-	"github.com/oasisprotocol/oasis-core/go/common/sgx"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
-	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
-	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 )
 
 // RuntimeDynamic is the dynamic runtime registration scenario.
 var RuntimeDynamic scenario.Scenario = newRuntimeDynamicImpl()
 
-const (
-	runtimeDynamicTestKey   = "genesis state"
-	runtimeDynamicTestValue = "hello world"
-)
-
 type runtimeDynamicImpl struct {
-	runtimeImpl
+	Scenario
 
-	epoch epochtime.EpochTime
+	epoch beacon.EpochTime
 }
 
 func newRuntimeDynamicImpl() scenario.Scenario {
 	return &runtimeDynamicImpl{
-		runtimeImpl: *newRuntimeImpl("runtime-dynamic", "", nil),
+		Scenario: *NewScenario("runtime-dynamic", nil),
 	}
 }
 
 func (sc *runtimeDynamicImpl) Clone() scenario.Scenario {
 	return &runtimeDynamicImpl{
-		runtimeImpl: *sc.runtimeImpl.Clone().(*runtimeImpl),
-		epoch:       sc.epoch,
+		Scenario: *sc.Scenario.Clone().(*Scenario),
+		epoch:    sc.epoch,
 	}
 }
 
 func (sc *runtimeDynamicImpl) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := sc.runtimeImpl.Fixture()
+	f, err := sc.Scenario.Fixture()
 	if err != nil {
 		return nil, err
 	}
@@ -64,29 +53,22 @@ func (sc *runtimeDynamicImpl) Fixture() (*oasis.NetworkFixture, error) {
 				staking.KindEntity:            *quantity.NewFromUint64(0),
 				staking.KindNodeValidator:     *quantity.NewFromUint64(0),
 				staking.KindNodeCompute:       *quantity.NewFromUint64(0),
-				staking.KindNodeStorage:       *quantity.NewFromUint64(0),
+				staking.KindNodeObserver:      *quantity.NewFromUint64(0),
 				staking.KindNodeKeyManager:    *quantity.NewFromUint64(0),
 				staking.KindRuntimeCompute:    *quantity.NewFromUint64(1000),
 				staking.KindRuntimeKeyManager: *quantity.NewFromUint64(1000),
+				staking.KindKeyManagerChurp:   *quantity.NewFromUint64(0),
 			},
 		},
 	}
-	// We need IAS proxy to use the registry as we are registering runtimes dynamically.
-	f.Network.IAS.UseRegistry = true
 	// Avoid unexpected blocks.
-	f.Network.EpochtimeMock = true
+	f.Network.SetMockEpoch()
 	// Exclude all runtimes from genesis as we will register those dynamically.
 	for i := range f.Runtimes {
 		f.Runtimes[i].ExcludeFromGenesis = true
 	}
-	// Test storage genesis state for compute runtimes. Also test with a non-zero round.
+	// Test with a non-zero round.
 	f.Runtimes[1].GenesisRound = 42
-	f.Runtimes[1].GenesisState = storage.WriteLog{
-		{
-			Key:   []byte(runtimeDynamicTestKey),
-			Value: []byte(runtimeDynamicTestValue),
-		},
-	}
 
 	return f, nil
 }
@@ -104,16 +86,16 @@ func (sc *runtimeDynamicImpl) epochTransition(ctx context.Context) error {
 	return nil
 }
 
-func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
+func (sc *runtimeDynamicImpl) Run(ctx context.Context, childEnv *env.Env) error { // nolint: gocyclo
+	var rtNonce uint64
 	if err := sc.Net.Start(); err != nil {
 		return err
 	}
 
-	ctx := context.Background()
 	cli := cli.New(childEnv, sc.Net, sc.Logger)
 
 	// Wait for all nodes to be synced before we proceed.
-	if err := sc.waitNodesSynced(); err != nil {
+	if err := sc.WaitNodesSynced(ctx); err != nil {
 		return err
 	}
 
@@ -136,75 +118,43 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 	// Nonce used for transactions (increase this by 1 after each transaction).
 	var nonce uint64
 
-	// Register a new keymanager runtime.
-	kmRt := sc.Net.Runtimes()[0]
-	kmRtDesc := kmRt.ToRuntimeDescriptor()
-	kmTxPath := filepath.Join(childEnv.Dir(), "register_km_runtime.json")
-	if err := cli.Registry.GenerateRegisterRuntimeTx(nonce, kmRtDesc, kmTxPath, ""); err != nil {
-		return fmt.Errorf("failed to generate register KM runtime tx: %w", err)
-	}
-	nonce++
-	if err := cli.Consensus.SubmitTx(kmTxPath); err != nil {
-		return fmt.Errorf("failed to register KM runtime: %w", err)
+	// Fetch current epoch.
+	epoch, err := sc.Net.Controller().Beacon.GetEpoch(ctx, consensus.HeightLatest)
+	if err != nil {
+		return fmt.Errorf("failed to get current epoch: %w", err)
 	}
 
+	// Register a new keymanager runtime.
+	kmRt := sc.Net.Runtimes()[0]
+	rtDsc := kmRt.ToRuntimeDescriptor()
+	rtDsc.Deployments[0].ValidFrom = epoch + 1
+	if err = sc.RegisterRuntime(childEnv, cli, rtDsc, nonce); err != nil {
+		return err
+	}
+	nonce++
+
 	// Generate and update the new keymanager runtime's policy.
-	kmPolicyPath := filepath.Join(childEnv.Dir(), "km_policy.cbor")
-	kmPolicySig1Path := filepath.Join(childEnv.Dir(), "km_policy_sig1.pem")
-	kmPolicySig2Path := filepath.Join(childEnv.Dir(), "km_policy_sig2.pem")
-	kmPolicySig3Path := filepath.Join(childEnv.Dir(), "km_policy_sig3.pem")
-	kmUpdateTxPath := filepath.Join(childEnv.Dir(), "km_gen_update.json")
-	sc.Logger.Info("building KM SGX policy enclave policies map")
-	enclavePolicies := make(map[sgx.EnclaveIdentity]*keymanager.EnclavePolicySGX)
-	kmRtEncID := kmRt.GetEnclaveIdentity()
-	var havePolicy bool
-	if kmRtEncID != nil {
-		enclavePolicies[*kmRtEncID] = &keymanager.EnclavePolicySGX{}
-		enclavePolicies[*kmRtEncID].MayQuery = make(map[common.Namespace][]sgx.EnclaveIdentity)
-		enclavePolicies[*kmRtEncID].MayReplicate = []sgx.EnclaveIdentity{}
-		for _, rt := range sc.Net.Runtimes() {
-			if rt.Kind() != registry.KindCompute {
-				continue
-			}
-			if eid := rt.GetEnclaveIdentity(); eid != nil {
-				enclavePolicies[*kmRtEncID].MayQuery[rt.ID()] = []sgx.EnclaveIdentity{*eid}
-				// This is set only in SGX mode.
-				havePolicy = true
-			}
-		}
-	}
-	sc.Logger.Info("initing KM policy")
-	if err := cli.Keymanager.InitPolicy(kmRt.ID(), 1, enclavePolicies, kmPolicyPath); err != nil {
+	policies, err := sc.BuildEnclavePolicies()
+	if err != nil {
 		return err
 	}
-	sc.Logger.Info("signing KM policy")
-	if err := cli.Keymanager.SignPolicy("1", kmPolicyPath, kmPolicySig1Path); err != nil {
-		return err
-	}
-	if err := cli.Keymanager.SignPolicy("2", kmPolicyPath, kmPolicySig2Path); err != nil {
-		return err
-	}
-	if err := cli.Keymanager.SignPolicy("3", kmPolicyPath, kmPolicySig3Path); err != nil {
-		return err
-	}
-	if havePolicy {
-		// In SGX mode, we can update the policy as intended.
-		sc.Logger.Info("updating KM policy")
-		if err := cli.Keymanager.GenUpdate(nonce, kmPolicyPath, []string{kmPolicySig1Path, kmPolicySig2Path, kmPolicySig3Path}, kmUpdateTxPath); err != nil {
-			return err
-		}
-		nonce++
-		if err := cli.Consensus.SubmitTx(kmUpdateTxPath); err != nil {
-			return fmt.Errorf("failed to update KM policy: %w", err)
-		}
-	} else {
+	switch policies {
+	case nil:
+		sc.Logger.Info("no SGX runtimes, skipping policy update")
+
 		// In non-SGX mode, the policy update fails with a policy checksum
 		// mismatch (the non-SGX KM returns an empty policy), so we need to
 		// do an epoch transition instead (to complete the KM runtime
 		// registration).
-		if err := sc.epochTransition(ctx); err != nil {
+		if err = sc.epochTransition(ctx); err != nil {
 			return err
 		}
+	default:
+		// In SGX mode, we can update the policy as intended.
+		if err = sc.ApplyKeyManagerPolicy(ctx, childEnv, cli, 0, policies, nonce); err != nil {
+			return err
+		}
+		nonce++
 	}
 
 	// Wait for key manager nodes to register, then make another epoch transition.
@@ -212,102 +162,111 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 		"num_keymanagers", len(sc.Net.Keymanagers()),
 	)
 	for _, n := range sc.Net.Keymanagers() {
-		if err := n.WaitReady(ctx); err != nil {
+		if err = n.WaitReady(ctx); err != nil {
 			return fmt.Errorf("failed to wait for a validator: %w", err)
 		}
 	}
-	if err := sc.epochTransition(ctx); err != nil {
+	if err = sc.epochTransition(ctx); err != nil {
 		return err
+	}
+
+	// Fetch current epoch.
+	epoch, err = sc.Net.Controller().Beacon.GetEpoch(ctx, consensus.HeightLatest)
+	if err != nil {
+		return fmt.Errorf("failed to get current epoch: %w", err)
 	}
 
 	// Register a new compute runtime.
 	compRt := sc.Net.Runtimes()[1]
 	compRtDesc := compRt.ToRuntimeDescriptor()
-	txPath := filepath.Join(childEnv.Dir(), "register_compute_runtime.json")
-	if err := cli.Registry.GenerateRegisterRuntimeTx(nonce, compRtDesc, txPath, compRt.GetGenesisStatePath()); err != nil {
-		return fmt.Errorf("failed to generate register compute runtime tx: %w", err)
+	compRtDesc.Deployments[0].ValidFrom = epoch + 1
+	if err = sc.RegisterRuntime(childEnv, cli, compRtDesc, nonce); err != nil {
+		return err
 	}
 	nonce++
-	if err := cli.Consensus.SubmitTx(txPath); err != nil {
-		return fmt.Errorf("failed to register compute runtime: %w", err)
-	}
 
-	// Wait for storage workers and compute workers to become ready.
-	sc.Logger.Info("waiting for storage workers to initialize",
-		"num_storage_workers", len(sc.Net.StorageWorkers()),
-	)
-	for _, n := range sc.Net.StorageWorkers() {
-		if err := n.WaitReady(ctx); err != nil {
-			return fmt.Errorf("failed to wait for a storage worker: %w", err)
-		}
-	}
+	// Wait for compute workers to become ready.
 	sc.Logger.Info("waiting for compute workers to initialize",
 		"num_compute_workers", len(sc.Net.ComputeWorkers()),
 	)
 	for _, n := range sc.Net.ComputeWorkers() {
-		if err := n.WaitReady(ctx); err != nil {
+		if err = n.WaitReady(ctx); err != nil {
 			return fmt.Errorf("failed to wait for a compute worker: %w", err)
 		}
 	}
 
+	// Perform an epoch transition to make sure all nodes are eligible. They may not be eligible
+	// if they have registered after the beacon commit phase.
+	if err = sc.epochTransition(ctx); err != nil {
+		return err
+	}
+
 	for i := 0; i < 5; i++ {
 		// Perform another epoch transition to elect compute runtime committees.
-		if err := sc.epochTransition(ctx); err != nil {
+		if err = sc.epochTransition(ctx); err != nil {
 			return err
 		}
 
 		// Wait a bit after epoch transitions.
 		time.Sleep(1 * time.Second)
 
-		if i == 0 {
-			sc.Logger.Info("checking if genesis state has been initialized")
-			var rawRsp cbor.RawMessage
-			var err error
-			if rawRsp, err = sc.submitRuntimeTx(ctx, runtimeID, "get", struct {
-				Key   string `json:"key"`
-				Nonce uint64 `json:"nonce"`
-			}{
-				Key:   runtimeDynamicTestKey,
-				Nonce: 1234567890,
-			}); err != nil {
-				return fmt.Errorf("failed to submit get tx to runtime: %w", err)
-			}
-			var rsp string
-			if err = cbor.Unmarshal(rawRsp, &rsp); err != nil {
-				return fmt.Errorf("failed to unmarshal response from runtime: %w", err)
-			}
-			if rsp != runtimeDynamicTestValue {
-				return fmt.Errorf("incorrect value returned by runtime: %s", rsp)
-			}
-		}
-
 		// Submit a runtime transaction.
 		sc.Logger.Info("submitting transaction to runtime",
 			"seq", i,
 		)
-		if err := sc.submitKeyValueRuntimeInsertTx(ctx, runtimeID, "hello", fmt.Sprintf("world %d", i)); err != nil {
+		if _, err = sc.submitKeyValueRuntimeInsertTx(ctx, KeyValueRuntimeID, rtNonce, "hello", fmt.Sprintf("world %d", i), 0, 0, plaintextTxKind); err != nil {
 			return err
 		}
+		rtNonce++
 	}
 
 	// Stop all runtime nodes, so they will not re-register, causing the nodes to expire.
-	sc.Logger.Info("stopping storage nodes")
-	for _, n := range sc.Net.StorageWorkers() {
-		if err := n.Stop(); err != nil {
+	sc.Logger.Info("stopping compute nodes")
+	for _, n := range sc.Net.ComputeWorkers() {
+		if err = n.Stop(); err != nil {
 			return fmt.Errorf("failed to stop node: %w", err)
 		}
 	}
-	sc.Logger.Info("stopping compute nodes")
-	for _, n := range sc.Net.ComputeWorkers() {
-		if err := n.Stop(); err != nil {
-			return fmt.Errorf("failed to stop node: %w", err)
+
+	registyCh, sub, err := sc.Net.Controller().Registry.WatchEvents(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to watch events: %w", err)
+	}
+	defer sub.Close()
+	ensureRuntimeEvents := func(suspended bool) error {
+		// Ensure expected suspended/started event is received.
+		for {
+			select {
+			case evt := <-registyCh:
+				sc.Logger.Debug("received event", "event", evt)
+				switch suspended {
+				case true:
+					if evt.RuntimeSuspendedEvent == nil {
+						continue
+					}
+					if !compRtDesc.ID.Equal(&evt.RuntimeSuspendedEvent.RuntimeID) {
+						continue
+					}
+					return nil
+				default:
+					if evt.RuntimeStartedEvent == nil {
+						continue
+					}
+					if !compRtDesc.ID.Equal(&evt.RuntimeStartedEvent.Runtime.ID) {
+						continue
+					}
+					return nil
+				}
+			case <-time.After(10 * time.Second):
+				return fmt.Errorf("failed to receive runtime event for: %s (suspended: %t)", compRtDesc.ID, suspended)
+			}
 		}
 	}
 
 	// Epoch transitions so nodes expire.
 	sc.Logger.Info("performing epoch transitions so nodes expire")
 	for i := 0; i < 3; i++ {
-		if err := sc.epochTransition(ctx); err != nil {
+		if err = sc.epochTransition(ctx); err != nil {
 			return err
 		}
 
@@ -317,7 +276,7 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 
 	// Ensure that runtime got suspended.
 	sc.Logger.Info("checking that runtime got suspended")
-	_, err := sc.Net.Controller().Registry.GetRuntime(ctx, &registry.NamespaceQuery{
+	_, err = sc.Net.Controller().Registry.GetRuntime(ctx, &registry.GetRuntimeQuery{
 		Height: consensus.HeightLatest,
 		ID:     compRtDesc.ID,
 	})
@@ -329,14 +288,11 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 	default:
 		return fmt.Errorf("unexpected error while fetching runtime: %w", err)
 	}
+	if err = ensureRuntimeEvents(true); err != nil {
+		return err
+	}
 
 	// Start runtime nodes, make sure they register.
-	sc.Logger.Info("starting storage nodes")
-	for _, n := range sc.Net.StorageWorkers() {
-		if err = n.Start(); err != nil {
-			return fmt.Errorf("failed to start node: %w", err)
-		}
-	}
 	sc.Logger.Info("starting compute nodes")
 	for _, n := range sc.Net.ComputeWorkers() {
 		if err = n.Start(); err != nil {
@@ -344,14 +300,6 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 		}
 	}
 
-	sc.Logger.Info("waiting for storage workers to initialize",
-		"num_storage_workers", len(sc.Net.StorageWorkers()),
-	)
-	for _, n := range sc.Net.StorageWorkers() {
-		if err = n.WaitReady(ctx); err != nil {
-			return fmt.Errorf("failed to wait for a storage worker: %w", err)
-		}
-	}
 	sc.Logger.Info("waiting for compute workers to initialize",
 		"num_compute_workers", len(sc.Net.ComputeWorkers()),
 	)
@@ -361,6 +309,12 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 		}
 	}
 
+	// Perform an epoch transition to make sure all nodes are eligible. They may not be eligible
+	// if they have registered after the beacon commit phase.
+	if err = sc.epochTransition(ctx); err != nil {
+		return err
+	}
+
 	// Epoch transition.
 	if err = sc.epochTransition(ctx); err != nil {
 		return err
@@ -368,9 +322,10 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 
 	// Submit a runtime transaction to check whether the runtimes got resumed.
 	sc.Logger.Info("submitting transaction to runtime")
-	if err = sc.submitKeyValueRuntimeInsertTx(ctx, runtimeID, "hello", "final world"); err != nil {
+	if _, err = sc.submitKeyValueRuntimeInsertTx(ctx, KeyValueRuntimeID, rtNonce, "hello", "final world", 0, 0, plaintextTxKind); err != nil {
 		return err
 	}
+	rtNonce++
 
 	// Now reclaim all stake from the debug entity which owns the runtime.
 	sc.Logger.Info("reclaiming stake from entity which owns the runtime")
@@ -430,7 +385,7 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 	ensureRuntimesSuspended := func(suspended bool) error {
 		sc.Logger.Info("checking that runtimes got (un)suspended")
 		for _, rt := range sc.Net.Runtimes() {
-			_, err = sc.Net.Controller().Registry.GetRuntime(ctx, &registry.NamespaceQuery{
+			_, err = sc.Net.Controller().Registry.GetRuntime(ctx, &registry.GetRuntimeQuery{
 				Height: consensus.HeightLatest,
 				ID:     rt.ID(),
 			})
@@ -452,6 +407,19 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 	}
 	if err = ensureRuntimesSuspended(true); err != nil {
 		return err
+	}
+	if err = ensureRuntimeEvents(true); err != nil {
+		return err
+	}
+
+	// Restart nodes to test that the nodes will re-register although
+	// the runtime is suspended.
+	sc.Logger.Info("Restarting compute node to ensure it re-registers")
+	if err = sc.Net.ComputeWorkers()[0].Stop(); err != nil {
+		return fmt.Errorf("failed to stop node: %w", err)
+	}
+	if err = sc.Net.ComputeWorkers()[0].Start(); err != nil {
+		return fmt.Errorf("failed to start node: %w", err)
 	}
 
 	// Another epoch transition to make sure the runtime keeps being suspended.
@@ -477,7 +445,7 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 		Account: entAddr,
 		Amount:  enoughStake,
 	})
-	nonce++ // nolint: ineffassign
+	nonce++
 	sigTx, err = transaction.Sign(entSigner, tx)
 	if err != nil {
 		return fmt.Errorf("failed to sign escrow: %w", err)
@@ -500,15 +468,39 @@ func (sc *runtimeDynamicImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 	if err = ensureRuntimesSuspended(false); err != nil {
 		return err
 	}
+	if err = ensureRuntimeEvents(false); err != nil {
+		return err
+	}
 
 	// Another epoch transition to elect committees.
 	if err = sc.epochTransition(ctx); err != nil {
 		return err
 	}
 
+	// Transition the runtime governance model to runtime.
+	compRtDesc.GovernanceModel = registry.GovernanceRuntime
+	// Ensure runtime account has enough stake.
+	tx = staking.NewAddEscrowTx(nonce, &transaction.Fee{Gas: 10000}, &staking.Escrow{
+		Account: *compRtDesc.StakingAddress(),
+		Amount:  enoughStake,
+	})
+	nonce++
+	sigTx, err = transaction.Sign(entSigner, tx)
+	if err != nil {
+		return fmt.Errorf("failed to sign escrow: %w", err)
+	}
+	if err = sc.Net.Controller().Consensus.SubmitTx(ctx, sigTx); err != nil {
+		return fmt.Errorf("failed to escrow stake: %w", err)
+	}
+	// Update the runtime governance model.
+	if err = sc.RegisterRuntime(childEnv, cli, compRtDesc, nonce); err != nil {
+		return err
+	}
+	nonce++ // nolint: ineffassign
+
 	// Submit a runtime transaction to check whether the runtimes got resumed.
 	sc.Logger.Info("submitting transaction to runtime")
-	if err = sc.submitKeyValueRuntimeInsertTx(ctx, runtimeID, "hello", "final world for sure"); err != nil {
+	if _, err = sc.submitKeyValueRuntimeInsertTx(ctx, KeyValueRuntimeID, rtNonce, "hello", "final world for sure", 0, 0, plaintextTxKind); err != nil {
 		return err
 	}
 

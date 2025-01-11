@@ -1,195 +1,162 @@
 //! Session demultiplexer.
-use std::{collections::HashMap, io::Write, sync::Arc, time::SystemTime};
+use std::{io::Write, sync::Mutex};
 
-use anyhow::Result;
 use thiserror::Error;
+use tokio::sync::OwnedMutexGuard;
 
 use super::{
-    session::{Builder, Session, SessionInfo},
+    session::Builder,
+    sessions::{self, MultiplexedSession, Sessions},
     types::{Frame, Message, SessionID},
 };
-use crate::{
-    common::{cbor, time::insecure_posix_system_time},
-    rak::RAK,
-};
+use crate::common::time::insecure_posix_time;
 
-/// Maximum concurrent EnclaveRPC sessions.
-const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 100;
-/// Sessions without any processed frame for more than STALE_SESSION_TIMEOUT_SECS seconds
-/// can be purged.
-const DEFAULT_STALE_SESSION_TIMEOUT_SECS: u64 = 60;
-/// Stale session check will be performed on any new incoming connection with at minimum
-/// STALE_SESSIONS_CHECK_TIMEOUT_SECS seconds between checks.
-const STALE_SESSIONS_CHECK_TIMEOUT_SECS: u64 = 10;
-
-/// Demux error.
+/// Demultiplexer error.
 #[derive(Error, Debug)]
-enum DemuxError {
-    #[error("session not found for id {session:?}")]
-    SessionNotFound { session: SessionID },
-    #[error("max concurrent sessions reached")]
-    MaxConcurrentSessions,
+pub enum Error {
+    #[error("malformed payload: {0}")]
+    MalformedPayload(#[from] cbor::DecodeError),
+    #[error("malformed request method")]
+    MalformedRequestMethod,
+    #[error("sessions error: {0}")]
+    SessionsError(#[from] sessions::Error),
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
 }
 
-pub type SessionMessage = (SessionID, Option<Arc<SessionInfo>>, Message, String);
+impl Error {
+    fn code(&self) -> u32 {
+        match self {
+            Error::MalformedPayload(_) => 1,
+            Error::MalformedRequestMethod => 2,
+            Error::SessionsError(_) => 3,
+            Error::Other(_) => 4,
+        }
+    }
+}
+
+impl From<Error> for crate::types::Error {
+    fn from(e: Error) -> Self {
+        Self {
+            module: "demux".to_string(),
+            code: e.code(),
+            message: e.to_string(),
+        }
+    }
+}
 
 /// Session demultiplexer.
 pub struct Demux {
-    rak: Arc<RAK>,
-    sessions: HashMap<SessionID, EnrichedSession>,
-    max_concurrent_sessions: usize,
-    stale_session_timeout: u64,
-    last_stale_sessions_purge: SystemTime,
-}
-
-struct EnrichedSession {
-    session: Session,
-    last_process_frame_time: SystemTime,
+    sessions: Mutex<Sessions<Vec<u8>>>,
 }
 
 impl Demux {
     /// Create new session demultiplexer.
-    pub fn new(rak: Arc<RAK>) -> Self {
+    pub fn new(
+        builder: Builder,
+        max_sessions: usize,
+        max_sessions_per_peer: usize,
+        stale_session_timeout: i64,
+    ) -> Self {
         Self {
-            rak: rak,
-            sessions: HashMap::new(),
-            max_concurrent_sessions: DEFAULT_MAX_CONCURRENT_SESSIONS,
-            stale_session_timeout: DEFAULT_STALE_SESSION_TIMEOUT_SECS,
-            last_stale_sessions_purge: insecure_posix_system_time(),
+            sessions: Mutex::new(Sessions::new(
+                builder,
+                max_sessions,
+                max_sessions_per_peer,
+                stale_session_timeout,
+            )),
         }
     }
 
-    /// Configures max_concurrent_sessions.
-    pub fn set_max_concurrent_sessions(&mut self, max_concurrent_sessions: usize) {
-        self.max_concurrent_sessions = max_concurrent_sessions;
+    /// Set the session builder to use.
+    pub fn set_session_builder(&self, builder: Builder) {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.set_builder(builder);
     }
 
-    /// Configures stale session timeout.
-    /// If 0, sessions are never considered stale.
-    pub fn set_stale_session_timeout(&mut self, stale_session_timeout: u64) {
-        self.stale_session_timeout = stale_session_timeout;
+    async fn get_or_create_session(
+        &self,
+        peer_id: Vec<u8>,
+        session_id: SessionID,
+    ) -> Result<OwnedMutexGuard<MultiplexedSession<Vec<u8>>>, Error> {
+        let session = {
+            let mut sessions = self.sessions.lock().unwrap();
+            match sessions.get(&peer_id, &session_id) {
+                Some(session) => session,
+                None => {
+                    let now = insecure_posix_time();
+                    let _ = sessions.remove_for(&peer_id, now)?;
+                    let session = sessions.create_responder(peer_id, session_id);
+                    sessions
+                        .add(session, now)
+                        .expect("there should be space for the new session")
+                }
+            }
+        };
+
+        Ok(session.lock_owned().await)
     }
 
-    fn purge_stale_sessions(&mut self) {
-        let now = insecure_posix_system_time();
-        let stale_session_timeout = self.stale_session_timeout;
-
-        // If 0, sessions should never be considered stale.
-        if stale_session_timeout != 0 {
-            self.sessions.retain(|_, val| {
-                now.duration_since(val.last_process_frame_time)
-                    .unwrap()
-                    .as_secs()
-                    < stale_session_timeout
-            });
-        }
-        self.last_stale_sessions_purge = now;
-    }
-
-    /// Process an incoming frame.
-    pub fn process_frame<W: Write>(
-        &mut self,
+    /// Process a frame, returning the locked session guard and decoded message.
+    ///
+    /// Any data that needs to be transmitted back to the peer is written to the passed writer.
+    pub async fn process_frame<W: Write>(
+        &self,
+        peer_id: Vec<u8>,
         data: Vec<u8>,
         writer: W,
-    ) -> Result<Option<SessionMessage>> {
+    ) -> Result<
+        (
+            OwnedMutexGuard<MultiplexedSession<Vec<u8>>>,
+            Option<Message>,
+        ),
+        Error,
+    > {
+        // Decode frame.
         let frame: Frame = cbor::from_slice(&data)?;
-        let id = frame.session.clone();
-        let untrusted_plaintext = frame.untrusted_plaintext.clone();
-
-        if let Some(enriched_session) = self.sessions.get_mut(&id.into()) {
-            match enriched_session
-                .session
-                .process_data(frame.payload, writer)
-                .map(|m| {
-                    m.map(|msg| {
-                        (
-                            id,
-                            enriched_session.session.session_info(),
-                            msg,
-                            untrusted_plaintext.clone(),
-                        )
-                    })
-                }) {
-                Ok(result) => {
-                    enriched_session.last_process_frame_time = insecure_posix_system_time();
-                    Ok(result)
+        // Get the existing session or create a new one.
+        let mut session = self.get_or_create_session(peer_id, frame.session).await?;
+        // Process session data.
+        match session.process_data(&frame.payload, writer).await {
+            Ok(msg) => {
+                if let Some(Message::Request(ref req)) = msg {
+                    // Make sure that the untrusted_plaintext matches the request's method.
+                    if frame.untrusted_plaintext != req.method {
+                        return Err(Error::MalformedRequestMethod);
+                    }
                 }
-                // In case there is an error, drop the session.
-                Err(error) => {
-                    self.sessions.remove(&id);
-                    Err(error)
+
+                Ok((session, msg))
+            }
+            Err(err) => {
+                // In case the session was closed, remove the session.
+                if session.is_closed() {
+                    let mut sessions = self.sessions.lock().unwrap();
+                    sessions.remove(&session);
                 }
-            }
-        } else {
-            // Session does not yet exist, first check if any stale sessions
-            // should be closed.
-            // Don't check if less than STALE_SESSIONS_CHECK_TIMEOUT_SECS seconds
-            // since last check.
-            let now = insecure_posix_system_time();
-            if now
-                .duration_since(self.last_stale_sessions_purge)
-                .unwrap()
-                .as_secs()
-                >= STALE_SESSIONS_CHECK_TIMEOUT_SECS
-            {
-                self.purge_stale_sessions()
-            }
-
-            // Create a new session.
-            if self.sessions.len() < self.max_concurrent_sessions {
-                let mut session = Builder::new().local_rak(self.rak.clone()).build_responder();
-                let result = match session.process_data(frame.payload, writer).map(|m| {
-                    m.map(|msg| (id, session.session_info(), msg, untrusted_plaintext.clone()))
-                }) {
-                    Ok(result) => result,
-                    // In case there is an error, drop the session.
-                    Err(error) => return Err(error),
-                };
-                self.sessions.insert(
-                    id,
-                    EnrichedSession {
-                        session: session,
-                        last_process_frame_time: insecure_posix_system_time(),
-                    },
-                );
-
-                Ok(result)
-            } else {
-                Err(DemuxError::MaxConcurrentSessions.into())
+                Err(Error::Other(err))
             }
         }
     }
 
-    /// Write message to session and generate a response.
-    pub fn write_message<W: Write>(
-        &mut self,
-        id: SessionID,
-        msg: Message,
-        mut writer: W,
-    ) -> Result<()> {
-        match self.sessions.get_mut(&id) {
-            Some(enriched_session) => {
-                // Responses don't need framing as they are linked at the
-                // runtime IPC protocol.
-                enriched_session.session.write_message(msg, &mut writer)?;
-                Ok(())
-            }
-            None => Err(DemuxError::SessionNotFound { session: id }.into()),
-        }
+    /// Closes the given session.
+    ///
+    /// Any data that needs to be transmitted back to the peer is written to the passed writer.
+    pub fn close<W: Write>(
+        &self,
+        mut session: OwnedMutexGuard<MultiplexedSession<Vec<u8>>>,
+        writer: W,
+    ) -> Result<(), Error> {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.remove(&session);
+
+        session.write_message(Message::Close, writer)?;
+        Ok(())
     }
 
-    /// Close the session and generate a response.
-    pub fn close<W: Write>(&mut self, id: SessionID, mut writer: W) -> Result<()> {
-        match self.sessions.remove(&id) {
-            Some(mut enriched_session) => {
-                // Responses don't need framing as they are linked at the
-                // runtime IPC protocol.
-                enriched_session
-                    .session
-                    .write_message(Message::Close, &mut writer)?;
-                Ok(())
-            }
-            None => Err(DemuxError::SessionNotFound { session: id }.into()),
-        }
+    /// Resets all open sessions.
+    pub fn reset(&self) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let _ = sessions.drain();
     }
 }

@@ -42,7 +42,7 @@ var (
 	}
 )
 
-func handlerVerifyEvidence( // nolint: golint
+func handlerVerifyEvidence(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -65,10 +65,10 @@ func handlerVerifyEvidence( // nolint: golint
 	return interceptor(ctx, &req, info, handler)
 }
 
-func handlerGetSPIDInfo( // nolint: golint
+func handlerGetSPIDInfo(
 	srv interface{},
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
 	if interceptor == nil {
@@ -78,13 +78,13 @@ func handlerGetSPIDInfo( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetSPIDInfo.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ interface{}) (interface{}, error) {
 		return srv.(Endpoint).GetSPIDInfo(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerGetSigRL( // nolint: golint
+func handlerGetSigRL(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,

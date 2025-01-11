@@ -6,7 +6,7 @@ of the [consensus layer] and its services.
 For more details about the actual genesis document's API, see
 [genesis API documentation].
 
-[consensus layer]: index.md
+[consensus layer]: README.md
 [genesis API documentation]:
   https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/genesis/api
 
@@ -27,10 +27,12 @@ where:
   [Serialization] documentation, and
 - `<genesis-document>` represents a given genesis document.
 
-{% hint style="info" %}
+:::info
+
 This should not be confused with a SHA-1 or a SHA-256 checksum of a
 [genesis file] that is used to check if the downloaded genesis file is correct.
-{% endhint %}
+
+:::
 
 This hash is also used for [chain domain separation][crypto-chain] as the last
 part of the [domain separation] context.
@@ -43,22 +45,25 @@ part of the [domain separation] context.
 
 ## Genesis File
 
-A genesis file is a JSON document corresponding to a serialized genesis
-document.
+A genesis file is a JSON file corresponding to a serialized genesis document.
 
-{% hint style="info" %}
-For a high-level overview of the genesis file, its various sections and
-parameters and the parameter values that will be used for Oasis Network Mainnet
-launch, see: [Genesis File Overview].
-{% endhint %}
+:::info
 
+For a high-level overview of the genesis file, its sections, parameters and
+the parameter values that are used for the Oasis Network, see:
+[Genesis File Overview].
+
+:::
+
+<!-- markdownlint-disable line-length -->
 [Genesis File Overview]:
-  https://docs.oasis.dev/general/pre-mainnet/genesis-file
+  https://github.com/oasisprotocol/docs/blob/main/docs/node/genesis-doc.md
+<!-- markdownlint-enable line-length -->
 
 ### Canonical Form
 
 The *canonical* form of a genesis file is the pretty-printed JSON file with
-2-space indents, where:
+2-space indents ending with a newline, where:
 
 - Struct fields are encoded in the order in which they are defined in the
   corresponding struct definitions.
@@ -73,11 +78,13 @@ The *canonical* form of a genesis file is the pretty-printed JSON file with
   This is Go's default behavior. For more details, see
   [`encoding/json.Marshal()`]'s documentation.
 
-{% hint style="info" %}
+:::info
+
 This should not be confused with the *canonical* CBOR encoding of the genesis
 document that is used to derive the domain separation context as described
 in the [Genesis Document's Hash] section.
-{% endhint %}
+
+:::
 
 This form is used to enable simple diffing/patching with the standard Unix tools
 (i.e. `diff`/`patch`).

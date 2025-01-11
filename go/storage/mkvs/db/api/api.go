@@ -5,7 +5,6 @@ import (
 	"context"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/errors"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/node"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/writelog"
@@ -51,6 +50,12 @@ var (
 	// ErrInvalidMultipartVersion indicates that a Finalize, NewBatch or Commit was called with a version
 	// that doesn't match the current multipart restore as set with StartMultipartRestore.
 	ErrInvalidMultipartVersion = errors.New(ModuleName, 14, "mkvs: operation called with different version than current multipart version")
+	// ErrUpgradeInProgress indicates that a database upgrade was started by the upgrader tool and the
+	// database is therefore unusable. Run the upgrade tool to finish upgrading.
+	ErrUpgradeInProgress = errors.New(ModuleName, 15, "mkvs: database upgrade in progress")
+	// ErrCannotPruneLatestVersion indicates that the caller attempted to prune the latest finalized
+	// version which would leave the database without any finalized versions.
+	ErrCannotPruneLatestVersion = errors.New(ModuleName, 16, "mkvs: cannot prune latest version")
 )
 
 // Config is the node database backend configuration.
@@ -77,6 +82,51 @@ type Config struct { // nolint: maligned
 	DiscardWriteLogs bool
 }
 
+// Factory is a node database factory interface that can create new databases.
+type Factory interface {
+	// New creates a new node database.
+	New(cfg *Config) (NodeDB, error)
+
+	// Name returns the name of this node database factory.
+	Name() string
+}
+
+// RootPolicy is the storage policy for a given root type.
+type RootPolicy struct {
+	// NoChildRoots means that roots of this type cannot have any children, each version must create
+	// a root from scratch and the root is not available in the next version.
+	NoChildRoots bool
+}
+
+var rootPolicies = map[node.RootType]*RootPolicy{
+	node.RootTypeState: {
+		NoChildRoots: false,
+	},
+	node.RootTypeIO: {
+		NoChildRoots: true,
+	},
+}
+
+// PolicyForRoot returns the storage policy for the given root.
+func PolicyForRoot(root node.Root) *RootPolicy {
+	return rootPolicies[root.Type]
+}
+
+// RootTypesWithPolicy returns all root types where the given policy predicate evaluates to true.
+func RootTypesWithPolicy(policyFn func(*RootPolicy) bool) (types []node.RootType) {
+	for rootType, policy := range rootPolicies {
+		if policyFn(policy) {
+			types = append(types, rootType)
+		}
+	}
+	return
+}
+
+// RootTypes returns all supported root types.
+func RootTypes() []node.RootType {
+	return RootTypesWithPolicy(func(*RootPolicy) bool { return true })
+}
+
 // NodeDB is the persistence layer used for persisting the in-memory tree.
 type NodeDB interface {
 	// GetNode looks up a node in the database.
@@ -86,13 +136,15 @@ type NodeDB interface {
 	GetWriteLog(ctx context.Context, startRoot, endRoot node.Root) (writelog.Iterator, error)
 
 	// GetLatestVersion returns the most recent version in the node database.
-	GetLatestVersion(ctx context.Context) (uint64, error)
+	//
+	// The boolean flag signifies whether any version exists to disambiguate version zero.
+	GetLatestVersion() (uint64, bool)
 
 	// GetEarliestVersion returns the earliest version in the node database.
-	GetEarliestVersion(ctx context.Context) (uint64, error)
+	GetEarliestVersion() uint64
 
 	// GetRootsForVersion returns a list of roots stored under the given version.
-	GetRootsForVersion(ctx context.Context, version uint64) ([]hash.Hash, error)
+	GetRootsForVersion(version uint64) ([]node.Root, error)
 
 	// StartMultipartInsert prepares the database for a batch insert job from multiple chunks.
 	// Batches from this call onwards will keep track of inserted nodes so that they can be
@@ -117,15 +169,14 @@ type NodeDB interface {
 	// HasRoot checks whether the given root exists.
 	HasRoot(root node.Root) bool
 
-	// Finalize finalizes the specified version. The passed list of roots are the
-	// roots within the version that have been finalized. All non-finalized roots
-	// can be discarded.
-	Finalize(ctx context.Context, version uint64, roots []hash.Hash) error
+	// Finalize finalizes the version comprising the passed list of finalized roots.
+	// All non-finalized roots can be discarded.
+	Finalize(roots []node.Root) error
 
 	// Prune removes all roots recorded under the given version.
 	//
 	// Only the earliest version can be pruned, passing any other version will result in an error.
-	Prune(ctx context.Context, version uint64) error
+	Prune(version uint64) error
 
 	// Size returns the size of the database in bytes.
 	Size() (int64, error)
@@ -151,7 +202,15 @@ type Subtree interface {
 	// The specific NodeDB implementation may wish to do further processing.
 	//
 	// Depth is the node depth not bit depth.
-	VisitCleanNode(depth node.Depth, ptr *node.Pointer) error
+	VisitCleanNode(depth node.Depth, ptr *node.Pointer, parent *node.Pointer) error
+
+	// VisitDirtyNode is called before processing any children of a dirty node encountered during
+	// commit or checkpoint restore operation.
+	//
+	// The specific NodeDB implementation may wish to do further processing.
+	//
+	// Depth is the node depth not bit depth.
+	VisitDirtyNode(depth node.Depth, ptr *node.Pointer, parent *node.Pointer) error
 
 	// Commit marks the subtree as complete.
 	Commit() error
@@ -172,7 +231,7 @@ type Batch interface {
 	PutWriteLog(writeLog writelog.WriteLog, logAnnotations writelog.Annotations) error
 
 	// RemoveNodes marks nodes for eventual garbage collection.
-	RemoveNodes(nodes []node.Node) error
+	RemoveNodes(nodes []*node.Pointer) error
 
 	// Commit commits the batch.
 	Commit(root node.Root) error
@@ -191,7 +250,7 @@ func (b *BaseBatch) OnCommit(hook func()) {
 	b.onCommitHooks = append(b.onCommitHooks, hook)
 }
 
-func (b *BaseBatch) Commit(root node.Root) error {
+func (b *BaseBatch) Commit(node.Root) error {
 	for _, hook := range b.onCommitHooks {
 		hook()
 	}
@@ -207,31 +266,31 @@ func NewNopNodeDB() (NodeDB, error) {
 	return &nopNodeDB{}, nil
 }
 
-func (d *nopNodeDB) GetNode(root node.Root, ptr *node.Pointer) (node.Node, error) {
+func (d *nopNodeDB) GetNode(node.Root, *node.Pointer) (node.Node, error) {
 	return nil, ErrNodeNotFound
 }
 
-func (d *nopNodeDB) GetWriteLog(ctx context.Context, startRoot, endRoot node.Root) (writelog.Iterator, error) {
+func (d *nopNodeDB) GetWriteLog(context.Context, node.Root, node.Root) (writelog.Iterator, error) {
 	return nil, ErrWriteLogNotFound
 }
 
-func (d *nopNodeDB) GetLatestVersion(ctx context.Context) (uint64, error) {
-	return 0, nil
+func (d *nopNodeDB) GetLatestVersion() (uint64, bool) {
+	return 0, false
 }
 
-func (d *nopNodeDB) GetEarliestVersion(ctx context.Context) (uint64, error) {
-	return 0, nil
+func (d *nopNodeDB) GetEarliestVersion() uint64 {
+	return 0
 }
 
-func (d *nopNodeDB) GetRootsForVersion(ctx context.Context, version uint64) ([]hash.Hash, error) {
+func (d *nopNodeDB) GetRootsForVersion(uint64) ([]node.Root, error) {
 	return nil, nil
 }
 
-func (d *nopNodeDB) HasRoot(root node.Root) bool {
+func (d *nopNodeDB) HasRoot(node.Root) bool {
 	return false
 }
 
-func (d *nopNodeDB) StartMultipartInsert(version uint64) error {
+func (d *nopNodeDB) StartMultipartInsert(uint64) error {
 	return nil
 }
 
@@ -239,11 +298,11 @@ func (d *nopNodeDB) AbortMultipartInsert() error {
 	return nil
 }
 
-func (d *nopNodeDB) Finalize(ctx context.Context, version uint64, roots []hash.Hash) error {
+func (d *nopNodeDB) Finalize([]node.Root) error {
 	return nil
 }
 
-func (d *nopNodeDB) Prune(ctx context.Context, version uint64) error {
+func (d *nopNodeDB) Prune(uint64) error {
 	return nil
 }
 
@@ -263,19 +322,19 @@ type nopBatch struct {
 	BaseBatch
 }
 
-func (d *nopNodeDB) NewBatch(oldRoot node.Root, version uint64, chunk bool) (Batch, error) {
+func (d *nopNodeDB) NewBatch(node.Root, uint64, bool) (Batch, error) {
 	return &nopBatch{}, nil
 }
 
-func (b *nopBatch) MaybeStartSubtree(subtree Subtree, depth node.Depth, subtreeRoot *node.Pointer) Subtree {
+func (b *nopBatch) MaybeStartSubtree(Subtree, node.Depth, *node.Pointer) Subtree {
 	return &nopSubtree{}
 }
 
-func (b *nopBatch) PutWriteLog(writeLog writelog.WriteLog, logAnnotations writelog.Annotations) error {
+func (b *nopBatch) PutWriteLog(writelog.WriteLog, writelog.Annotations) error {
 	return nil
 }
 
-func (b *nopBatch) RemoveNodes(nodes []node.Node) error {
+func (b *nopBatch) RemoveNodes([]*node.Pointer) error {
 	return nil
 }
 
@@ -285,11 +344,15 @@ func (b *nopBatch) Reset() {
 // nopSubtree is a no-op subtree.
 type nopSubtree struct{}
 
-func (s *nopSubtree) PutNode(depth node.Depth, ptr *node.Pointer) error {
+func (s *nopSubtree) PutNode(node.Depth, *node.Pointer) error {
 	return nil
 }
 
-func (s *nopSubtree) VisitCleanNode(depth node.Depth, ptr *node.Pointer) error {
+func (s *nopSubtree) VisitCleanNode(node.Depth, *node.Pointer, *node.Pointer) error {
+	return nil
+}
+
+func (s *nopSubtree) VisitDirtyNode(node.Depth, *node.Pointer, *node.Pointer) error {
 	return nil
 }
 

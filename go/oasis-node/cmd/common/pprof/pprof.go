@@ -2,26 +2,19 @@
 package pprof
 
 import (
-	"context"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
 	"runtime"
+	"time"
+
 	runtimePprof "runtime/pprof"
 
-	flag "github.com/spf13/pflag"
-	"github.com/spf13/viper"
-
 	"github.com/oasisprotocol/oasis-core/go/common/service"
+	"github.com/oasisprotocol/oasis-core/go/config"
 )
-
-const cfgPprofBind = "pprof.bind"
-
-// Flags has the flags used by the pprof service.
-var Flags = flag.NewFlagSet("", flag.ContinueOnError)
 
 type pprofService struct {
 	service.BaseBackgroundService
@@ -30,9 +23,6 @@ type pprofService struct {
 
 	listener net.Listener
 	server   *http.Server
-
-	ctx   context.Context
-	errCh chan error
 }
 
 // DumpHeapToFile writes the current process heap to given file with unique suffix.
@@ -42,7 +32,7 @@ func DumpHeapToFile(name string) error {
 	if err != nil {
 		return fmt.Errorf("failed to determine current working directory for memory profiler output: %w", err)
 	}
-	mprof, merr := ioutil.TempFile(wd, name+".*.pb")
+	mprof, merr := os.CreateTemp(wd, name+".*.pb")
 	if merr != nil {
 		return fmt.Errorf("failed to create file for memory profiler output: %w", merr)
 	}
@@ -81,30 +71,31 @@ func (p *pprofService) Start() error {
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 	p.listener = listener
-	p.server = &http.Server{Handler: mux}
+	p.server = &http.Server{Handler: mux, ReadTimeout: 5 * time.Second}
 
 	go func() {
 		if err := p.server.Serve(p.listener); err != nil {
-			p.BaseBackgroundService.Stop()
-			p.errCh <- err
+			if err != http.ErrServerClosed {
+				p.Logger.Error("pprof server terminated uncleanly",
+					"err", err,
+				)
+			}
 		}
+		p.BaseBackgroundService.Stop()
 	}()
 
 	return nil
 }
 
 func (p *pprofService) Stop() {
+	// If we never started, make sure that the service doesn't hang forever.
+	if p.address == "" {
+		p.BaseBackgroundService.Stop()
+		return
+	}
+
 	if p.server != nil {
-		select {
-		case err := <-p.errCh:
-			if err != nil {
-				p.Logger.Error("pprof server terminated uncleanly",
-					"err", err,
-				)
-			}
-		default:
-			_ = p.server.Shutdown(p.ctx)
-		}
+		_ = p.server.Close()
 		p.server = nil
 	}
 }
@@ -117,19 +108,11 @@ func (p *pprofService) Cleanup() {
 }
 
 // New constructs a new pprof service.
-func New(ctx context.Context) (service.BackgroundService, error) {
-	address := viper.GetString(cfgPprofBind)
+func New() (service.BackgroundService, error) {
+	address := config.GlobalConfig.Pprof.BindAddress
 
 	return &pprofService{
 		BaseBackgroundService: *service.NewBaseBackgroundService("pprof"),
 		address:               address,
-		ctx:                   ctx,
-		errCh:                 make(chan error),
 	}, nil
-}
-
-func init() {
-	Flags.String(cfgPprofBind, "", "enable profiling endpoint at given address")
-
-	_ = viper.BindPFlags(Flags)
 }

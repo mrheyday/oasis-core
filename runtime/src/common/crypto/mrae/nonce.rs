@@ -3,6 +3,7 @@ use std::ops::Deref;
 
 use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use rand::{rngs::OsRng, Rng};
 
 /// Size of the nonce in bytes.
 pub use super::deoxysii::NONCE_SIZE;
@@ -24,24 +25,36 @@ pub struct Nonce {
 }
 
 impl Nonce {
+    /// Create a new nonce.
     pub fn new(start_value: [u8; NONCE_SIZE]) -> Self {
         Nonce {
             current_value: start_value,
             start_value,
         }
     }
+
+    /// Generate a random nonce.
+    pub fn generate() -> Self {
+        let mut rng = OsRng {};
+        let mut start_value = [0u8; NONCE_SIZE];
+        rng.fill(&mut start_value);
+
+        Self::new(start_value)
+    }
+
     /// Adds one to the nonce, affecting only the last 32 counting bits.
     /// Returns an error iff we've exceeded our nonce's counter capacity, i.e.,
     /// we've incremented 2^32 times. In this case, the Nonce remains unchanged,
     /// and all subsequent calls to this method will return an Error.
     pub fn increment(&mut self) -> Result<()> {
         // Extract the current counter out of the nonce.
-        let mut counter_array = &self.current_value.clone()[TAG_SIZE..];
+        let mut counter_array = &self.current_value[TAG_SIZE..];
         // Increment the count and wrap to 0 if necessary.
         let new_counter: u32 = {
             let mut counter = counter_array.read_u32::<BigEndian>().unwrap();
             // If about to overflow wrap around to 0.
-            if counter == !(0 as u32) {
+            #[allow(clippy::nonminimal_bool)]
+            if counter == !0u32 {
                 counter = 0;
             } else {
                 counter += 1;

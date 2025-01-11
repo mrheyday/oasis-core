@@ -1,9 +1,10 @@
-use std::sync::Arc;
-
 use anyhow::Result;
-use io_context::Context;
 
-use crate::storage::mkvs::{cache::*, sync::*, tree::*};
+use crate::storage::mkvs::{
+    cache::{Cache, ReadSyncFetcher},
+    sync::{GetRequest, Proof, ProofBuilder, ReadSync, TreeID},
+    tree::{Depth, Key, KeyTrait, NodeBox, NodeKind, NodePtrRef, Root, Tree, Value},
+};
 
 pub(super) struct FetcherSyncGet<'a> {
     key: &'a Key,
@@ -20,70 +21,69 @@ impl<'a> FetcherSyncGet<'a> {
 }
 
 impl<'a> ReadSyncFetcher for FetcherSyncGet<'a> {
-    fn fetch(
-        &self,
-        ctx: Context,
-        root: Root,
-        ptr: NodePtrRef,
-        rs: &mut Box<dyn ReadSync>,
-    ) -> Result<Proof> {
-        let rsp = rs.sync_get(
-            ctx,
-            GetRequest {
-                tree: TreeID {
-                    root,
-                    position: ptr.borrow().hash,
-                },
-                key: self.key.clone(),
-                include_siblings: self.include_siblings,
+    fn fetch(&self, root: Root, ptr: NodePtrRef, rs: &mut Box<dyn ReadSync>) -> Result<Proof> {
+        let rsp = rs.sync_get(GetRequest {
+            tree: TreeID {
+                root,
+                position: ptr.borrow().hash,
             },
-        )?;
+            key: self.key.clone(),
+            include_siblings: self.include_siblings,
+        })?;
         Ok(rsp.proof)
     }
 }
 
 impl Tree {
     /// Get an existing key.
-    pub fn get(&self, ctx: Context, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self._get_top(ctx, key, false)
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self._get_top(key, false)
+    }
+
+    pub fn get_proof(&self, key: &[u8]) -> Result<Option<Proof>> {
+        let boxed_key = key.to_vec();
+        let pending_root = self.cache.borrow().get_pending_root();
+
+        // Remember where the path from root to target node ends (will end).
+        self.cache.borrow_mut().mark_position();
+
+        let mut proof_builder = ProofBuilder::new(pending_root.as_ref().borrow().hash);
+
+        let result = self._get(pending_root, 0, &boxed_key, false, Some(&mut proof_builder))?;
+        match result {
+            Some(_) => Ok(Some(proof_builder.build())),
+            None => Ok(None),
+        }
     }
 
     /// Check if the key exists in the local cache.
-    pub fn cache_contains_key(&self, ctx: Context, key: &[u8]) -> bool {
-        match self._get_top(ctx, key, true) {
+    pub fn cache_contains_key(&self, key: &[u8]) -> bool {
+        match self._get_top(key, true) {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(_) => false,
         }
     }
 
-    fn _get_top(&self, ctx: Context, key: &[u8], check_only: bool) -> Result<Option<Vec<u8>>> {
-        let ctx = ctx.freeze();
+    fn _get_top(&self, key: &[u8], check_only: bool) -> Result<Option<Vec<u8>>> {
         let boxed_key = key.to_vec();
         let pending_root = self.cache.borrow().get_pending_root();
-
-        // If the key has been modified locally, no need to perform any lookups.
-        if let Some(PendingLogEntry { ref value, .. }) = self.pending_write_log.get(&boxed_key) {
-            return Ok(value.clone());
-        }
 
         // Remember where the path from root to target node ends (will end).
         self.cache.borrow_mut().mark_position();
 
-        Ok(self._get(&ctx, pending_root, 0, &boxed_key, 0, check_only)?)
+        self._get(pending_root, 0, &boxed_key, check_only, None)
     }
 
     fn _get(
         &self,
-        ctx: &Arc<Context>,
         ptr: NodePtrRef,
         bit_depth: Depth,
         key: &Key,
-        depth: Depth,
         check_only: bool,
+        mut proof_builder: Option<&mut ProofBuilder>,
     ) -> Result<Option<Value>> {
         let node_ref = self.cache.borrow_mut().deref_node_ptr(
-            ctx,
             ptr,
             if check_only {
                 None
@@ -92,10 +92,15 @@ impl Tree {
             },
         )?;
 
+        // Include nodes in proof if we have a proof builder.
+        if let (Some(pb), Some(node_ref)) = (proof_builder.as_mut(), &node_ref) {
+            pb.include(&node_ref.borrow());
+        }
+
         match classify_noderef!(?node_ref) {
             NodeKind::None => {
                 // Reached a nil node, there is nothing here.
-                return Ok(None);
+                Ok(None)
             }
             NodeKind::Internal => {
                 let node_ref = node_ref.unwrap();
@@ -104,12 +109,11 @@ impl Tree {
                     // Does lookup key end here? Look into LeafNode.
                     if key.bit_length() == bit_depth + n.label_bit_length {
                         return self._get(
-                            ctx,
                             n.leaf_node.clone(),
                             bit_depth + n.label_bit_length,
                             key,
-                            depth,
                             check_only,
+                            proof_builder,
                         );
                     }
 
@@ -121,21 +125,19 @@ impl Tree {
                     // Continue recursively based on a bit value.
                     if key.get_bit(bit_depth + n.label_bit_length) {
                         return self._get(
-                            ctx,
                             n.right.clone(),
                             bit_depth + n.label_bit_length,
                             key,
-                            depth + 1,
                             check_only,
+                            proof_builder,
                         );
                     } else {
                         return self._get(
-                            ctx,
                             n.left.clone(),
                             bit_depth + n.label_bit_length,
                             key,
-                            depth + 1,
                             check_only,
+                            proof_builder,
                         );
                     }
                 }
@@ -146,11 +148,11 @@ impl Tree {
                 // Reached a leaf node, check if key matches.
                 let node_ref = node_ref.unwrap();
                 if noderef_as!(node_ref, Leaf).key == *key {
-                    return Ok(Some(noderef_as!(node_ref, Leaf).value.clone()));
+                    Ok(Some(noderef_as!(node_ref, Leaf).value.clone()))
                 } else {
-                    return Ok(None);
+                    Ok(None)
                 }
             }
-        };
+        }
     }
 }

@@ -1,4 +1,4 @@
-// Package SGX provides common Intel SGX datatypes and utilities.
+// Package sgx provides common Intel SGX datatypes and utilities.
 package sgx
 
 import (
@@ -45,12 +45,12 @@ type Attributes struct {
 	Xfrm  uint64
 }
 
-// GetFlagInit returns value of given flag attribute of the Report.
+// Contains returns value of given flag attribute of the Report.
 func (a AttributesFlags) Contains(flag AttributesFlags) bool {
 	return (uint64(a) & uint64(flag)) != 0
 }
 
-// Mrenclave is a SGX enclave identity register value (MRENCLAVE).
+// MrEnclave is a SGX enclave identity register value (MRENCLAVE).
 type MrEnclave [MrEnclaveSize]byte
 
 // MarshalBinary encodes a Mrenclave into binary form.
@@ -83,30 +83,15 @@ func (m *MrEnclave) UnmarshalHex(text string) error {
 // FromSgxs derives a MrEnclave from r, under the assumption that r will
 // provide the entire `.sgxs` file.
 func (m *MrEnclave) FromSgxs(r io.Reader) error {
-	// A `.sgxs` file's SHA256 digest is conveniently the MRENCLAVE.
-	var buf [32768]byte
-
 	h := sha256.New()
-readLoop:
-	for {
-		l, err := r.Read(buf[:])
-		if l > 0 {
-			_, _ = h.Write(buf[:l])
-		}
-		switch err {
-		case nil:
-		case io.EOF:
-			break readLoop
-		default:
-			return fmt.Errorf("sgx: failed to read .sgxs: %w", err)
-		}
+	if _, err := io.Copy(h, r); err != nil {
+		return fmt.Errorf("sgx: failed to read sgxs: %w", err)
 	}
-
 	sum := h.Sum(nil)
 	return m.UnmarshalBinary(sum)
 }
 
-// FromSgxsBytes dervies a MrEnclave from a byte slice containing a `.sgxs`
+// FromSgxsBytes derives a MrEnclave from a byte slice containing a `.sgxs`
 // file.
 func (m *MrEnclave) FromSgxsBytes(data []byte) error {
 	sum := sha256.Sum256(data)
@@ -225,6 +210,9 @@ func (id *EnclaveIdentity) UnmarshalText(text []byte) error {
 	if err != nil {
 		return fmt.Errorf("sgx: malformed EnclaveIdentity: %w", err)
 	}
+	if len(b) != enclaveIdentitySize {
+		return fmt.Errorf("sgx: malformed EnclaveIdentity")
+	}
 	if err := id.MrEnclave.UnmarshalBinary(b[:MrEnclaveSize]); err != nil {
 		return fmt.Errorf("sgx: malformed MrEnclave in EnclaveIdentity: %w", err)
 	}
@@ -238,8 +226,11 @@ func (id *EnclaveIdentity) UnmarshalText(text []byte) error {
 // UnmarshalHex decodes a hex marshaled EnclaveIdentity.
 func (id *EnclaveIdentity) UnmarshalHex(text string) error {
 	b, err := hex.DecodeString(text)
-	if err != nil || len(b) != enclaveIdentitySize {
+	if err != nil {
 		return fmt.Errorf("sgx: malformed EnclaveIdentity: %w", err)
+	}
+	if len(b) != enclaveIdentitySize {
+		return fmt.Errorf("sgx: malformed EnclaveIdentity")
 	}
 
 	copy(id.MrEnclave[:], b[:MrEnclaveSize])

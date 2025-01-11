@@ -1,7 +1,6 @@
 package sgx
 
 import (
-	"context"
 	"os"
 	"testing"
 	"time"
@@ -10,8 +9,13 @@ import (
 
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	cmnIAS "github.com/oasisprotocol/oasis-core/go/common/sgx/ias"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
+	cmt "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/api"
+	"github.com/oasisprotocol/oasis-core/go/ias/api"
 	iasHttp "github.com/oasisprotocol/oasis-core/go/ias/http"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host"
+	"github.com/oasisprotocol/oasis-core/go/runtime/host/protocol"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host/tests"
 )
 
@@ -20,14 +24,14 @@ import (
 const recvTimeout = 120 * time.Second
 
 var (
-	envRuntimePath       = os.Getenv("OASIS_TEST_RUNTIME_HOST_SGX_RUNTIME_PATH")
+	envRuntimePath       = os.Getenv("OASIS_TEST_RUNTIME_HOST_BUNDLE_PATH")
 	envRuntimeLoaderPath = os.Getenv("OASIS_TEST_RUNTIME_HOST_SGX_LOADER_PATH")
 )
 
 func skipIfMissingDeps(t *testing.T) {
 	// Skip test if there is no runtime configured.
 	if envRuntimePath == "" {
-		t.Skip("skipping as OASIS_TEST_RUNTIME_HOST_SGX_RUNTIME_PATH is not set")
+		t.Skip("skipping as OASIS_TEST_RUNTIME_HOST_BUNDLE_PATH is not set")
 	}
 
 	// Skip test if there is no runtime loader configured.
@@ -43,8 +47,25 @@ func TestProvisionerSGX(t *testing.T) {
 
 	require := require.New(t)
 
+	bnd, err := bundle.Open(envRuntimePath)
+	require.NoError(err, "bundle.Open")
+
+	tmpDir := t.TempDir()
+	_, err = bnd.WriteExploded(tmpDir)
+	require.NoError(err, "bnd.WriteExploded")
+
+	explodedDataDir := bnd.ExplodedPath(tmpDir, "")
+
 	cfg := host.Config{
-		Path: envRuntimePath,
+		Name: "test-runtime",
+		ID:   bnd.Manifest.ID,
+	}
+
+	for _, comp := range bnd.Manifest.Components {
+		cfg.Components = append(cfg.Components, &bundle.ExplodedComponent{
+			Component:       comp,
+			ExplodedDataDir: explodedDataDir,
+		})
 	}
 
 	ias, err := iasHttp.New(&iasHttp.Config{
@@ -55,14 +76,21 @@ func TestProvisionerSGX(t *testing.T) {
 	require.NoError(err, "iasHttp.New")
 
 	extraTests := []tests.TestCase{
-		{"AttestationWorker", testAttestationWorker}, // nolint: govet
+		{
+			Name: "AttestationWorker",
+			Fn:   testAttestationWorker,
+		},
 	}
 
 	t.Run("Naked", func(t *testing.T) {
 		tests.TestProvisioner(t, cfg, func() (host.Provisioner, error) {
 			return New(Config{
+				HostInfo: &protocol.HostInfo{
+					ConsensusBackend:         cmt.BackendName,
+					ConsensusProtocolVersion: version.Versions.ConsensusProtocol,
+				},
 				LoaderPath:            envRuntimeLoaderPath,
-				IAS:                   ias,
+				IAS:                   []api.Endpoint{ias},
 				RuntimeAttestInterval: 2 * time.Second,
 				InsecureNoSandbox:     true,
 				SandboxBinaryPath:     bwrapPath,
@@ -73,9 +101,13 @@ func TestProvisionerSGX(t *testing.T) {
 	t.Run("Sandboxed", func(t *testing.T) {
 		tests.TestProvisioner(t, cfg, func() (host.Provisioner, error) {
 			return New(Config{
+				HostInfo: &protocol.HostInfo{
+					ConsensusBackend:         cmt.BackendName,
+					ConsensusProtocolVersion: version.Versions.ConsensusProtocol,
+				},
 				LoaderPath:            envRuntimeLoaderPath,
 				RuntimeAttestInterval: 2 * time.Second,
-				IAS:                   ias,
+				IAS:                   []api.Endpoint{ias},
 				SandboxBinaryPath:     bwrapPath,
 			})
 		}, extraTests)
@@ -85,14 +117,12 @@ func TestProvisionerSGX(t *testing.T) {
 func testAttestationWorker(t *testing.T, cfg host.Config, p host.Provisioner) {
 	require := require.New(t)
 
-	r, err := p.NewRuntime(context.Background(), cfg)
+	r, err := p.NewRuntime(cfg)
 	require.NoError(err, "NewRuntime")
-	err = r.Start()
-	require.NoError(err, "Start")
+	r.Start()
 	defer r.Stop()
 
-	evCh, sub, err := r.WatchEvents(context.Background())
-	require.NoError(err, "WatchEvents")
+	evCh, sub := r.WatchEvents()
 	defer sub.Close()
 
 	// Wait for a successful start event.

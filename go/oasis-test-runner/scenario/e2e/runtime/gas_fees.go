@@ -13,24 +13,24 @@ import (
 
 // GasFeesRuntimes is the runtime gas fees scenario.
 var GasFeesRuntimes scenario.Scenario = &gasFeesRuntimesImpl{
-	runtimeImpl: *newRuntimeImpl("gas-fees/runtimes", "", nil),
+	Scenario: *NewScenario("gas-fees/runtimes", nil),
 }
 
 // gasPrice is the gas price used during the test.
 const gasPrice = 1
 
 type gasFeesRuntimesImpl struct {
-	runtimeImpl
+	Scenario
 }
 
 func (sc *gasFeesRuntimesImpl) Clone() scenario.Scenario {
 	return &gasFeesRuntimesImpl{
-		runtimeImpl: *sc.runtimeImpl.Clone().(*runtimeImpl),
+		Scenario: *sc.Scenario.Clone().(*Scenario),
 	}
 }
 
 func (sc *gasFeesRuntimesImpl) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := sc.runtimeImpl.Fixture()
+	f, err := sc.Scenario.Fixture()
 	if err != nil {
 		return nil, err
 	}
@@ -102,9 +102,6 @@ func (sc *gasFeesRuntimesImpl) Fixture() (*oasis.NetworkFixture, error) {
 	for i := range f.Keymanagers {
 		f.Keymanagers[i].Consensus.SubmissionGasPrice = gasPrice
 	}
-	for i := range f.StorageWorkers {
-		f.StorageWorkers[i].Consensus.SubmissionGasPrice = gasPrice
-	}
 	for i := range f.ComputeWorkers {
 		f.ComputeWorkers[i].Consensus.SubmissionGasPrice = gasPrice
 	}
@@ -115,21 +112,19 @@ func (sc *gasFeesRuntimesImpl) Fixture() (*oasis.NetworkFixture, error) {
 	return f, nil
 }
 
-func (sc *gasFeesRuntimesImpl) Run(childEnv *env.Env) error {
+func (sc *gasFeesRuntimesImpl) Run(ctx context.Context, _ *env.Env) error {
 	if err := sc.Net.Start(); err != nil {
 		return err
 	}
 
-	ctx := context.Background()
-
 	// Wait for all nodes to be synced before we proceed.
-	if err := sc.waitNodesSynced(); err != nil {
+	if err := sc.WaitNodesSynced(ctx); err != nil {
 		return err
 	}
 
 	// Submit a runtime transaction to check whether transaction processing works.
 	sc.Logger.Info("submitting transaction to runtime")
-	if err := sc.submitKeyValueRuntimeInsertTx(ctx, runtimeID, "hello", "non-free world"); err != nil {
+	if _, err := sc.submitKeyValueRuntimeInsertTx(ctx, KeyValueRuntimeID, 0, "hello", "non-free world", 0, 0, plaintextTxKind); err != nil {
 		return err
 	}
 

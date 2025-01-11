@@ -13,20 +13,22 @@ import (
 
 var (
 	signerCmd = &cobra.Command{
-		Use:   "signer",
-		Short: "signer backend utilities",
+		Use:        "signer",
+		Short:      "signer backend utilities",
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	exportCmd = &cobra.Command{
-		Use:   "export",
-		Short: "export the public key from signer as an empty entity",
-		Run:   doExport,
+		Use:        "export",
+		Short:      "export the public key from signer as an empty entity",
+		Run:        doExport,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	logger = logging.GetLogger("cmd/signer")
 )
 
-func doExport(cmd *cobra.Command, args []string) {
+func doExport(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}

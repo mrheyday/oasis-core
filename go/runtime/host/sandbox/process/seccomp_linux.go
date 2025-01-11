@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package process
@@ -7,6 +8,8 @@ import (
 	"syscall"
 
 	seccomp "github.com/seccomp/libseccomp-golang"
+
+	"github.com/oasisprotocol/oasis-core/go/common/dynlib"
 )
 
 // A list of syscalls allowed with any arguments.
@@ -354,5 +357,38 @@ func generateSeccompPolicy(out *os.File) error {
 		return err
 	}
 
+	// Handle clone3 if the kernel is new enough to support it.
+	osVersion, err := dynlib.GetOsVersion()
+	if err != nil {
+		return err
+	}
+	if osVersion >= 0x50300 { // "The clone3() system call first appeared in Linux 5.3.""
+		if err = handleClone3(filter); err != nil {
+			return err
+		}
+	}
+
 	return filter.ExportBPF(out)
+}
+
+func handleClone3(filter *seccomp.ScmpFilter) error {
+	// We need to handle the clone3 syscall in a special manner as there are several complications
+	// to its handling:
+	//
+	// - Newer glibc versions will try clone3 first and if they see EPERM they will instantly fail
+	//   making the program unable to spawn threads.
+	//
+	// - The clone3 syscall is much more complex than clone and so we can't simply inspect its flags
+	//   as above for clone.
+	//
+	// Therefore we need to reject the syscall with ENOSYS, causing fallback to clone.
+	clone3ID, err := seccomp.GetSyscallFromName("clone3")
+	if err != nil {
+		return err
+	}
+	err = filter.AddRule(clone3ID, seccomp.ActErrno.SetReturnCode(int16(syscall.ENOSYS)))
+	if err != nil {
+		return err
+	}
+	return nil
 }

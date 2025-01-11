@@ -1,26 +1,19 @@
-use io_context::Context;
-use serde_json;
-use std::{collections::HashSet, fs::File, io::BufReader, iter::FromIterator, path::Path};
+use std::{collections::HashSet, fs::File, io::BufReader, iter, iter::FromIterator, path::Path};
 
-use crate::{
-    common::crypto::hash::Hash,
-    storage::mkvs::{
-        cache::*,
-        interop::{Driver, ProtocolServer},
-        sync::*,
-        tests,
-        tree::*,
-        LogEntry, LogEntryKind, WriteLog,
-    },
+use crate::storage::mkvs::{
+    interop::{Driver, ProtocolServer},
+    tests,
+    tree::*,
+    Iterator, LogEntry, LogEntryKind, WriteLog, MKVS,
 };
 
 const INSERT_ITEMS: usize = 1000;
-const ALL_ITEMS_ROOT: &str = "71bb02a598b13c6c8e1e969e4c7f91b30a441bb9140e97b4a2d2962d4ed9d63a";
+const ALL_ITEMS_ROOT: &str = "2187c55627819b60069888ba86f83dc2a9f50c827624b0e31e31261806300ede";
 
 const LONG_KEY: &str = "Unlock the potential of your data without compromising security or privacy";
 const LONG_VALUE: &str = "The platform that puts data privacy first. From sharing medical records, to analyzing personal financial information, to training machine learning models, the Oasis platform supports applications that use even the most sensitive data without compromising privacy or performance.";
 const ALL_LONG_ITEMS_ROOT: &str =
-    "51ab169f7362d3261a63883e8a4011108784108107c93e8a1693c26fbeed4715";
+    "d829bb244a709bacf33bc2d8b4a016592e5310a10910aa980ef91cb3b4347dcb";
 
 pub fn generate_key_value_pairs_ex(prefix: String, count: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(count);
@@ -51,7 +44,11 @@ fn generate_long_key_value_pairs() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
 
 #[test]
 fn test_basic() {
-    let mut tree = Tree::make().new(Box::new(NoopReadSyncer));
+    let mut tree = OverlayTree::new(
+        Tree::builder()
+            .with_root_type(RootType::State)
+            .build(Box::new(NoopReadSyncer)),
+    );
 
     let key_zero = b"foo";
     let value_zero = b"bar";
@@ -61,51 +58,28 @@ fn test_basic() {
     let value_one_alt = b"boo";
 
     // Insert two keys and check committed tree.
-    assert_eq!(
-        tree.insert(Context::background(), key_zero, value_zero)
-            .expect("insert"),
-        None
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_zero),
-        true
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_one),
-        false
-    );
-    let value = tree
-        .get(Context::background(), key_zero)
-        .expect("get")
-        .expect("get_some");
+    assert_eq!(tree.insert(key_zero, value_zero).expect("insert"), None);
+    assert_eq!(tree.cache_contains_key(key_zero), true);
+    assert_eq!(tree.cache_contains_key(key_one), false);
+    let value = tree.get(key_zero).expect("get").expect("get_some");
     assert_eq!(value.as_slice(), value_zero);
 
     assert_eq!(
-        tree.insert(Context::background(), key_zero, value_zero)
+        tree.insert(key_zero, value_zero)
             .expect("insert")
             .expect("insert_some")
             .as_slice(),
         value_zero
     );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_zero),
-        true
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_one),
-        false
-    );
-    let value = tree
-        .get(Context::background(), key_zero)
-        .expect("get")
-        .expect("get_some");
+    assert_eq!(tree.cache_contains_key(key_zero), true);
+    assert_eq!(tree.cache_contains_key(key_one), false);
+    let value = tree.get(key_zero).expect("get").expect("get_some");
     assert_eq!(value.as_slice(), value_zero);
 
-    let (log, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let (log, hash) = tree.commit_both(Default::default(), 0).expect("commit");
     assert_eq!(
         format!("{:?}", hash),
-        "68e0c95d0dcb3a4ace95d1a64b8d7bb1dd08e3708abdca4068c1ccf32b7076d4"
+        "db67c0572006673b488342a45e6590a75e8919265e6da706c80c6b2776017aa7"
     );
     assert_eq!(
         log,
@@ -118,110 +92,57 @@ fn test_basic() {
     assert_eq!(log[0].kind(), LogEntryKind::Insert);
 
     // Check overwriting modifications.
-    assert_eq!(
-        tree.insert(Context::background(), key_one, value_one)
-            .expect("insert"),
-        None
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_zero),
-        true
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_one),
-        true
-    );
-    let value = tree
-        .get(Context::background(), key_one)
-        .expect("get")
-        .expect("get_some");
+    assert_eq!(tree.insert(key_one, value_one).expect("insert"), None);
+    assert_eq!(tree.cache_contains_key(key_zero), true);
+    assert_eq!(tree.cache_contains_key(key_one), true);
+    let value = tree.get(key_one).expect("get").expect("get_some");
     assert_eq!(value.as_slice(), value_one);
 
     assert_eq!(
-        tree.insert(Context::background(), key_zero, value_zero_alt)
+        tree.insert(key_zero, value_zero_alt)
             .expect("insert")
             .expect("insert_some")
             .as_slice(),
         value_zero
     );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_zero),
-        true
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_one),
-        true
-    );
-    let value = tree
-        .get(Context::background(), key_zero)
-        .expect("get")
-        .expect("get_some");
+    assert_eq!(tree.cache_contains_key(key_zero), true);
+    assert_eq!(tree.cache_contains_key(key_one), true);
+    let value = tree.get(key_zero).expect("get").expect("get_some");
     assert_eq!(value.as_slice(), value_zero_alt);
-    let value = tree
-        .get(Context::background(), key_one)
-        .expect("get")
-        .expect("get_some");
+    let value = tree.get(key_one).expect("get").expect("get_some");
     assert_eq!(value.as_slice(), value_one);
 
     assert_eq!(
-        tree.remove(Context::background(), key_one)
+        tree.remove(key_one)
             .expect("remove")
             .expect("remove_some")
             .as_slice(),
         value_one
     );
-    assert_eq!(
-        tree.remove(Context::background(), key_one).expect("remove"),
-        None
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_zero),
-        true
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_one),
-        false
-    );
-    assert_eq!(None, tree.get(Context::background(), key_one).expect("get"));
-    let value = tree
-        .get(Context::background(), key_zero)
-        .expect("get")
-        .expect("get_some");
+    assert_eq!(tree.remove(key_one).expect("remove"), None);
+    assert_eq!(tree.cache_contains_key(key_zero), true);
+    assert_eq!(tree.cache_contains_key(key_one), false);
+    assert_eq!(None, tree.get(key_one).expect("get"));
+    let value = tree.get(key_zero).expect("get").expect("get_some");
     assert_eq!(value.as_slice(), value_zero_alt);
 
-    assert_eq!(
-        tree.insert(Context::background(), key_one, value_one_alt)
-            .expect("insert"),
-        None
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_zero),
-        true
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_one),
-        true
-    );
-    let value = tree
-        .get(Context::background(), key_zero)
-        .expect("get")
-        .expect("get_some");
+    assert_eq!(tree.insert(key_one, value_one_alt).expect("insert"), None);
+    assert_eq!(tree.cache_contains_key(key_zero), true);
+    assert_eq!(tree.cache_contains_key(key_one), true);
+    let value = tree.get(key_zero).expect("get").expect("get_some");
     assert_eq!(value.as_slice(), value_zero_alt);
-    let value = tree
-        .get(Context::background(), key_one)
-        .expect("get")
-        .expect("get_some");
+    let value = tree.get(key_one).expect("get").expect("get_some");
     assert_eq!(value.as_slice(), value_one_alt);
 
     assert_eq!(
-        tree.insert(Context::background(), key_zero, value_zero)
+        tree.insert(key_zero, value_zero)
             .expect("insert")
             .expect("insert_some")
             .as_slice(),
         value_zero_alt
     );
     assert_eq!(
-        tree.insert(Context::background(), key_one, value_one)
+        tree.insert(key_one, value_one)
             .expect("insert")
             .expect("insert_some")
             .as_slice(),
@@ -229,11 +150,10 @@ fn test_basic() {
     );
 
     // Tree now has key_zero and key_one and should hash as if the mangling didn't happen.
-    let (log, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let (log, hash) = tree.commit_both(Default::default(), 0).expect("commit");
     assert_eq!(
         format!("{:?}", hash),
-        "821d13489eae34debd85117823058a143ee3c534e91828a0db8d48ecb2128b8c"
+        "e627581db43e18410a52793e662e4f21ae6a4fca14e16915a85ec4c3e3e41a13"
     );
     // Order of transactions in writelog is arbitrary.
     assert_eq!(
@@ -256,19 +176,13 @@ fn test_basic() {
     assert_eq!(log[0].kind(), LogEntryKind::Insert);
     assert_eq!(log[1].kind(), LogEntryKind::Insert);
 
-    tree.remove(Context::background(), key_one).expect("remove");
-    assert_eq!(
-        true,
-        tree.get(Context::background(), key_one)
-            .expect("get")
-            .is_none()
-    );
+    tree.remove(key_one).expect("remove");
+    assert_eq!(true, tree.get(key_one).expect("get").is_none());
 
-    let (log, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let (log, hash) = tree.commit_both(Default::default(), 0).expect("commit");
     assert_eq!(
         format!("{:?}", hash),
-        "68e0c95d0dcb3a4ace95d1a64b8d7bb1dd08e3708abdca4068c1ccf32b7076d4"
+        "db67c0572006673b488342a45e6590a75e8919265e6da706c80c6b2776017aa7"
     );
     assert_eq!(
         log,
@@ -279,45 +193,32 @@ fn test_basic() {
         .to_vec()
     );
     assert_eq!(log[0].kind(), LogEntryKind::Delete);
-    tree.remove(Context::background(), key_zero)
-        .expect("remove");
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_zero),
-        false
-    );
-    assert_eq!(
-        tree.cache_contains_key(Context::background(), key_one),
-        false
-    );
+    tree.remove(key_zero).expect("remove");
+    assert_eq!(tree.cache_contains_key(key_zero), false);
+    assert_eq!(tree.cache_contains_key(key_one), false);
 }
 
 #[test]
 fn test_long_keys() {
-    let mut tree = Tree::make().new(Box::new(NoopReadSyncer));
+    let mut tree = Tree::builder()
+        .with_root_type(RootType::State)
+        .build(Box::new(NoopReadSyncer));
 
     // First insert keys 0..n and remove them in order n..0.
     let mut roots: Vec<Hash> = Vec::new();
     let (keys, values) = generate_long_key_value_pairs();
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
 
-        let (_, hash) =
-            Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+        let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
         roots.push(hash);
     }
 
     for i in 0..keys.len() {
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), keys[i].as_slice()),
-            true
-        );
+        assert_eq!(tree.cache_contains_key(keys[i].as_slice()), true);
         let value = tree
-            .get(Context::background(), keys[i].as_slice())
+            .get(keys[i].as_slice())
             .expect("get")
             .expect("get_some");
         assert_eq!(values[i], value.as_slice());
@@ -326,68 +227,42 @@ fn test_long_keys() {
     assert_eq!(format!("{:?}", roots[roots.len() - 1]), ALL_LONG_ITEMS_ROOT);
 
     for i in (1..keys.len()).rev() {
-        tree.remove(Context::background(), keys[i].as_slice())
-            .expect("remove");
+        tree.remove(keys[i].as_slice()).expect("remove");
 
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), keys[i].as_slice()),
-            false
-        );
-        assert_eq!(
-            None,
-            tree.get(Context::background(), keys[i].as_slice())
-                .expect("get")
-        );
+        assert_eq!(tree.cache_contains_key(keys[i].as_slice()), false);
+        assert_eq!(None, tree.get(keys[i].as_slice()).expect("get"));
 
-        let (_, hash) =
-            Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+        let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
         assert_eq!(hash, roots[i - 1]);
     }
 
-    tree.remove(Context::background(), keys[0].as_slice())
-        .expect("remove");
+    tree.remove(keys[0].as_slice()).expect("remove");
 
-    let (_, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
     assert_eq!(hash, Hash::empty_hash());
 }
 
 #[test]
 fn test_empty_keys() {
-    let mut tree = Tree::make().new(Box::new(NoopReadSyncer));
+    let mut tree = Tree::builder()
+        .with_root_type(RootType::State)
+        .build(Box::new(NoopReadSyncer));
 
     fn test_empty_key(tree: &mut Tree) {
         let empty_key = b"";
         let empty_value = b"empty value";
 
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), empty_key),
-            false
-        );
-        tree.insert(Context::background(), empty_key, empty_value)
-            .expect("insert");
+        assert_eq!(tree.cache_contains_key(empty_key), false);
+        tree.insert(empty_key, empty_value).expect("insert");
 
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), empty_key),
-            true
-        );
-        let value = tree
-            .get(Context::background(), empty_key)
-            .expect("get")
-            .expect("get_some");
+        assert_eq!(tree.cache_contains_key(empty_key), true);
+        let value = tree.get(empty_key).expect("get").expect("get_some");
         assert_eq!(empty_value, value.as_slice());
 
-        tree.remove(Context::background(), empty_key)
-            .expect("remove");
+        tree.remove(empty_key).expect("remove");
 
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), empty_key),
-            false
-        );
-        assert_eq!(
-            None,
-            tree.get(Context::background(), empty_key).expect("get")
-        );
+        assert_eq!(tree.cache_contains_key(empty_key), false);
+        assert_eq!(None, tree.get(empty_key).expect("get"));
     }
 
     fn test_zeroth_discriminator_bit(tree: &mut Tree) {
@@ -396,27 +271,19 @@ fn test_empty_keys() {
         let value1 = b"value 1";
         let value2 = b"value 2";
 
-        tree.insert(Context::background(), key1, value1)
-            .expect("insert");
-        tree.insert(Context::background(), key2, value2)
-            .expect("insert");
+        tree.insert(key1, value1).expect("insert");
+        tree.insert(key2, value2).expect("insert");
 
-        let value = tree
-            .get(Context::background(), key1)
-            .expect("get")
-            .expect("get_some");
+        let value = tree.get(key1).expect("get").expect("get_some");
         assert_eq!(value1, value.as_slice());
-        let value = tree
-            .get(Context::background(), key2)
-            .expect("get")
-            .expect("get_some");
+        let value = tree.get(key2).expect("get").expect("get_some");
         assert_eq!(value2, value.as_slice());
 
-        tree.remove(Context::background(), key1).expect("remove");
-        assert_eq!(None, tree.get(Context::background(), key1).expect("get"));
+        tree.remove(key1).expect("remove");
+        assert_eq!(None, tree.get(key1).expect("get"));
 
-        tree.remove(Context::background(), key2).expect("remove");
-        assert_eq!(None, tree.get(Context::background(), key2).expect("get"));
+        tree.remove(key2).expect("remove");
+        assert_eq!(None, tree.get(key2).expect("get"));
     }
 
     test_empty_key(&mut tree);
@@ -426,253 +293,183 @@ fn test_empty_keys() {
     let mut roots: Vec<Hash> = Vec::new();
     let (keys, values) = generate_long_key_value_pairs();
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
 
         test_empty_key(&mut tree);
         test_zeroth_discriminator_bit(&mut tree);
 
-        let (_, hash) =
-            Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+        let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
         roots.push(hash);
     }
 
     for i in 0..keys.len() {
         let value = tree
-            .get(Context::background(), keys[i].as_slice())
+            .get(keys[i].as_slice())
             .expect("get")
             .expect("get_some");
         assert_eq!(values[i], value.as_slice());
     }
 
     for i in (1..keys.len()).rev() {
-        tree.remove(Context::background(), keys[i].as_slice())
-            .expect("remove");
+        tree.remove(keys[i].as_slice()).expect("remove");
 
-        assert_eq!(
-            None,
-            tree.get(Context::background(), keys[i].as_slice())
-                .expect("get")
-        );
+        assert_eq!(None, tree.get(keys[i].as_slice()).expect("get"));
 
         test_empty_key(&mut tree);
         test_zeroth_discriminator_bit(&mut tree);
 
-        let (_, hash) =
-            Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+        let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
         assert_eq!(hash, roots[i - 1]);
     }
 
-    tree.remove(Context::background(), keys[0].as_slice())
-        .expect("remove");
+    tree.remove(keys[0].as_slice()).expect("remove");
 
     test_empty_key(&mut tree);
     test_zeroth_discriminator_bit(&mut tree);
 
-    let (_, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
     assert_eq!(hash, Hash::empty_hash());
 }
 
 #[test]
 fn test_insert_commit_batch() {
-    let mut tree = Tree::make().new(Box::new(NoopReadSyncer));
+    let mut tree = Tree::builder()
+        .with_root_type(RootType::State)
+        .build(Box::new(NoopReadSyncer));
 
     let (keys, values) = generate_key_value_pairs();
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
 
         let value = tree
-            .get(Context::background(), keys[i].as_slice())
+            .get(keys[i].as_slice())
             .expect("get")
             .expect("get_some");
         assert_eq!(values[i], value.as_slice());
     }
 
-    let (_, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
     assert_eq!(format!("{:?}", hash), ALL_ITEMS_ROOT);
 }
 
 #[test]
 fn test_insert_commit_each() {
-    let mut tree = Tree::make()
+    let mut tree = Tree::builder()
         .with_capacity(0, 0)
-        .new(Box::new(NoopReadSyncer));
+        .with_root_type(RootType::State)
+        .build(Box::new(NoopReadSyncer));
 
     let (keys, values) = generate_key_value_pairs();
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
 
         let value = tree
-            .get(Context::background(), keys[i].as_slice())
+            .get(keys[i].as_slice())
             .expect("get")
             .expect("get_some");
         assert_eq!(values[i], value.as_slice());
 
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+        Tree::commit(&mut tree, Default::default(), 0).expect("commit");
     }
 
-    let (_, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
     assert_eq!(format!("{:?}", hash), ALL_ITEMS_ROOT);
 }
 
 #[test]
 fn test_remove() {
-    let mut tree = Tree::make()
+    let mut tree = Tree::builder()
         .with_capacity(0, 0)
-        .new(Box::new(NoopReadSyncer));
+        .with_root_type(RootType::State)
+        .build(Box::new(NoopReadSyncer));
 
     // First insert keys 0..n and remove them in order n..0.
     let mut roots: Vec<Hash> = Vec::new();
     let (keys, values) = generate_key_value_pairs();
     for i in 0..keys.len() {
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), keys[i].as_slice()),
-            false
-        );
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        assert_eq!(tree.cache_contains_key(keys[i].as_slice()), false);
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
 
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), keys[i].as_slice()),
-            true
-        );
+        assert_eq!(tree.cache_contains_key(keys[i].as_slice()), true);
         let value = tree
-            .get(Context::background(), keys[i].as_slice())
+            .get(keys[i].as_slice())
             .expect("get")
             .expect("get_some");
         assert_eq!(values[i], value.as_slice());
 
-        let (_, hash) =
-            Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+        let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
         roots.push(hash);
     }
 
     assert_eq!(format!("{:?}", roots[roots.len() - 1]), ALL_ITEMS_ROOT);
 
     for i in (1..keys.len()).rev() {
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), keys[i].as_slice()),
-            true
-        );
-        tree.remove(Context::background(), keys[i].as_slice())
-            .expect("remove");
+        assert_eq!(tree.cache_contains_key(keys[i].as_slice()), true);
+        tree.remove(keys[i].as_slice()).expect("remove");
 
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), keys[i].as_slice()),
-            false
-        );
-        assert_eq!(
-            None,
-            tree.get(Context::background(), keys[i].as_slice())
-                .expect("get")
-        );
+        assert_eq!(tree.cache_contains_key(keys[i].as_slice()), false);
+        assert_eq!(None, tree.get(keys[i].as_slice()).expect("get"));
 
-        let (_, hash) =
-            Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+        let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
         assert_eq!(hash, roots[i - 1]);
     }
 
-    tree.remove(Context::background(), keys[0].as_slice())
-        .expect("remove");
-    let (_, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    tree.remove(keys[0].as_slice()).expect("remove");
+    let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
     assert_eq!(hash, Hash::empty_hash());
 
     // Now re-insert keys n..0, remove them in order 0..n.
     for i in (0..keys.len()).rev() {
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), keys[i].as_slice()),
-            false
-        );
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        assert_eq!(tree.cache_contains_key(keys[i].as_slice()), false);
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
 
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), keys[i].as_slice()),
-            true
-        );
+        assert_eq!(tree.cache_contains_key(keys[i].as_slice()), true);
         let value = tree
-            .get(Context::background(), keys[i].as_slice())
+            .get(keys[i].as_slice())
             .expect("get")
             .expect("get_some");
         assert_eq!(values[i], value.as_slice());
 
-        let (_, _) =
-            Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+        let _ = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
     }
 
     for i in 0..keys.len() {
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), keys[i].as_slice()),
-            true
-        );
-        tree.remove(Context::background(), keys[i].as_slice())
-            .expect("remove");
+        assert_eq!(tree.cache_contains_key(keys[i].as_slice()), true);
+        tree.remove(keys[i].as_slice()).expect("remove");
 
-        assert_eq!(
-            tree.cache_contains_key(Context::background(), keys[i].as_slice()),
-            false
-        );
-        assert_eq!(
-            None,
-            tree.get(Context::background(), keys[i].as_slice())
-                .expect("get")
-        );
+        assert_eq!(tree.cache_contains_key(keys[i].as_slice()), false);
+        assert_eq!(None, tree.get(keys[i].as_slice()).expect("get"));
 
-        let (_, _) =
-            Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+        let _ = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
     }
 
-    let (_, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let hash = Tree::commit(&mut tree, Default::default(), 0).expect("commit");
     assert_eq!(hash, Hash::empty_hash());
 }
 
 #[test]
 fn test_syncer_basic() {
-    let server = ProtocolServer::new();
+    let server = ProtocolServer::new(None);
 
-    let mut tree = Tree::make()
-        .with_capacity(0, 0)
-        .new(Box::new(NoopReadSyncer));
+    let mut tree = OverlayTree::new(
+        Tree::builder()
+            .with_capacity(0, 0)
+            .with_root_type(RootType::State)
+            .build(Box::new(NoopReadSyncer)),
+    );
 
     let (keys, values) = generate_key_value_pairs();
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
     }
 
-    let (write_log, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let (write_log, hash) = tree.commit_both(Default::default(), 0).expect("commit");
     assert_eq!(format!("{:?}", hash), ALL_ITEMS_ROOT);
 
     server.apply(&write_log, hash, Default::default(), 0);
@@ -681,17 +478,18 @@ fn test_syncer_basic() {
     // syncer interface.
 
     let stats = StatsCollector::new(server.read_sync());
-    let remote_tree = Tree::make()
+    let remote_tree = Tree::builder()
         .with_capacity(0, 0)
         .with_root(Root {
+            root_type: RootType::State,
             hash,
             ..Default::default()
         })
-        .new(Box::new(stats));
+        .build(Box::new(stats));
 
     for i in 0..keys.len() {
         let value = remote_tree
-            .get(Context::background(), keys[i].as_slice())
+            .get(keys[i].as_slice())
             .expect("get")
             .expect("get_some");
         assert_eq!(values[i], value.as_slice());
@@ -710,25 +508,23 @@ fn test_syncer_basic() {
 
 #[test]
 fn test_syncer_remove() {
-    let server = ProtocolServer::new();
+    let server = ProtocolServer::new(None);
 
-    let mut tree = Tree::make()
-        .with_capacity(0, 0)
-        .new(Box::new(NoopReadSyncer));
+    let mut tree = OverlayTree::new(
+        Tree::builder()
+            .with_capacity(0, 0)
+            .with_root_type(RootType::State)
+            .build(Box::new(NoopReadSyncer)),
+    );
     let mut roots: Vec<Hash> = Vec::new();
 
     let mut write_log = WriteLog::new();
     let (keys, values) = generate_key_value_pairs();
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
 
-        let (mut wl, hash) =
-            Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+        let (mut wl, hash) = tree.commit_both(Default::default(), 0).expect("commit");
         roots.push(hash);
         write_log.append(&mut wl);
     }
@@ -737,27 +533,20 @@ fn test_syncer_remove() {
     server.apply(&write_log, roots[roots.len() - 1], Default::default(), 0);
 
     let stats = StatsCollector::new(server.read_sync());
-    let mut remote_tree = Tree::make()
+    let mut remote_tree = Tree::builder()
         .with_capacity(0, 0)
         .with_root(Root {
+            root_type: RootType::State,
             hash: roots[roots.len() - 1],
             ..Default::default()
         })
-        .new(Box::new(stats));
+        .build(Box::new(stats));
 
     for i in (0..keys.len()).rev() {
-        remote_tree
-            .remove(Context::background(), keys[i].as_slice())
-            .expect("remove");
+        remote_tree.remove(keys[i].as_slice()).expect("remove");
     }
 
-    let (_, hash) = Tree::commit(
-        &mut remote_tree,
-        Context::background(),
-        Default::default(),
-        0,
-    )
-    .expect("commit");
+    let hash = Tree::commit(&mut remote_tree, Default::default(), 0).expect("commit");
     assert_eq!(hash, Hash::empty_hash());
 
     let cache = remote_tree.cache.borrow();
@@ -773,42 +562,37 @@ fn test_syncer_remove() {
 
 #[test]
 fn test_syncer_insert() {
-    let server = ProtocolServer::new();
+    let server = ProtocolServer::new(None);
 
-    let mut tree = Tree::make()
-        .with_capacity(0, 0)
-        .new(Box::new(NoopReadSyncer));
+    let mut tree = OverlayTree::new(
+        Tree::builder()
+            .with_capacity(0, 0)
+            .with_root_type(RootType::State)
+            .build(Box::new(NoopReadSyncer)),
+    );
 
     let (keys, values) = generate_key_value_pairs();
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
     }
 
-    let (write_log, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let (write_log, hash) = tree.commit_both(Default::default(), 0).expect("commit");
     server.apply(&write_log, hash, Default::default(), 0);
 
     let stats = StatsCollector::new(server.read_sync());
-    let mut remote_tree = Tree::make()
+    let mut remote_tree = Tree::builder()
         .with_capacity(0, 0)
         .with_root(Root {
+            root_type: RootType::State,
             hash,
             ..Default::default()
         })
-        .new(Box::new(stats));
+        .build(Box::new(stats));
 
     for i in 0..keys.len() {
         remote_tree
-            .insert(
-                Context::background(),
-                keys[i].as_slice(),
-                values[i].as_slice(),
-            )
+            .insert(keys[i].as_slice(), values[i].as_slice())
             .expect("insert");
     }
 
@@ -825,32 +609,28 @@ fn test_syncer_insert() {
 
 #[test]
 fn test_syncer_writelog_remove() {
-    let server = ProtocolServer::new();
+    let server = ProtocolServer::new(None);
 
-    let mut tree = Tree::make()
-        .with_capacity(0, 0)
-        .new(Box::new(NoopReadSyncer));
+    let mut tree = OverlayTree::new(
+        Tree::builder()
+            .with_capacity(0, 0)
+            .with_root_type(RootType::State)
+            .build(Box::new(NoopReadSyncer)),
+    );
 
     let (keys, values) = generate_key_value_pairs();
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
     }
 
-    let (write_log, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let (write_log, hash) = tree.commit_both(Default::default(), 0).expect("commit");
     server.apply(&write_log, hash, Default::default(), 0);
 
-    tree.remove(Context::background(), keys[0].as_slice())
-        .expect("remove");
+    tree.remove(keys[0].as_slice()).expect("remove");
 
     let previous_hash = hash;
-    let (write_log, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let (write_log, hash) = tree.commit_both(Default::default(), 0).expect("commit");
     // Submit the write log to the protocol server. This will fail in case the server interprets the
     // write log differently.
     server.apply_existing(&write_log, previous_hash, hash, Default::default(), 0);
@@ -858,43 +638,42 @@ fn test_syncer_writelog_remove() {
 
 #[test]
 fn test_syncer_prefetch_prefixes() {
-    let server = ProtocolServer::new();
+    let server = ProtocolServer::new(None);
 
-    let mut tree = Tree::make()
-        .with_capacity(0, 0)
-        .new(Box::new(NoopReadSyncer));
+    let mut tree = OverlayTree::new(
+        Tree::builder()
+            .with_capacity(0, 0)
+            .with_root_type(RootType::State)
+            .build(Box::new(NoopReadSyncer)),
+    );
 
     let (keys, values) = generate_key_value_pairs();
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
     }
 
-    let (write_log, hash) =
-        Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    let (write_log, hash) = tree.commit_both(Default::default(), 0).expect("commit");
     server.apply(&write_log, hash, Default::default(), 0);
 
     let stats = StatsCollector::new(server.read_sync());
-    let remote_tree = Tree::make()
+    let remote_tree = Tree::builder()
         .with_capacity(0, 0)
         .with_root(Root {
+            root_type: RootType::State,
             hash,
             ..Default::default()
         })
-        .new(Box::new(stats));
+        .build(Box::new(stats));
 
     // Prefetch keys starting with prefix "key".
     remote_tree
-        .prefetch_prefixes(Context::background(), &vec![b"key".to_vec().into()], 1000)
+        .prefetch_prefixes(&vec![b"key".to_vec().into()], 1000)
         .expect("prefetch_prefixes");
 
     for i in 0..keys.len() {
         let value = remote_tree
-            .get(Context::background(), keys[i].as_slice())
+            .get(keys[i].as_slice())
             .expect("get")
             .expect("get_some");
         assert_eq!(values[i], value.as_slice());
@@ -913,20 +692,17 @@ fn test_syncer_prefetch_prefixes() {
 
 #[test]
 fn test_value_eviction() {
-    let mut tree = Tree::make()
+    let mut tree = Tree::builder()
         .with_capacity(0, 512)
-        .new(Box::new(NoopReadSyncer));
+        .with_root_type(RootType::State)
+        .build(Box::new(NoopReadSyncer));
 
     let (keys, values) = generate_key_value_pairs();
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
     }
-    Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    Tree::commit(&mut tree, Default::default(), 0).expect("commit");
 
     assert_eq!(
         999,
@@ -943,31 +719,24 @@ fn test_value_eviction() {
 
 #[test]
 fn test_node_eviction() {
-    let mut tree = Tree::make()
+    let mut tree = Tree::builder()
         .with_capacity(128, 0)
-        .new(Box::new(NoopReadSyncer));
+        .with_root_type(RootType::State)
+        .build(Box::new(NoopReadSyncer));
 
     let (keys, values) = generate_key_value_pairs_ex("foo".to_string(), 150);
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
     }
-    Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    Tree::commit(&mut tree, Default::default(), 0).expect("commit");
 
     let (keys, values) = generate_key_value_pairs_ex("foo key 1".to_string(), 150);
     for i in 0..keys.len() {
-        tree.insert(
-            Context::background(),
-            keys[i].as_slice(),
-            values[i].as_slice(),
-        )
-        .expect("insert");
+        tree.insert(keys[i].as_slice(), values[i].as_slice())
+            .expect("insert");
     }
-    Tree::commit(&mut tree, Context::background(), Default::default(), 0).expect("commit");
+    Tree::commit(&mut tree, Default::default(), 0).expect("commit");
 
     // Only a subset of nodes should remain in cache.
     assert_eq!(
@@ -983,10 +752,10 @@ fn test_node_eviction() {
 }
 
 /// Location of the test vectors directory (from Go).
-const TEST_VECTORS_DIR: &'static str = "../go/storage/mkvs/testdata";
+const TEST_VECTORS_DIR: &str = "../go/storage/mkvs/testdata";
 
 fn test_special_case_from_json(fixture: &'static str) {
-    let server = ProtocolServer::new();
+    let server = ProtocolServer::new(None);
 
     let file =
         File::open(Path::new(TEST_VECTORS_DIR).join(fixture)).expect("failed to open fixture");
@@ -994,25 +763,27 @@ fn test_special_case_from_json(fixture: &'static str) {
 
     let ops: tests::TestVector = serde_json::from_reader(reader).expect("failed to parse fixture");
 
-    let mut tree = Tree::make()
+    let mut tree = Tree::builder()
         .with_capacity(0, 0)
-        .new(Box::new(NoopReadSyncer));
+        .with_root_type(RootType::State)
+        .build(Box::new(NoopReadSyncer));
+    let mut overlay = OverlayTree::new(&mut tree);
     let mut remote_tree: Option<Tree> = None;
     let mut root = Hash::empty_hash();
 
-    let mut commit_remote = |tree: &mut Tree, remote_tree: &mut Option<Tree>| {
-        let (write_log, hash) =
-            Tree::commit(tree, Context::background(), Default::default(), 0).expect("commit");
+    let mut commit_remote = |tree: &mut OverlayTree<_>, remote_tree: &mut Option<Tree>| {
+        let (write_log, hash) = tree.commit_both(Default::default(), 0).expect("commit");
         server.apply_existing(&write_log, root, hash, Default::default(), 0);
 
         remote_tree.replace(
-            Tree::make()
+            Tree::builder()
                 .with_capacity(0, 0)
                 .with_root(Root {
+                    root_type: RootType::State,
                     hash,
                     ..Default::default()
                 })
-                .new(server.read_sync()),
+                .build(server.read_sync()),
         );
         root = hash;
     };
@@ -1024,41 +795,33 @@ fn test_special_case_from_json(fixture: &'static str) {
                 let value = op.value.unwrap_or_default();
 
                 if let Some(ref mut remote_tree) = remote_tree {
-                    remote_tree
-                        .insert(Context::background(), &key, &value)
-                        .expect("insert");
+                    remote_tree.insert(&key, &value).expect("insert");
                 }
 
-                tree.insert(Context::background(), &key, &value)
-                    .expect("insert");
+                overlay.insert(&key, &value).expect("insert");
 
-                commit_remote(&mut tree, &mut remote_tree);
+                commit_remote(&mut overlay, &mut remote_tree);
             }
             tests::OpKind::Remove => {
                 let key = op.key.unwrap();
 
                 if let Some(ref mut remote_tree) = remote_tree {
-                    remote_tree
-                        .remove(Context::background(), &key)
-                        .expect("remove");
-                    let value = remote_tree
-                        .get(Context::background(), &key)
-                        .expect("get (after remove)");
+                    // If we want a mutable remote synced tree, we must use an overlay.
+                    let mut overlay = OverlayTree::new(remote_tree);
+
+                    overlay.remove(&key).expect("remove");
+                    let value = overlay.get(&key).expect("get (after remove)");
                     assert!(value.is_none(), "get (after remove) should return None");
                 }
 
-                tree.remove(Context::background(), &key).expect("remove");
-                let value = tree
-                    .get(Context::background(), &key)
-                    .expect("get (after remove)");
+                overlay.remove(&key).expect("remove");
+                let value = overlay.get(&key).expect("get (after remove)");
                 assert!(value.is_none(), "get (after remove) should return None");
 
-                commit_remote(&mut tree, &mut remote_tree);
+                commit_remote(&mut overlay, &mut remote_tree);
             }
             tests::OpKind::Get => {
-                let value = tree
-                    .get(Context::background(), &op.key.unwrap())
-                    .expect("get");
+                let value = overlay.get(&op.key.unwrap()).expect("get");
                 assert_eq!(value, op.value, "get should return the correct value");
             }
             tests::OpKind::IteratorSeek => {
@@ -1067,11 +830,11 @@ fn test_special_case_from_json(fixture: &'static str) {
                 let value = op.value.as_ref();
 
                 if let Some(ref mut remote_tree) = remote_tree {
-                    let mut it = remote_tree.iter(Context::background());
+                    let mut it = remote_tree.iter();
                     it.seek(&key);
                     assert!(it.error().is_none(), "seek");
 
-                    let item = Iterator::next(&mut it);
+                    let item = iter::Iterator::next(&mut it);
                     assert_eq!(
                         expected_key,
                         item.as_ref().map(|p| &p.0),
@@ -1084,11 +847,11 @@ fn test_special_case_from_json(fixture: &'static str) {
                     );
                 }
 
-                let mut it = tree.iter(Context::background());
+                let mut it = overlay.iter();
                 it.seek(&key);
                 assert!(it.error().is_none(), "seek");
 
-                let item = Iterator::next(&mut it);
+                let item = iter::Iterator::next(&mut it);
                 assert_eq!(
                     expected_key,
                     item.as_ref().map(|p| &p.0),

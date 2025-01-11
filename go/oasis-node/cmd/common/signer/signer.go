@@ -98,22 +98,25 @@ func doNewFactory(signerBackend, signerDir string, roles ...signature.SignerRole
 		config := &remoteSigner.FactoryConfig{
 			Address: viper.GetString(cfgSignerRemoteAddress),
 		}
-		clientCert, err := tls.Load(
-			viper.GetString(cfgSignerRemoteClientCert),
-			viper.GetString(cfgSignerRemoteClientKey),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load client certificate: %w", err)
-		}
-		config.ClientCertificate = clientCert
 
-		serverCert, err := tls.LoadCertificate(viper.GetString(cfgSignerRemoteServerCert))
-		if err != nil {
-			return nil, fmt.Errorf("failed to load server certificate: %w", err)
-		}
-		config.ServerCertificate = serverCert
+		if !config.IsLocal() {
+			clientCert, err := tls.Load(
+				viper.GetString(cfgSignerRemoteClientCert),
+				viper.GetString(cfgSignerRemoteClientKey),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load client certificate: %w", err)
+			}
+			config.ClientCertificate = clientCert
 
-		return remoteSigner.NewFactory(config, roles...)
+			serverCert, err := tls.LoadCertificate(viper.GetString(cfgSignerRemoteServerCert))
+			if err != nil {
+				return nil, fmt.Errorf("failed to load server certificate: %w", err)
+			}
+			config.ServerCertificate = serverCert
+		}
+
+		return remoteSigner.NewFactory(config)
 	case pluginSigner.SignerName:
 		config := &pluginSigner.FactoryConfig{
 			Name:   viper.GetString(cfgSignerPluginName),

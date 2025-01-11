@@ -7,100 +7,162 @@ import (
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	"github.com/oasisprotocol/oasis-core/go/roothash/api/message"
 )
 
 func TestConsistentHash(t *testing.T) {
-	// NOTE: These hashes MUST be synced with runtime/src/common/roothash.rs.
+	// NOTE: These hashes MUST be synced with runtime/src/common/roothash/commitment/executor.rs.
 	var emptyHeaderHash hash.Hash
 	_ = emptyHeaderHash.UnmarshalHex("57d73e02609a00fcf4ca43cbf8c9f12867c46942d246fb2b0bce42cbdb8db844")
 
 	var empty ComputeResultsHeader
-	require.EqualValues(t, emptyHeaderHash, empty.EncodedHash())
+	require.EqualValues(t, emptyHeaderHash.String(), empty.EncodedHash().String())
 
 	var emptyRoot hash.Hash
 	emptyRoot.Empty()
 
 	var populatedHeaderHash hash.Hash
-	_ = populatedHeaderHash.UnmarshalHex("374021bcba44f1014d0d9919e876a1ecd7fe5ec1a92ecf9c8b313cd4976fbc01")
+	_ = populatedHeaderHash.UnmarshalHex("8459a9e6e3341cd2df5ada5737469a505baf92397aaa88b7100915324506d843")
 
 	populated := ComputeResultsHeader{
-		Round:        42,
-		PreviousHash: emptyHeaderHash,
-		IORoot:       &emptyRoot,
-		StateRoot:    &emptyRoot,
-		Messages:     nil,
+		Round:          42,
+		PreviousHash:   emptyHeaderHash,
+		IORoot:         &emptyRoot,
+		StateRoot:      &emptyRoot,
+		MessagesHash:   &emptyRoot,
+		InMessagesHash: &emptyRoot,
 	}
-	require.EqualValues(t, populatedHeaderHash, populated.EncodedHash())
+	require.EqualValues(t, populatedHeaderHash.String(), populated.EncodedHash().String())
 }
 
 func TestValidateBasic(t *testing.T) {
+	// NOTE: These hashes MUST be synced with runtime/src/common/roothash/commitment/executor.rs.
 	var emptyRoot hash.Hash
 	emptyRoot.Empty()
 
 	var emptyHeaderHash hash.Hash
 	_ = emptyHeaderHash.UnmarshalHex("57d73e02609a00fcf4ca43cbf8c9f12867c46942d246fb2b0bce42cbdb8db844")
 
-	body := ComputeBody{
-		Header: ComputeResultsHeader{
-			Round:        42,
-			PreviousHash: emptyHeaderHash,
-			IORoot:       &emptyRoot,
-			StateRoot:    &emptyRoot,
-			Messages:     nil,
+	body := ExecutorCommitment{
+		Header: ExecutorCommitmentHeader{
+			Header: ComputeResultsHeader{
+				Round:          42,
+				PreviousHash:   emptyHeaderHash,
+				IORoot:         &emptyRoot,
+				StateRoot:      &emptyRoot,
+				MessagesHash:   &emptyRoot,
+				InMessagesHash: &emptyRoot,
+			},
+			RAKSignature: &signature.RawSignature{},
 		},
-		TxnSchedSig:       signature.Signature{},
-		InputRoot:         emptyRoot,
-		StorageSignatures: []signature.Signature{{}},
-		RakSig:            &signature.RawSignature{},
+		Messages: nil,
 	}
 
 	for _, tc := range []struct {
 		name      string
-		fn        func(ComputeBody) ComputeBody
+		fn        func(ExecutorCommitment) ExecutorCommitment
 		shouldErr bool
 	}{
 		{
 			"Ok",
-			func(b ComputeBody) ComputeBody { return b },
+			func(ec ExecutorCommitment) ExecutorCommitment { return ec },
 			false,
 		},
 		{
 			"Bad IORoot",
-			func(b ComputeBody) ComputeBody {
-				b.Header.IORoot = nil
-				return b
+			func(ec ExecutorCommitment) ExecutorCommitment {
+				ec.Header.Header.IORoot = nil
+				return ec
 			},
 			true,
 		},
 		{
 			"Bad StateRoot",
-			func(b ComputeBody) ComputeBody {
-				b.Header.StateRoot = nil
-				return b
+			func(ec ExecutorCommitment) ExecutorCommitment {
+				ec.Header.Header.StateRoot = nil
+				return ec
+			},
+			true,
+		},
+		{
+			"Bad MessagesHash",
+			func(ec ExecutorCommitment) ExecutorCommitment {
+				ec.Header.Header.MessagesHash = nil
+				return ec
+			},
+			true,
+		},
+		{
+			"Bad runtime messages",
+			func(ec ExecutorCommitment) ExecutorCommitment {
+				ec.Messages = []message.Message{
+					{}, // A message without any variant is invalid.
+				}
+				return ec
 			},
 			true,
 		},
 		{
 			"Bad Failure",
-			func(b ComputeBody) ComputeBody {
-				b.SetFailure(10)
-				return b
+			func(ec ExecutorCommitment) ExecutorCommitment {
+				ec.Header.SetFailure(10)
+				return ec
 			},
 			true,
 		},
 		{
-			"Bad Failure",
-			func(b ComputeBody) ComputeBody {
-				b.Failure = FailureStorageUnavailable
-				return b
+			"Bad Failure (existing IORoot)",
+			func(ec ExecutorCommitment) ExecutorCommitment {
+				ec.Header.Failure = FailureUnknown
+				// ec.Header.IORoot is set.
+				ec.Header.Header.StateRoot = nil
+				ec.Header.Header.MessagesHash = nil
+				ec.Header.Header.InMessagesHash = nil
+				return ec
+			},
+			true,
+		},
+		{
+			"Bad Failure (existing StateRoot)",
+			func(ec ExecutorCommitment) ExecutorCommitment {
+				ec.Header.Failure = FailureUnknown
+				ec.Header.Header.IORoot = nil
+				// ec.Header.StateRoot is set.
+				ec.Header.Header.MessagesHash = nil
+				ec.Header.Header.InMessagesHash = nil
+				return ec
+			},
+			true,
+		},
+		{
+			"Bad Failure (existing MessagesHash)",
+			func(ec ExecutorCommitment) ExecutorCommitment {
+				ec.Header.Failure = FailureUnknown
+				ec.Header.Header.IORoot = nil
+				ec.Header.Header.StateRoot = nil
+				// ec.Header.MessagesHash is set.
+				ec.Header.Header.InMessagesHash = nil
+				return ec
+			},
+			true,
+		},
+		{
+			"Bad Failure (existing InMessagesHash)",
+			func(ec ExecutorCommitment) ExecutorCommitment {
+				ec.Header.Failure = FailureUnknown
+				ec.Header.Header.IORoot = nil
+				ec.Header.Header.StateRoot = nil
+				ec.Header.Header.MessagesHash = nil
+				// ec.Header.InMessagesHash is set.
+				return ec
 			},
 			true,
 		},
 		{
 			"Ok Failure",
-			func(b ComputeBody) ComputeBody {
-				b.SetFailure(FailureStorageUnavailable)
-				return b
+			func(ec ExecutorCommitment) ExecutorCommitment {
+				ec.Header.SetFailure(FailureUnknown)
+				return ec
 			},
 			false,
 		},

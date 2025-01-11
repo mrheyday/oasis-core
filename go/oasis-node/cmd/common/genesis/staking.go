@@ -5,8 +5,8 @@ package genesis
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math/big"
+	"os"
 
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
@@ -35,9 +35,9 @@ func (st *AppendableStakingState) AppendTo(doc *genesis.Document) error {
 		}
 		entAddr := staking.NewAddress(ent.ID)
 
-		// Ok then, we hold the world ransom for One Hundred Billion Dollars.
+		// Ok then, we hold the world ransom for One Million Billion Yen.
 		var q quantity.Quantity
-		if err = q.FromBigInt(big.NewInt(100000000000)); err != nil {
+		if err = q.FromBigInt(big.NewInt(1_000_000_000_000_000)); err != nil {
 			return fmt.Errorf("genesis/staking: failed to allocate test entity stake: %w", err)
 		}
 
@@ -81,16 +81,16 @@ func (st *AppendableStakingState) AppendTo(doc *genesis.Document) error {
 	// Set zero thresholds for all staking kinds, if none set.
 	if len(st.State.Parameters.Thresholds) == 0 {
 		sq := *quantity.NewFromUint64(0)
-		st.State.Parameters.Thresholds =
-			map[staking.ThresholdKind]quantity.Quantity{
-				staking.KindEntity:            sq,
-				staking.KindNodeValidator:     sq,
-				staking.KindNodeCompute:       sq,
-				staking.KindNodeStorage:       sq,
-				staking.KindNodeKeyManager:    sq,
-				staking.KindRuntimeCompute:    sq,
-				staking.KindRuntimeKeyManager: sq,
-			}
+		st.State.Parameters.Thresholds = map[staking.ThresholdKind]quantity.Quantity{
+			staking.KindEntity:            sq,
+			staking.KindNodeValidator:     sq,
+			staking.KindNodeCompute:       sq,
+			staking.KindNodeObserver:      sq,
+			staking.KindNodeKeyManager:    sq,
+			staking.KindRuntimeCompute:    sq,
+			staking.KindRuntimeKeyManager: sq,
+			staking.KindKeyManagerChurp:   sq,
+		}
 	}
 
 	doc.Staking = st.State
@@ -112,6 +112,9 @@ func NewAppendableStakingState() (*AppendableStakingState, error) {
 	st := &AppendableStakingState{
 		State: staking.Genesis{
 			Ledger: make(map[staking.Address]*staking.Account),
+			Parameters: staking.ConsensusParameters{
+				DebondingInterval: 1, // Minimum valid debonding interval.
+			},
 		},
 	}
 	if err := st.setDefaultFeeSplit(); err != nil {
@@ -129,7 +132,7 @@ func NewAppendableStakingStateFromFile(path string) (*AppendableStakingState, er
 		return nil, err
 	}
 
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("genesis/staking: failed to load staking genesis state: %w", err)
 	}

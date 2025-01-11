@@ -3,9 +3,7 @@ package node
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,10 +16,10 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	fileSigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/file"
-	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
@@ -34,7 +32,6 @@ import (
 const (
 	CfgEntityID         = "node.entity_id"
 	CfgExpiration       = "node.expiration"
-	CfgTLSAddress       = "node.tls_address"
 	CfgP2PAddress       = "node.p2p_address"
 	CfgConsensusAddress = "node.consensus_address"
 	CfgRole             = "node.role"
@@ -42,39 +39,42 @@ const (
 	CfgNodeRuntimeID    = "node.runtime.id"
 
 	optRoleComputeWorker = "compute-worker"
-	optRoleStorageWorker = "storage-worker"
 	optRoleKeyManager    = "key-manager"
 	optRoleValidator     = "validator"
 
 	NodeGenesisFilename = "node_genesis.json"
 
-	maskCommitteeMember = node.RoleComputeWorker | node.RoleStorageWorker | node.RoleKeyManager
+	maskCommitteeMember = node.RoleComputeWorker | node.RoleKeyManager
 )
 
 var (
 	flags = flag.NewFlagSet("", flag.ContinueOnError)
 
 	nodeCmd = &cobra.Command{
-		Use:   "node",
-		Short: "node registry backend utilities",
+		Use:        "node",
+		Short:      "node registry backend utilities",
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	initCmd = &cobra.Command{
-		Use:   "init",
-		Short: "initialize a node",
-		Run:   doInit,
+		Use:        "init",
+		Short:      "initialize a node",
+		Run:        doInit,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	listCmd = &cobra.Command{
-		Use:   "list",
-		Short: "list registered nodes",
-		Run:   doList,
+		Use:        "list",
+		Short:      "list registered nodes",
+		Run:        doList,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	isRegisteredCmd = &cobra.Command{
-		Use:   "is-registered",
-		Short: "check whether the node is registered",
-		Run:   doIsRegistered,
+		Use:        "is-registered",
+		Short:      "check whether the node is registered",
+		Run:        doIsRegistered,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	logger = logging.GetLogger("cmd/registry/node")
@@ -93,7 +93,7 @@ func doConnect(cmd *cobra.Command) (*grpc.ClientConn, registry.Backend) {
 	return conn, client
 }
 
-func doInit(cmd *cobra.Command, args []string) { // nolint: gocyclo
+func doInit(*cobra.Command, []string) { // nolint: gocyclo
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -106,62 +106,27 @@ func doInit(cmd *cobra.Command, args []string) { // nolint: gocyclo
 		os.Exit(1)
 	}
 
-	// Get the entity ID or entity.
-	var (
-		entityDir string
-		entityID  signature.PublicKey
+	// Get the entity ID.
+	var entityID signature.PublicKey
 
-		entity       *entity.Entity
-		entitySigner signature.Signer
-
-		isSelfSigned bool
-	)
-
-	if idStr := viper.GetString(CfgEntityID); idStr != "" {
-		if err = entityID.UnmarshalText([]byte(idStr)); err != nil {
-			logger.Error("malformed entity ID",
-				"err", err,
-			)
-			os.Exit(1)
-		}
-		logger.Info("entity ID provided, assuming self-signed node registrations")
-
-		isSelfSigned = true
-	} else {
-		entityDir, err = cmdSigner.CLIDirOrPwd()
-		if err != nil {
-			logger.Error("failed to retrieve entity dir",
-				"err", err,
-			)
-			os.Exit(1)
-		}
-		entity, entitySigner, err = cmdCommon.LoadEntity(cmdSigner.Backend(), entityDir)
-		if err != nil {
-			logger.Error("failed to load entity",
-				"err", err,
-			)
-			os.Exit(1)
-		}
-
-		entityID = entity.ID
-		isSelfSigned = !entity.AllowEntitySignedNodes
-		if viper.GetBool(CfgSelfSigned) {
-			isSelfSigned = true
-		}
-		if !cmdFlags.DebugDontBlameOasis() && !isSelfSigned {
-			logger.Error("entity signed node descriptors are prohibited")
-			os.Exit(1)
-		}
-		defer entitySigner.Reset()
+	idStr := viper.GetString(CfgEntityID)
+	if idStr == "" {
+		logger.Error("missing --node.entity_id command-line argument")
+		os.Exit(1)
 	}
+	if err = entityID.UnmarshalText([]byte(idStr)); err != nil {
+		logger.Error("malformed entity ID",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	logger.Info("entity ID provided, assuming self-signed node registrations")
 
 	// Provision the node identity.
 	nodeSignerFactory, err := cmdSigner.NewFactory(
 		cmdSigner.Backend(),
 		dataDir,
-		signature.SignerNode,
-		signature.SignerP2P,
-		signature.SignerConsensus,
+		identity.RequiredSignerRoles...,
 	)
 	if err != nil {
 		logger.Error("failed to initialize signer backend",
@@ -169,17 +134,12 @@ func doInit(cmd *cobra.Command, args []string) { // nolint: gocyclo
 		)
 		os.Exit(1)
 	}
-	nodeIdentity, err := identity.LoadOrGenerate(dataDir, nodeSignerFactory, false)
+	nodeIdentity, err := identity.LoadOrGenerate(dataDir, nodeSignerFactory)
 	if err != nil {
 		logger.Error("failed to load or generate node identity",
 			"err", err,
 		)
 		os.Exit(1)
-	}
-
-	var nextPubKey signature.PublicKey
-	if s := nodeIdentity.GetNextTLSSigner(); s != nil {
-		nextPubKey = s.Public()
 	}
 
 	n := &node.Node{
@@ -188,8 +148,7 @@ func doInit(cmd *cobra.Command, args []string) { // nolint: gocyclo
 		EntityID:   entityID,
 		Expiration: viper.GetUint64(CfgExpiration),
 		TLS: node.TLSInfo{
-			PubKey:     nodeIdentity.GetTLSSigner().Public(),
-			NextPubKey: nextPubKey,
+			PubKey: nodeIdentity.TLSSigner.Public(),
 		},
 		P2P: node.P2PInfo{
 			ID: nodeIdentity.P2PSigner.Public(),
@@ -197,6 +156,10 @@ func doInit(cmd *cobra.Command, args []string) { // nolint: gocyclo
 		Consensus: node.ConsensusInfo{
 			ID: nodeIdentity.ConsensusSigner.Public(),
 		},
+		VRF: node.VRFInfo{
+			ID: nodeIdentity.VRFSigner.Public(),
+		},
+		SoftwareVersion: node.SoftwareVersion(version.SoftwareVersion),
 	}
 	if n.Roles, err = argsToRolesMask(); err != nil {
 		logger.Error("failed to parse node roles mask",
@@ -218,22 +181,6 @@ func doInit(cmd *cobra.Command, args []string) { // nolint: gocyclo
 		n.Runtimes = append(n.Runtimes, runtime)
 	}
 
-	for _, v := range viper.GetStringSlice(CfgTLSAddress) {
-		var tlsAddr node.TLSAddress
-		if tlsAddrErr := tlsAddr.UnmarshalText([]byte(v)); tlsAddrErr != nil {
-			if addrErr := tlsAddr.Address.UnmarshalText([]byte(v)); addrErr != nil {
-				logger.Error("failed to parse node's TLS address",
-					"addrErr", addrErr,
-					"tlsAddrErr", tlsAddrErr,
-					"addr", v,
-				)
-				os.Exit(1)
-			}
-			tlsAddr.PubKey = n.TLS.PubKey
-		}
-		n.TLS.Addresses = append(n.TLS.Addresses, tlsAddr)
-	}
-
 	for _, v := range viper.GetStringSlice(CfgP2PAddress) {
 		var addr node.Address
 		if err = addr.UnmarshalText([]byte(v)); err != nil {
@@ -245,8 +192,13 @@ func doInit(cmd *cobra.Command, args []string) { // nolint: gocyclo
 		}
 		n.P2P.Addresses = append(n.P2P.Addresses, addr)
 	}
-	if n.HasRoles(maskCommitteeMember) && (len(n.TLS.Addresses) == 0 || len(n.P2P.Addresses) == 0) {
-		logger.Error("nodes that are committee members require at least 1 TLS and 1 P2P address")
+	if len(n.P2P.Addresses) == 0 {
+		logger.Error("all nodes require at least 1 P2P address")
+		os.Exit(1)
+	}
+
+	if n.HasRoles(maskCommitteeMember) && len(n.P2P.Addresses) == 0 {
+		logger.Error("nodes that are committee members require at least 1 P2P address")
 		os.Exit(1)
 	}
 
@@ -275,15 +227,13 @@ func doInit(cmd *cobra.Command, args []string) { // nolint: gocyclo
 	}
 
 	// Sign and write out the genesis node registration.
-	signers := []signature.Signer{nodeIdentity.NodeSigner}
-	if !isSelfSigned {
-		signers = append(signers, entitySigner)
-	}
-	signers = append(signers, []signature.Signer{
+	signers := []signature.Signer{
+		nodeIdentity.NodeSigner,
 		nodeIdentity.P2PSigner,
 		nodeIdentity.ConsensusSigner,
-		nodeIdentity.GetTLSSigner(),
-	}...)
+		nodeIdentity.VRFSigner,
+		nodeIdentity.TLSSigner,
+	}
 
 	signed, err := node.MultiSignNode(signers, registry.RegisterGenesisNodeSignatureContext, n)
 	if err != nil {
@@ -292,8 +242,14 @@ func doInit(cmd *cobra.Command, args []string) { // nolint: gocyclo
 		)
 		os.Exit(1)
 	}
-	b, _ := json.Marshal(signed)
-	if err = ioutil.WriteFile(filepath.Join(dataDir, NodeGenesisFilename), b, 0o600); err != nil {
+	prettySigned, err := cmdCommon.PrettyJSONMarshal(signed)
+	if err != nil {
+		logger.Error("failed to get pretty JSON of signed node genesis registration",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	if err = os.WriteFile(filepath.Join(dataDir, NodeGenesisFilename), prettySigned, 0o600); err != nil {
 		logger.Error("failed to write signed node genesis registration",
 			"err", err,
 		)
@@ -308,8 +264,6 @@ func argsToRolesMask() (node.RolesMask, error) {
 		switch v {
 		case optRoleComputeWorker:
 			rolesMask |= node.RoleComputeWorker
-		case optRoleStorageWorker:
-			rolesMask |= node.RoleStorageWorker
 		case optRoleKeyManager:
 			rolesMask |= node.RoleKeyManager
 		case optRoleValidator:
@@ -321,7 +275,7 @@ func argsToRolesMask() (node.RolesMask, error) {
 	return rolesMask, nil
 }
 
-func doList(cmd *cobra.Command, args []string) {
+func doList(cmd *cobra.Command, _ []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -338,20 +292,28 @@ func doList(cmd *cobra.Command, args []string) {
 	}
 
 	for _, node := range nodes {
-		var s string
+		var nodeString string
 		switch cmdFlags.Verbose() {
 		case true:
-			b, _ := json.Marshal(node)
-			s = string(b)
+			prettyNode, err := cmdCommon.PrettyJSONMarshal(node)
+			if err != nil {
+				logger.Error("failed to get pretty JSON of node",
+					"err", err,
+					"node ID", node.ID.String(),
+				)
+				nodeString = fmt.Sprintf("[invalid pretty JSON for node %s]", node.ID)
+			} else {
+				nodeString = string(prettyNode)
+			}
 		default:
-			s = node.ID.String()
+			nodeString = node.ID.String()
 		}
 
-		fmt.Printf("%v\n", s)
+		fmt.Println(nodeString)
 	}
 }
 
-func doIsRegistered(cmd *cobra.Command, args []string) {
+func doIsRegistered(cmd *cobra.Command, _ []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -365,7 +327,7 @@ func doIsRegistered(cmd *cobra.Command, args []string) {
 	}
 
 	// Load node's identity.
-	nodeSignerFactory, err := fileSigner.NewFactory(dataDir, signature.SignerNode, signature.SignerP2P, signature.SignerConsensus)
+	nodeSignerFactory, err := fileSigner.NewFactory(dataDir, identity.RequiredSignerRoles...)
 	if err != nil {
 		logger.Error("failed to create node identity signer factory",
 			"err", err,
@@ -426,7 +388,6 @@ func Register(parentCmd *cobra.Command) {
 func init() {
 	flags.String(CfgEntityID, "", "Entity ID that controls this node")
 	flags.Uint64(CfgExpiration, 0, "Epoch that the node registration should expire")
-	flags.StringSlice(CfgTLSAddress, nil, "Address(es) the node can be reached over TLS of the form [PubKey@]ip:port (where PubKey@ part is optional and represents base64 encoded node TLS public key)")
 	flags.StringSlice(CfgP2PAddress, nil, "Address(es) the node can be reached over the P2P transport")
 	flags.StringSlice(CfgConsensusAddress, nil, "Address(es) the node can be reached as a consensus member of the form [ID@]ip:port (where the ID@ part is optional and ID represents the node's public key)")
 	flags.StringSlice(CfgRole, nil, "Role(s) of the node.  Supported values are \"compute-worker\", \"storage-worker\", \"transaction-scheduler\", \"key-manager\", \"merge-worker\", and \"validator\"")

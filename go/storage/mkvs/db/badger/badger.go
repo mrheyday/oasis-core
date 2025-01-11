@@ -7,8 +7,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v4"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	cmnBadger "github.com/oasisprotocol/oasis-core/go/common/badger"
@@ -22,7 +21,7 @@ import (
 )
 
 const (
-	dbVersion = 3
+	dbVersion = 5
 
 	// multipartVersionNone is the value used for the multipart version in metadata
 	// when no multipart restore is in progress.
@@ -30,36 +29,43 @@ const (
 )
 
 var (
+	// keyFormat is the namespace for the badger database key formats.
+	keyFormat = keyformat.NewNamespace("badger")
+
 	// nodeKeyFmt is the key format for nodes (node hash).
 	//
 	// Value is serialized node.
-	nodeKeyFmt = keyformat.New(0x00, &hash.Hash{})
+	nodeKeyFmt = keyFormat.New(0x00, &hash.Hash{})
 	// writeLogKeyFmt is the key format for write logs (version, new root,
 	// old root).
 	//
 	// Value is CBOR-serialized write log.
-	writeLogKeyFmt = keyformat.New(0x01, uint64(0), &hash.Hash{}, &hash.Hash{})
+	writeLogKeyFmt = keyFormat.New(0x01, uint64(0), &api.TypedHash{}, &api.TypedHash{})
 	// rootsMetadataKeyFmt is the key format for roots metadata. The key format is (version).
 	//
 	// Value is CBOR-serialized rootsMetadata.
-	rootsMetadataKeyFmt = keyformat.New(0x02, uint64(0))
+	rootsMetadataKeyFmt = keyFormat.New(0x02, uint64(0))
 	// rootUpdatedNodesKeyFmt is the key format for the pending updated nodes for the
 	// given root that need to be removed only in case the given root is not among
 	// the finalized roots. They key format is (version, root).
 	//
 	// Value is CBOR-serialized []updatedNode.
-	rootUpdatedNodesKeyFmt = keyformat.New(0x03, uint64(0), &hash.Hash{})
+	rootUpdatedNodesKeyFmt = keyFormat.New(0x03, uint64(0), &api.TypedHash{})
 	// metadataKeyFmt is the key format for metadata.
 	//
 	// Value is CBOR-serialized metadata.
-	metadataKeyFmt = keyformat.New(0x04)
+	metadataKeyFmt = keyFormat.New(0x04)
 	// multipartRestoreNodeLogKeyFmt is the key format for the nodes inserted during a chunk restore.
 	// Once a set of chunks is fully restored, these entries should be removed. If chunk restoration
 	// is interrupted for any reason, the nodes associated with these keys should be removed, along
 	// with these entries.
 	//
 	// Value is empty.
-	multipartRestoreNodeLogKeyFmt = keyformat.New(0x05, &hash.Hash{})
+	multipartRestoreNodeLogKeyFmt = keyFormat.New(0x05, &api.TypedHash{})
+	// rootNodeKeyFmt is the key format for root nodes (typed node hash).
+	//
+	// Value is empty.
+	rootNodeKeyFmt = keyFormat.New(0x06, &api.TypedHash{})
 )
 
 // New creates a new BadgerDB-backed node database.
@@ -70,22 +76,7 @@ func New(cfg *api.Config) (api.NodeDB, error) {
 		readOnly:         cfg.ReadOnly,
 		discardWriteLogs: cfg.DiscardWriteLogs,
 	}
-
-	opts := badger.DefaultOptions(cfg.DB)
-	opts = opts.WithLogger(cmnBadger.NewLogAdapter(db.logger))
-	opts = opts.WithSyncWrites(!cfg.NoFsync)
-	// Allow value log truncation if required (this is needed to recover the
-	// value log file which can get corrupted in crashes).
-	opts = opts.WithTruncate(true)
-	opts = opts.WithCompression(options.Snappy)
-	opts = opts.WithBlockCacheSize(cfg.MaxCacheSize)
-	opts = opts.WithReadOnly(cfg.ReadOnly)
-	opts = opts.WithDetectConflicts(false)
-
-	if cfg.MemoryOnly {
-		db.logger.Warn("using memory-only mode, data will not be persisted")
-		opts = opts.WithInMemory(true).WithDir("").WithValueDir("")
-	}
+	opts := commonConfigToBadgerOptions(cfg, db)
 
 	var err error
 	if db.db, err = badger.OpenManaged(opts); err != nil {
@@ -108,6 +99,7 @@ func New(cfg *api.Config) (api.NodeDB, error) {
 	}
 
 	db.gc = cmnBadger.NewGCWorker(db.logger, db.db)
+	db.gc.Start()
 
 	return db, nil
 }
@@ -137,6 +129,12 @@ type badgerNodeDB struct { // nolint: maligned
 func (d *badgerNodeDB) load() error {
 	tx := d.db.NewTransactionAt(tsMetadata, true)
 	defer tx.Discard()
+
+	// Check first if the database is even usable.
+	_, err := tx.Get(migrationMetaKeyFmt.Encode())
+	if err == nil {
+		return api.ErrUpgradeInProgress
+	}
 
 	// Load metadata.
 	item, err := tx.Get(metadataKeyFmt.Encode())
@@ -186,6 +184,22 @@ func (d *badgerNodeDB) sanityCheckNamespace(ns common.Namespace) error {
 	return nil
 }
 
+func (d *badgerNodeDB) checkRoot(txn *badger.Txn, root node.Root) error {
+	rootHash := api.TypedHashFromRoot(root)
+	if _, err := txn.Get(rootNodeKeyFmt.Encode(&rootHash)); err != nil {
+		switch err {
+		case badger.ErrKeyNotFound:
+			return api.ErrRootNotFound
+		default:
+			d.logger.Error("failed to check root existence",
+				"err", err,
+			)
+			return fmt.Errorf("mkvs/badger: failed to check root existence while getting node from backing store: %w", err)
+		}
+	}
+	return nil
+}
+
 // Assumes metaUpdateLock is held when called.
 func (d *badgerNodeDB) cleanMultipartLocked(removeNodes bool) error {
 	var version uint64
@@ -208,10 +222,8 @@ func (d *badgerNodeDB) cleanMultipartLocked(removeNodes bool) error {
 	it := txn.NewIterator(opts)
 	defer it.Close()
 
-	metaBatch := d.db.NewWriteBatchAt(tsMetadata)
-	defer metaBatch.Cancel()
-	nodeBatch := d.db.NewWriteBatchAt(versionToTs(version))
-	defer nodeBatch.Cancel()
+	batch := d.db.NewWriteBatchAt(versionToTs(version))
+	defer batch.Cancel()
 
 	var logged bool
 	for it.Rewind(); it.Valid(); it.Next() {
@@ -221,25 +233,30 @@ func (d *badgerNodeDB) cleanMultipartLocked(removeNodes bool) error {
 				d.logger.Info("removing some nodes from a multipart restore")
 				logged = true
 			}
-			var hash hash.Hash
+			var hash api.TypedHash
 			if !multipartRestoreNodeLogKeyFmt.Decode(key, &hash) {
 				panic("mkvs/badger: bad iterator")
 			}
-			if err := nodeBatch.Delete(nodeKeyFmt.Encode(&hash)); err != nil {
-				return err
+			switch hash.Type() {
+			case node.RootTypeInvalid:
+				h := hash.Hash()
+				if err := batch.Delete(nodeKeyFmt.Encode(&h)); err != nil {
+					return err
+				}
+			default:
+				if err := batch.Delete(rootNodeKeyFmt.Encode(&hash)); err != nil {
+					return err
+				}
 			}
 		}
-		if err := metaBatch.Delete(key); err != nil {
+		if err := batch.DeleteAt(key, tsMetadata); err != nil {
 			return err
 		}
 	}
 
-	// Flush both batches first. If anything fails, having corrupt
+	// Flush batch first. If anything fails, having corrupt
 	// multipart info in d.meta shouldn't hurt us next run.
-	if err := nodeBatch.Flush(); err != nil {
-		return err
-	}
-	if err := metaBatch.Flush(); err != nil {
+	if err := batch.Flush(); err != nil {
 		return err
 	}
 
@@ -271,6 +288,12 @@ func (d *badgerNodeDB) GetNode(root node.Root, ptr *node.Pointer) (node.Node, er
 
 	tx := d.db.NewTransactionAt(versionToTs(root.Version), false)
 	defer tx.Discard()
+
+	// Check if the root actually exists.
+	if err := d.checkRoot(tx, root); err != nil {
+		return nil, err
+	}
+
 	item, err := tx.Get(nodeKeyFmt.Encode(&ptr.Hash))
 	switch err {
 	case nil:
@@ -321,6 +344,11 @@ func (d *badgerNodeDB) GetWriteLog(ctx context.Context, startRoot, endRoot node.
 		}
 	}()
 
+	// Check if the root actually exists.
+	if err := d.checkRoot(tx, endRoot); err != nil {
+		return nil, err
+	}
+
 	// Start at the end root and search towards the start root. This assumes that the
 	// chains are not long and that there is not a lot of forks as in that case performance
 	// would suffer.
@@ -334,13 +362,14 @@ func (d *badgerNodeDB) GetWriteLog(ctx context.Context, startRoot, endRoot node.
 
 	type wlItem struct {
 		depth       uint8
-		endRootHash hash.Hash
+		endRootHash api.TypedHash
 		logKeys     [][]byte
-		logRoots    []hash.Hash
+		logRoots    []api.TypedHash
 	}
 	// NOTE: We could use a proper deque, but as long as we keep the number of hops and
 	//       forks low, this should not be a problem.
-	queue := []*wlItem{{depth: 0, endRootHash: endRoot.Hash}}
+	queue := []*wlItem{{depth: 0, endRootHash: api.TypedHashFromRoot(endRoot)}}
+	startRootHash := api.TypedHashFromRoot(startRoot)
 	for len(queue) > 0 {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -363,8 +392,8 @@ func (d *badgerNodeDB) GetWriteLog(ctx context.Context, startRoot, endRoot node.
 				item := it.Item()
 
 				var decVersion uint64
-				var decEndRootHash hash.Hash
-				var decStartRootHash hash.Hash
+				var decEndRootHash api.TypedHash
+				var decStartRootHash api.TypedHash
 
 				if !writeLogKeyFmt.Decode(item.Key(), &decVersion, &decEndRootHash, &decStartRootHash) {
 					// This should not happen as the Badger iterator should take care of it.
@@ -379,7 +408,7 @@ func (d *badgerNodeDB) GetWriteLog(ctx context.Context, startRoot, endRoot node.
 					logKeys:  append(curItem.logKeys, item.KeyCopy(nil)),
 					logRoots: append(curItem.logRoots, curItem.endRootHash),
 				}
-				if nextItem.endRootHash.Equal(&startRoot.Hash) {
+				if nextItem.endRootHash.Equal(&startRootHash) {
 					// Path has been found, deserialize and stream write logs.
 					var index int
 					discardTx = false
@@ -395,7 +424,8 @@ func (d *badgerNodeDB) GetWriteLog(ctx context.Context, startRoot, endRoot node.
 							root := node.Root{
 								Namespace: endRoot.Namespace,
 								Version:   endRoot.Version,
-								Hash:      nextItem.logRoots[index],
+								Type:      nextItem.logRoots[index].Type(),
+								Hash:      nextItem.logRoots[index].Hash(),
 							}
 
 							item, err := tx.Get(key)
@@ -442,16 +472,15 @@ func (d *badgerNodeDB) GetWriteLog(ctx context.Context, startRoot, endRoot node.
 	return nil, api.ErrWriteLogNotFound
 }
 
-func (d *badgerNodeDB) GetLatestVersion(ctx context.Context) (uint64, error) {
-	version, _ := d.meta.getLastFinalizedVersion()
-	return version, nil
+func (d *badgerNodeDB) GetLatestVersion() (uint64, bool) {
+	return d.meta.getLastFinalizedVersion()
 }
 
-func (d *badgerNodeDB) GetEarliestVersion(ctx context.Context) (uint64, error) {
-	return d.meta.getEarliestVersion(), nil
+func (d *badgerNodeDB) GetEarliestVersion() uint64 {
+	return d.meta.getEarliestVersion()
 }
 
-func (d *badgerNodeDB) GetRootsForVersion(ctx context.Context, version uint64) (roots []hash.Hash, err error) {
+func (d *badgerNodeDB) GetRootsForVersion(version uint64) (roots []node.Root, err error) {
 	// If the version is earlier than the earliest version, we don't have the roots.
 	if version < d.meta.getEarliestVersion() {
 		return nil, nil
@@ -466,7 +495,12 @@ func (d *badgerNodeDB) GetRootsForVersion(ctx context.Context, version uint64) (
 	}
 
 	for rootHash := range rootsMeta.Roots {
-		roots = append(roots, rootHash)
+		roots = append(roots, node.Root{
+			Namespace: d.namespace,
+			Version:   version,
+			Type:      rootHash.Type(),
+			Hash:      rootHash.Hash(),
+		})
 	}
 	return
 }
@@ -486,9 +520,6 @@ func (d *badgerNodeDB) HasRoot(root node.Root) bool {
 		return false
 	}
 
-	var emptyHash hash.Hash
-	emptyHash.Empty()
-
 	tx := d.db.NewTransactionAt(tsMetadata, false)
 	defer tx.Discard()
 
@@ -496,13 +527,20 @@ func (d *badgerNodeDB) HasRoot(root node.Root) bool {
 	if err != nil {
 		panic(err)
 	}
-	return rootsMeta.Roots[root.Hash] != nil
+
+	_, exists := rootsMeta.Roots[api.TypedHashFromRoot(root)]
+	return exists
 }
 
-func (d *badgerNodeDB) Finalize(ctx context.Context, version uint64, roots []hash.Hash) error { // nolint: gocyclo
+func (d *badgerNodeDB) Finalize(roots []node.Root) error { // nolint: gocyclo
 	if d.readOnly {
 		return api.ErrReadOnly
 	}
+
+	if len(roots) == 0 {
+		return fmt.Errorf("mkvs/badger: need at least one root to finalize")
+	}
+	version := roots[0].Version
 
 	d.metaUpdateLock.Lock()
 	defer d.metaUpdateLock.Unlock()
@@ -528,11 +566,14 @@ func (d *badgerNodeDB) Finalize(ctx context.Context, version uint64, roots []has
 		return api.ErrAlreadyFinalized
 	}
 
-	// Determine a set of finalized roots. Finalization is transitive, so if
-	// a parent root is finalized the child should be consider finalized too.
-	finalizedRoots := make(map[hash.Hash]bool)
-	for _, rootHash := range roots {
-		finalizedRoots[rootHash] = true
+	// Determine the set of finalized roots. Finalization is transitive, so if
+	// a parent root is finalized the child should be considered finalized too.
+	finalizedRoots := make(map[api.TypedHash]bool)
+	for _, root := range roots {
+		if root.Version != version {
+			return fmt.Errorf("mkvs/badger: roots to finalize don't have matching versions")
+		}
+		finalizedRoots[api.TypedHashFromRoot(root)] = true
 	}
 
 	var rootsChanged bool
@@ -555,6 +596,14 @@ func (d *badgerNodeDB) Finalize(ctx context.Context, version uint64, roots []has
 					updated = true
 				}
 			}
+		}
+	}
+
+	// Sanity check the input roots list.
+	for iroot := range finalizedRoots {
+		h := iroot.Hash()
+		if _, ok := rootsMeta.Roots[iroot]; !ok && !h.IsEmpty() {
+			return api.ErrRootNotFound
 		}
 	}
 
@@ -590,10 +639,10 @@ func (d *badgerNodeDB) Finalize(ctx context.Context, version uint64, roots []has
 				}
 			}
 		} else {
-			// Remove any non-finalized roots. It is safe to remove these nodes
-			// as they can never be resurrected due to the version being part of the
-			// node hash as long as we make sure that these nodes are not shared
-			// with any finalized roots added in the same version.
+			// Remove any non-finalized roots. It is safe to remove these nodes as Badger's version
+			// control will make sure they are not removed if they are resurrected in any later
+			// version as long as we make sure that these nodes are not shared with any finalized
+			// roots added in the same version.
 			for _, n := range updatedNodes {
 				if !n.Removed {
 					maybeLoneNodes[n.Hash] = true
@@ -670,7 +719,7 @@ func (d *badgerNodeDB) Finalize(ctx context.Context, version uint64, roots []has
 	return nil
 }
 
-func (d *badgerNodeDB) Prune(ctx context.Context, version uint64) error {
+func (d *badgerNodeDB) Prune(version uint64) error {
 	if d.readOnly {
 		return api.ErrReadOnly
 	}
@@ -691,6 +740,10 @@ func (d *badgerNodeDB) Prune(ctx context.Context, version uint64) error {
 	if version != d.meta.getEarliestVersion() {
 		return api.ErrNotEarliest
 	}
+	// Make sure that the version that we are trying to prune is not the only finalized version.
+	if version == lastFinalizedVersion {
+		return api.ErrCannotPruneLatestVersion
+	}
 
 	// Remove all roots in version.
 	batch := d.db.NewWriteBatchAt(versionToTs(version))
@@ -703,29 +756,28 @@ func (d *badgerNodeDB) Prune(ctx context.Context, version uint64) error {
 		return err
 	}
 
-	maybeLoneRoots := make(map[hash.Hash]bool)
 	for rootHash, derivedRoots := range rootsMeta.Roots {
-		if len(derivedRoots) == 0 {
-			// Need to only set the flag iff the flag has not already been set
-			// to either value before.
-			if _, ok := maybeLoneRoots[rootHash]; !ok {
-				maybeLoneRoots[rootHash] = true
-			}
-		} else {
-			maybeLoneRoots[rootHash] = false
-		}
-	}
-	for rootHash, isLone := range maybeLoneRoots {
-		if !isLone {
+		if len(derivedRoots) > 0 {
+			// Not a lone root.
 			continue
 		}
 
 		// Traverse the root and prune all items created in this version.
-		root := node.Root{Namespace: d.namespace, Version: version, Hash: rootHash}
+		root := node.Root{
+			Namespace: d.namespace,
+			Version:   version,
+			Type:      rootHash.Type(),
+			Hash:      rootHash.Hash(),
+		}
 		var innerErr error
-		err := api.Visit(ctx, d, root, func(ctx context.Context, n node.Node) bool {
-			if n.GetCreatedVersion() == version {
-				h := n.GetHash()
+		err := api.Visit(context.Background(), d, root, func(_ context.Context, n node.Node) bool {
+			h := n.GetHash()
+			var item *badger.Item
+			if item, innerErr = tx.Get(nodeKeyFmt.Encode(&h)); innerErr != nil {
+				return false
+			}
+
+			if tsToVersion(item.Version()) == version {
 				if innerErr = batch.Delete(nodeKeyFmt.Encode(&h)); innerErr != nil {
 					return false
 				}
@@ -736,6 +788,10 @@ func (d *badgerNodeDB) Prune(ctx context.Context, version uint64) error {
 			return innerErr
 		}
 		if err != nil {
+			return err
+		}
+
+		if err = batch.Delete(rootNodeKeyFmt.Encode(&rootHash)); err != nil {
 			return err
 		}
 	}
@@ -870,7 +926,9 @@ func (d *badgerNodeDB) Sync() error {
 
 func (d *badgerNodeDB) Close() {
 	d.closeOnce.Do(func() {
-		d.gc.Close()
+		if d.gc != nil {
+			d.gc.Stop()
+		}
 
 		if err := d.db.Close(); err != nil {
 			d.logger.Error("close returned error",
@@ -899,7 +957,7 @@ type badgerBatch struct {
 	updatedNodes []updatedNode
 }
 
-func (ba *badgerBatch) MaybeStartSubtree(subtree api.Subtree, depth node.Depth, subtreeRoot *node.Pointer) api.Subtree {
+func (ba *badgerBatch) MaybeStartSubtree(subtree api.Subtree, _ node.Depth, _ *node.Pointer) api.Subtree {
 	if subtree == nil {
 		return &badgerSubtree{batch: ba}
 	}
@@ -919,15 +977,15 @@ func (ba *badgerBatch) PutWriteLog(writeLog writelog.WriteLog, annotations write
 	return nil
 }
 
-func (ba *badgerBatch) RemoveNodes(nodes []node.Node) error {
+func (ba *badgerBatch) RemoveNodes(nodes []*node.Pointer) error {
 	if ba.chunk {
 		return fmt.Errorf("mkvs/badger: cannot remove nodes in chunk mode")
 	}
 
-	for _, n := range nodes {
+	for _, ptr := range nodes {
 		ba.updatedNodes = append(ba.updatedNodes, updatedNode{
 			Removed: true,
-			Hash:    n.GetHash(),
+			Hash:    ptr.GetHash(),
 		})
 	}
 	return nil
@@ -963,7 +1021,17 @@ func (ba *badgerBatch) Commit(root node.Root) error {
 		return err
 	}
 
-	if rootsMeta.Roots[root.Hash] != nil {
+	rootHash := api.TypedHashFromRoot(root)
+	if err = ba.bat.Set(rootNodeKeyFmt.Encode(&rootHash), []byte{}); err != nil {
+		return err
+	}
+	if ba.multipartNodes != nil {
+		if err = ba.multipartNodes.Set(multipartRestoreNodeLogKeyFmt.Encode(&rootHash), []byte{}); err != nil {
+			return err
+		}
+	}
+
+	if rootsMeta.Roots[rootHash] != nil {
 		// Root already exists, no need to do anything since if the hash matches, everything will
 		// be identical and we would just be duplicating work.
 		//
@@ -974,7 +1042,7 @@ func (ba *badgerBatch) Commit(root node.Root) error {
 		}
 	} else {
 		// Create root with no derived roots.
-		rootsMeta.Roots[root.Hash] = []hash.Hash{}
+		rootsMeta.Roots[rootHash] = []api.TypedHash{}
 
 		if err = rootsMeta.save(tx); err != nil {
 			return fmt.Errorf("mkvs/badger: failed to save roots metadata: %w", err)
@@ -983,12 +1051,13 @@ func (ba *badgerBatch) Commit(root node.Root) error {
 
 	if ba.chunk {
 		// Skip most of metadata updates if we are just importing chunks.
-		key := rootUpdatedNodesKeyFmt.Encode(root.Version, &root.Hash)
+		key := rootUpdatedNodesKeyFmt.Encode(root.Version, &rootHash)
 		if err = tx.Set(key, cbor.Marshal([]updatedNode{})); err != nil {
 			return fmt.Errorf("mkvs/badger: set returned error: %w", err)
 		}
 	} else {
 		// Update the root link for the old root.
+		oldRootHash := api.TypedHashFromRoot(ba.oldRoot)
 		if !ba.oldRoot.Hash.IsEmpty() {
 			if ba.oldRoot.Version < ba.db.meta.getEarliestVersion() && ba.oldRoot.Version != root.Version {
 				return api.ErrPreviousVersionMismatch
@@ -1000,18 +1069,18 @@ func (ba *badgerBatch) Commit(root node.Root) error {
 				return err
 			}
 
-			if _, ok := oldRootsMeta.Roots[ba.oldRoot.Hash]; !ok {
+			if _, ok := oldRootsMeta.Roots[oldRootHash]; !ok {
 				return api.ErrRootNotFound
 			}
 
-			oldRootsMeta.Roots[ba.oldRoot.Hash] = append(oldRootsMeta.Roots[ba.oldRoot.Hash], root.Hash)
+			oldRootsMeta.Roots[oldRootHash] = append(oldRootsMeta.Roots[oldRootHash], rootHash)
 			if err = oldRootsMeta.save(tx); err != nil {
 				return fmt.Errorf("mkvs/badger: failed to save old roots metadata: %w", err)
 			}
 		}
 
 		// Store updated nodes (only needed until the version is finalized).
-		key := rootUpdatedNodesKeyFmt.Encode(root.Version, &root.Hash)
+		key := rootUpdatedNodesKeyFmt.Encode(root.Version, &rootHash)
 		if err = tx.Set(key, cbor.Marshal(ba.updatedNodes)); err != nil {
 			return fmt.Errorf("mkvs/badger: set returned error: %w", err)
 		}
@@ -1020,7 +1089,7 @@ func (ba *badgerBatch) Commit(root node.Root) error {
 		if ba.writeLog != nil && ba.annotations != nil {
 			log := api.MakeHashedDBWriteLog(ba.writeLog, ba.annotations)
 			bytes := cbor.Marshal(log)
-			key := writeLogKeyFmt.Encode(root.Version, &root.Hash, &ba.oldRoot.Hash)
+			key := writeLogKeyFmt.Encode(root.Version, &rootHash, &oldRootHash)
 			if err = ba.bat.Set(key, bytes); err != nil {
 				return fmt.Errorf("mkvs/badger: set new write log returned error: %w", err)
 			}
@@ -1064,7 +1133,7 @@ type badgerSubtree struct {
 	batch *badgerBatch
 }
 
-func (s *badgerSubtree) PutNode(depth node.Depth, ptr *node.Pointer) error {
+func (s *badgerSubtree) PutNode(_ node.Depth, ptr *node.Pointer) error {
 	data, err := ptr.Node.MarshalBinary()
 	if err != nil {
 		return err
@@ -1075,18 +1144,21 @@ func (s *badgerSubtree) PutNode(depth node.Depth, ptr *node.Pointer) error {
 	nodeKey := nodeKeyFmt.Encode(&h)
 	if s.batch.multipartNodes != nil {
 		if _, err = s.batch.readTxn.Get(nodeKey); err != nil && errors.Is(err, badger.ErrKeyNotFound) {
-			if err = s.batch.multipartNodes.Set(multipartRestoreNodeLogKeyFmt.Encode(&h), []byte{}); err != nil {
+			th := api.TypedHashFromParts(node.RootTypeInvalid, h)
+			if err = s.batch.multipartNodes.Set(multipartRestoreNodeLogKeyFmt.Encode(&th), []byte{}); err != nil {
 				return err
 			}
 		}
 	}
-	if err = s.batch.bat.Set(nodeKey, data); err != nil {
-		return err
-	}
+
+	return s.batch.bat.Set(nodeKey, data)
+}
+
+func (s *badgerSubtree) VisitCleanNode(node.Depth, *node.Pointer, *node.Pointer) error {
 	return nil
 }
 
-func (s *badgerSubtree) VisitCleanNode(depth node.Depth, ptr *node.Pointer) error {
+func (s *badgerSubtree) VisitDirtyNode(node.Depth, *node.Pointer, *node.Pointer) error {
 	return nil
 }
 

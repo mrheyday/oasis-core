@@ -2,6 +2,8 @@
 package scenario
 
 import (
+	"context"
+
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 )
@@ -22,7 +24,7 @@ type Scenario interface {
 
 	// PreInit performs initial scenario initialization. It is guaranteed to be called before
 	// a new fixture is initialized in Fixture.
-	PreInit(childEnv *env.Env) error
+	PreInit() error
 
 	// Fixture returns a network fixture to use for this scenario.
 	//
@@ -36,6 +38,9 @@ type Scenario interface {
 	// otherwise it will be nil.
 	Init(childEnv *env.Env, net *oasis.Network) error
 
+	// Network returns the network used by this scenario.
+	Network() *oasis.Network
+
 	// Run runs the scenario.
-	Run(childEnv *env.Env) error
+	Run(ctx context.Context, childEnv *env.Env) error
 }

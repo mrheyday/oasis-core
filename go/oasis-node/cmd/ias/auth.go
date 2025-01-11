@@ -42,6 +42,12 @@ func (st *enclaveStore) verifyEvidence(evidence *ias.Evidence) error {
 		if v == id {
 			return nil
 		}
+		// HACK: Also allow enclaves from the same MRSIGNER. This is to make sure that ROFL enclaves
+		// are allowed as their MRENCLAVE may not be registered on the consensus layer. This will
+		// no longer be needed after everyone transitions to DCAP.
+		if v.MrSigner == id.MrSigner {
+			return nil
+		}
 	}
 
 	return fmt.Errorf("ias: enclave identity not in runtime descriptor: %v", id)
@@ -55,12 +61,18 @@ func (st *enclaveStore) addRuntime(runtime *registry.Runtime) (int, error) {
 		return len(st.enclaves), nil
 	}
 
-	var vi registry.VersionInfoIntelSGX
-	if err := cbor.Unmarshal(runtime.Version.TEE, &vi); err != nil {
-		return len(st.enclaves), err
+	// Regenerate the enclave ID list by iterating over all of the deployments.
+	var enclaveIDs []sgx.EnclaveIdentity
+	for _, deployment := range runtime.Deployments {
+		var cs node.SGXConstraints
+		if err := cbor.Unmarshal(deployment.TEE, &cs); err != nil {
+			return len(st.enclaves), err
+		}
+
+		enclaveIDs = append(enclaveIDs, cs.Enclaves...)
 	}
 
-	st.enclaves[runtime.ID] = vi.Enclaves
+	st.enclaves[runtime.ID] = enclaveIDs
 
 	return len(st.enclaves), nil
 }

@@ -23,11 +23,19 @@ if [ ! -d $src_dir ]; then
 fi
 shift
 
+# Make sure we can run unit tests for production enclaves.
+unset OASIS_UNSAFE_ALLOW_DEBUG_ENCLAVES
+unset OASIS_UNSAFE_SKIP_AVR_VERIFY
+
 #########################
 # Run the build and tests
 #########################
 pushd $src_dir
-  CARGO_TARGET_DIR="${CARGO_TARGET_DIR}/default" cargo build --all --locked --exclude simple-keyvalue
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR}/default" cargo build --release --workspace --locked \
+    --exclude simple-keyvalue
+
   cargo fmt -- --check
-  CARGO_TARGET_DIR="${CARGO_TARGET_DIR}/default" cargo test --all --locked --exclude simple-keyvalue
+
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR}/default" cargo test --workspace --locked \
+    --exclude simple-keyvalue
 popd

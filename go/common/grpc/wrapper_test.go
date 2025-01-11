@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 const numMultiPings uint32 = 10
@@ -21,17 +22,13 @@ var (
 
 // Request types
 
-type MultiPingUnaryRequest struct {
-}
+type MultiPingUnaryRequest struct{}
 
-type MultiPingUnaryResponse struct {
-}
+type MultiPingUnaryResponse struct{}
 
-type MultiPingStreamRequest struct {
-}
+type MultiPingStreamRequest struct{}
 
-type MultiPingStreamResponse struct {
-}
+type MultiPingStreamResponse struct{}
 
 func sendMultiPings(stream grpc.ServerStream) uint32 {
 	for i := uint32(0); i < numMultiPings; i++ {
@@ -52,7 +49,7 @@ type multiPingServer struct {
 	multiPingCount uint32
 }
 
-func (s *multiPingServer) Ping(ctx context.Context) (*MultiPingUnaryResponse, error) {
+func (s *multiPingServer) Ping(context.Context) (*MultiPingUnaryResponse, error) {
 	atomic.AddUint32(&s.pingCount, 1)
 	return &MultiPingUnaryResponse{}, nil
 }
@@ -151,7 +148,7 @@ var multiServiceDesc = grpc.ServiceDesc{
 	},
 }
 
-func multiPingUnaryHandler( // nolint: golint
+func multiPingUnaryHandler(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -168,13 +165,13 @@ func multiPingUnaryHandler( // nolint: golint
 		Server:     srv,
 		FullMethod: "/MultiPingService/Ping",
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ interface{}) (interface{}, error) {
 		return srv.(MultiPingServer).Ping(ctx)
 	}
 	return interceptor(ctx, pq, info, handler)
 }
 
-func multiPingStreamHandler( // nolint: golint
+func multiPingStreamHandler(
 	srv interface{},
 	stream grpc.ServerStream,
 ) error {
@@ -232,10 +229,9 @@ func TestGrpcWrapper(t *testing.T) {
 	require.NoErrorf(err, "Failed to start the gRPC server: %v", err)
 
 	// Connect to the gRPC server without a client certificate.
-	conn, err := grpc.DialContext(
-		ctx,
+	conn, err := grpc.NewClient(
 		fmt.Sprintf("%s:%d", host, port),
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&CBORCodec{})),
 	)
 	require.NoErrorf(err, "Failed to connect to gRPC server: %v", err)

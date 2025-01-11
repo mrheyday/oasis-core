@@ -17,3 +17,9 @@ set -euxo pipefail
 pushd go
   make lint
 popd
+
+# Lint doesn't work.
+# See: https://github.com/lucas-clemente/quic-go/wiki/quic-go-and-Go-versions
+#pushd tests/upgrade
+#  make lint
+#popd

@@ -3,992 +3,1112 @@ package commitment
 import (
 	"context"
 	"crypto/rand"
-	"errors"
+	"fmt"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	genesisTestHelpers "github.com/oasisprotocol/oasis-core/go/genesis/tests"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
+	"github.com/oasisprotocol/oasis-core/go/roothash/api/message"
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
-	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
+	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
-var nopSV = &nopSignatureVerifier{}
-
-// nopSignatureVerifier is a no-op storage verifier.
-type nopSignatureVerifier struct{}
-
-func (n *nopSignatureVerifier) VerifyCommitteeSignatures(kind scheduler.CommitteeKind, sigs []signature.Signature) error {
-	return nil
-}
-
-func (n *nopSignatureVerifier) VerifyTxnSchedulerSignature(sig signature.Signature, round uint64) error {
-	return nil
-}
-
-type staticSignatureVerifier struct {
-	storagePublicKey      signature.PublicKey
-	txnSchedulerPublicKey signature.PublicKey
-}
-
-func (n *staticSignatureVerifier) VerifyCommitteeSignatures(kind scheduler.CommitteeKind, sigs []signature.Signature) error {
-	var pk signature.PublicKey
-	switch kind {
-	case scheduler.KindStorage:
-		pk = n.storagePublicKey
-	default:
-		return errors.New("unsupported committee kind")
-	}
-
-	for _, sig := range sigs {
-		if !sig.PublicKey.Equal(pk) {
-			return errors.New("unknown public key")
-		}
-	}
-	return nil
-}
-
-func (n *staticSignatureVerifier) VerifyTxnSchedulerSignature(sig signature.Signature, round uint64) error {
-	if !sig.PublicKey.Equal(n.txnSchedulerPublicKey) {
-		return errors.New("unknown public key")
-	}
-
-	return nil
-}
-
-type staticNodeLookup struct {
-	runtime *node.Runtime
-}
-
-func (n *staticNodeLookup) Node(ctx context.Context, id signature.PublicKey) (*node.Node, error) {
-	return &node.Node{
-		Versioned: cbor.NewVersioned(node.LatestNodeDescriptorVersion),
-		ID:        id,
-		Runtimes:  []*node.Runtime{n.runtime},
-	}, nil
-}
-
-func TestPoolDefault(t *testing.T) {
+func TestAdd(t *testing.T) {
+	// Set chain domain separation context, required for signing commitments.
 	genesisTestHelpers.SetTestChainContext()
 
-	// Generate a commitment.
-	sk, err := memorySigner.NewSigner(rand.Reader)
-	require.NoError(t, err, "NewSigner")
-
-	var id common.Namespace
-	blk := block.NewGenesisBlock(id, 0)
-
-	body := ComputeBody{
-		Header: ComputeResultsHeader{
-			Round:        blk.Header.Round,
-			PreviousHash: blk.Header.PreviousHash,
-			IORoot:       &blk.Header.IORoot,
-			StateRoot:    &blk.Header.StateRoot,
-		},
-	}
-	commit, err := SignExecutorCommitment(sk, &body)
-	require.NoError(t, err, "SignExecutorCommitment")
-
-	// An empty pool should work but should always error.
-	pool := Pool{}
-	err = pool.AddExecutorCommitment(context.Background(), blk, nopSV, &staticNodeLookup{}, commit)
-	require.Error(t, err, "AddExecutorCommitment")
-	err = pool.CheckEnoughCommitments(false)
-	require.Error(t, err, "CheckEnoughCommitments")
-	require.Equal(t, ErrNoCommittee, err)
-	_, err = pool.DetectDiscrepancy()
-	require.Error(t, err, "DetectDiscrepancy")
-	require.Equal(t, ErrNoCommittee, err)
-	_, err = pool.ResolveDiscrepancy()
-	require.Error(t, err, "ResolveDiscrepancy")
-	require.Equal(t, ErrNoCommittee, err)
-	err = pool.CheckProposerTimeout(context.Background(), blk, nopSV, &staticNodeLookup{}, sk.Public(), 0)
-	require.Error(t, err, "CheckProposerTimeout")
-	require.Equal(t, ErrNoCommittee, err)
-}
-
-func TestPoolSingleCommitment(t *testing.T) {
-	genesisTestHelpers.SetTestChainContext()
-
-	// Generate a non-TEE runtime.
-	var rtID common.Namespace
-	_ = rtID.UnmarshalHex("0000000000000000000000000000000000000000000000000000000000000000")
-
-	rt := &registry.Runtime{
-		Versioned:   cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
-		ID:          rtID,
-		Kind:        registry.KindCompute,
-		TEEHardware: node.TEEHardwareInvalid,
-		Storage: registry.StorageParameters{
-			GroupSize:           1,
-			MinWriteReplication: 1,
-		},
-	}
-
-	// Generate a commitment signing key.
-	sk, err := memorySigner.NewSigner(rand.Reader)
-	require.NoError(t, err, "NewSigner")
-
-	// Generate a committee.
-	committee := &scheduler.Committee{
-		Kind: scheduler.KindComputeExecutor,
-		Members: []*scheduler.CommitteeNode{
-			{
-				Role:      scheduler.RoleWorker,
-				PublicKey: sk.Public(),
-			},
-		},
-	}
-
-	// Create a pool.
-	pool := Pool{
-		Runtime:   rt,
-		Committee: committee,
-	}
-
-	// Generate a commitment.
-	childBlk, parentBlk, body := generateComputeBody(t)
-
-	sv := &staticSignatureVerifier{
-		storagePublicKey:      body.StorageSignatures[0].PublicKey,
-		txnSchedulerPublicKey: body.TxnSchedSig.PublicKey,
-	}
-	nl := &staticNodeLookup{
-		runtime: &node.Runtime{
-			ID: rtID,
-		},
-	}
-
-	// Test invalid commitments.
-	for _, tc := range []struct {
-		name        string
-		fn          func(*ComputeBody)
-		expectedErr error
-	}{
-		{"BlockBadRound", func(b *ComputeBody) { b.Header.Round-- }, ErrNotBasedOnCorrectBlock},
-		{"BlockBadPreviousHash", func(b *ComputeBody) { b.Header.PreviousHash.FromBytes([]byte("invalid")) }, ErrNotBasedOnCorrectBlock},
-		{"StorageSigs1", func(b *ComputeBody) { b.StorageSignatures = nil }, ErrBadStorageReceipts},
-		{"MissingIORootHash", func(b *ComputeBody) { b.Header.IORoot = nil }, ErrBadExecutorCommitment},
-		{"MissingStateRootHash", func(b *ComputeBody) { b.Header.StateRoot = nil }, ErrBadExecutorCommitment},
-		{"FailureIndicatingWithStorageSigs", func(b *ComputeBody) { b.Failure = FailureStorageUnavailable }, ErrBadExecutorCommitment},
-		{"FailureIndicatingWithStateRootHash", func(b *ComputeBody) {
-			b.Failure = FailureStorageUnavailable
-			b.StorageSignatures = nil
-			b.Header.StateRoot = nil
-		}, ErrBadExecutorCommitment},
-		{"FailureIndicatingWithIORootHash", func(b *ComputeBody) {
-			b.Failure = FailureStorageUnavailable
-			b.StorageSignatures = nil
-			b.Header.IORoot = nil
-		}, ErrBadExecutorCommitment},
-	} {
-		_, _, invalidBody := generateComputeBody(t)
-		invalidBody.StorageSignatures = append([]signature.Signature{}, body.StorageSignatures...)
-		invalidBody.TxnSchedSig = body.TxnSchedSig
-
-		tc.fn(&invalidBody)
-
-		var commit *ExecutorCommitment
-		commit, err = SignExecutorCommitment(sk, &invalidBody)
-		require.NoError(t, err, "SignExecutorCommitment(%s)", tc.name)
-
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, sv, nl, commit)
-		require.Error(t, err, "AddExecutorCommitment(%s)", tc.name)
-		require.Equal(t, tc.expectedErr, err, "AddExecutorCommitment(%s)", tc.name)
-	}
-
-	// Generate a valid commitment.
-	commit, err := SignExecutorCommitment(sk, &body)
-	require.NoError(t, err, "SignExecutorCommitment")
-
-	// There should not be enough executor commitments.
-	err = pool.CheckEnoughCommitments(false)
-	require.Error(t, err, "CheckEnoughCommitments")
-	require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-	err = pool.CheckEnoughCommitments(true)
-	require.Error(t, err, "CheckEnoughCommitments")
-	require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-
-	// Adding a commitment having a storage receipt signed with an incorrect
-	// public key should fail.
-	bodyIncorrectStorageSig := body
-	// This generates a new signing key so verification should fail.
-	bodyIncorrectStorageSig.StorageSignatures[0] = generateStorageReceiptSignature(t, parentBlk, &bodyIncorrectStorageSig)
-	incorrectCommit, err := SignExecutorCommitment(sk, &bodyIncorrectStorageSig)
-	require.NoError(t, err, "SignExecutorCommitment")
-	err = pool.AddExecutorCommitment(context.Background(), childBlk, sv, nl, incorrectCommit)
-	require.Error(t, err, "AddExecutorCommitment")
-
-	// Adding a commitment having not enough storage receipts should fail.
-	bodyNotEnoughStorageSig := body
-	bodyNotEnoughStorageSig.StorageSignatures = []signature.Signature{}
-	incorrectCommit, err = SignExecutorCommitment(sk, &bodyNotEnoughStorageSig)
-	require.NoError(t, err, "SignExecutorCommitment")
-	err = pool.AddExecutorCommitment(context.Background(), childBlk, sv, nl, incorrectCommit)
-	require.Error(t, err, "AddExecutorCommitment")
-	require.Equal(t, ErrBadStorageReceipts, err, "AddExecutorCommitment")
-
-	// Adding a commitment having txn scheduler inputs signed with an incorrect
-	// public key should fail.
-	bodyIncorrectTxnSchedSig := body
-	// This generates a new signing key so verification should fail.
-	bodyIncorrectTxnSchedSig.TxnSchedSig = generateTxnSchedulerSignature(t, childBlk, &bodyIncorrectTxnSchedSig)
-	incorrectCommit, err = SignExecutorCommitment(sk, &bodyIncorrectTxnSchedSig)
-	require.NoError(t, err, "SignExecutorCommitment")
-	err = pool.AddExecutorCommitment(context.Background(), childBlk, sv, nl, incorrectCommit)
-	require.Error(t, err, "AddExecutorCommitment")
-
-	// Adding a commitment should succeed.
-	err = pool.AddExecutorCommitment(context.Background(), childBlk, sv, nl, commit)
-	require.NoError(t, err, "AddExecutorCommitment")
-
-	// Adding a commitment twice for the same node should fail.
-	err = pool.AddExecutorCommitment(context.Background(), childBlk, sv, nl, commit)
-	require.Error(t, err, "AddExecutorCommitment(context.Background(), duplicate)")
-
-	// There should be enough executor commitments.
-	err = pool.CheckEnoughCommitments(false)
-	require.NoError(t, err, "CheckEnoughCommitments")
-
-	// There should be no discrepancy.
-	dc, err := pool.DetectDiscrepancy()
-	require.NoError(t, err, "DetectDiscrepancy")
-	require.Equal(t, false, pool.Discrepancy)
-	header := dc.ToDDResult().(ComputeResultsHeader)
-	require.EqualValues(t, &body.Header, &header, "DD should return the same header")
-}
-
-func TestPoolSingleCommitmentTEE(t *testing.T) {
-	genesisTestHelpers.SetTestChainContext()
-
-	// Generate a TEE runtime.
-	var rtID common.Namespace
-	_ = rtID.UnmarshalHex("0000000000000000000000000000000000000000000000000000000000000000")
-
-	rt := &registry.Runtime{
-		Versioned:   cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
-		ID:          rtID,
-		Kind:        registry.KindCompute,
-		TEEHardware: node.TEEHardwareIntelSGX,
-	}
-
-	// Generate a commitment signing key.
-	sk, err := memorySigner.NewSigner(rand.Reader)
-	require.NoError(t, err, "NewSigner")
-
-	// Generate a dummy RAK.
-	skRAK, err := memorySigner.NewSigner(rand.Reader)
-	require.NoError(t, err, "NewSigner")
-
-	// Generate a committee.
-	committee := &scheduler.Committee{
-		Kind: scheduler.KindComputeExecutor,
-		Members: []*scheduler.CommitteeNode{
-			{
-				Role:      scheduler.RoleWorker,
-				PublicKey: sk.Public(),
-			},
-		},
-	}
-
-	// Create a pool.
-	pool := Pool{
-		Runtime:   rt,
-		Committee: committee,
-	}
-
-	nl := &staticNodeLookup{
-		runtime: &node.Runtime{
-			ID: rtID,
-			Capabilities: node.Capabilities{
-				TEE: &node.CapabilityTEE{
-					Hardware:    node.TEEHardwareIntelSGX,
-					RAK:         skRAK.Public(),
-					Attestation: []byte("My RAK is my attestation. Verify me."),
-				},
-			},
-		},
-	}
-
-	// Generate a commitment.
-	childBlk, _, body := generateComputeBody(t)
-	rakSig, err := signature.Sign(skRAK, ComputeResultsHeaderSignatureContext, cbor.Marshal(body.Header))
-	require.NoError(t, err, "Sign")
-	body.RakSig = &rakSig.Signature
-
-	commit, err := SignExecutorCommitment(sk, &body)
-	require.NoError(t, err, "SignExecutorCommitment")
-
-	// There should not be enough executor commitments.
-	err = pool.CheckEnoughCommitments(false)
-	require.Error(t, err, "CheckEnoughCommitments")
-	require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-	err = pool.CheckEnoughCommitments(true)
-	require.Error(t, err, "CheckEnoughCommitments")
-	require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-
-	// Adding a commitment should succeed.
-	err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit)
-	require.NoError(t, err, "AddExecutorCommitment")
-
-	// Adding a commitment twice for the same node should fail.
-	err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit)
-	require.Error(t, err, "AddExecutorCommitment(context.Background(), duplicate)")
-
-	// There should be enough executor commitments.
-	err = pool.CheckEnoughCommitments(false)
-	require.NoError(t, err, "CheckEnoughCommitments")
-
-	// There should be no discrepancy.
-	dc, err := pool.DetectDiscrepancy()
-	require.NoError(t, err, "DetectDiscrepancy")
-	require.Equal(t, false, pool.Discrepancy)
-	header := dc.ToDDResult().(ComputeResultsHeader)
-	require.EqualValues(t, &body.Header, &header, "DD should return the same header")
-}
-
-func TestPoolTwoCommitments(t *testing.T) {
-	genesisTestHelpers.SetTestChainContext()
-
-	rt, sks, committee, nl := generateMockCommittee(t)
-	sk1 := sks[0]
-	sk2 := sks[1]
-	sk3 := sks[2]
-
-	t.Run("NoDiscrepancy", func(t *testing.T) {
-		// Create a pool.
-		pool := Pool{
-			Runtime:   rt,
-			Committee: committee,
-		}
-
-		// Generate a commitment.
-		childBlk, _, body := generateComputeBody(t)
-
-		commit1, err := SignExecutorCommitment(sk1, &body)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		commit2, err := SignExecutorCommitment(sk2, &body)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		// Adding commitment 1 should succeed.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit1)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		// There should not be enough executor commitments.
-		err = pool.CheckEnoughCommitments(false)
-		require.Error(t, err, "CheckEnoughCommitments")
-		require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-		err = pool.CheckEnoughCommitments(true)
-		require.Error(t, err, "CheckEnoughCommitments")
-		require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-
-		// Adding commitment 2 should succeed.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit2)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		// There should be enough executor commitments.
-		err = pool.CheckEnoughCommitments(false)
-		require.NoError(t, err, "CheckEnoughCommitments")
-
-		// There should be no discrepancy.
-		dc, err := pool.DetectDiscrepancy()
-		require.NoError(t, err, "DetectDiscrepancy")
-		require.Equal(t, false, pool.Discrepancy)
-		header := dc.ToDDResult().(ComputeResultsHeader)
-		require.EqualValues(t, &body.Header, &header, "DD should return the same header")
-	})
-
-	t.Run("Discrepancy", func(t *testing.T) {
-		pool, childBlk, _, correctBody := setupDiscrepancy(t, rt, sks, committee, nl)
-
-		commit3, err := SignExecutorCommitment(sk3, correctBody)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		// Resolve discrepancy with commit from backup worker.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit3)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		// There should be enough executor commitments from backup workers.
-		err = pool.CheckEnoughCommitments(false)
-		require.NoError(t, err, "CheckEnoughCommitments")
-
-		// Discrepancy resolution should succeed.
-		dc, err := pool.ResolveDiscrepancy()
-		require.NoError(t, err, "ResolveDiscrepancy")
-		require.Equal(t, true, pool.Discrepancy)
-		header := dc.ToDDResult().(ComputeResultsHeader)
-		require.EqualValues(t, &correctBody.Header, &header, "DR should return the same header")
-	})
-
-	t.Run("DiscrepancyResolutionFailure", func(t *testing.T) {
-		pool, _, _, _ := setupDiscrepancy(t, rt, sks, committee, nl)
-
-		// Discrepancy resolution should fail.
-		dc, err := pool.ResolveDiscrepancy()
-		require.Nil(t, dc, "ResolveDiscrepancy")
-		require.Error(t, err, "ResolveDiscrepancy")
-		require.Equal(t, ErrInsufficientVotes, err)
-	})
-}
-
-func TestPoolFailureIndicatingCommitment(t *testing.T) {
-	rt, sks, committee, nl := generateMockCommittee(t)
-	sk1 := sks[0]
-	sk2 := sks[1]
-	sk3 := sks[2]
-
-	t.Run("FailureIndicating", func(t *testing.T) {
-		genesisTestHelpers.SetTestChainContext()
-
-		// Create a pool.
-		pool := Pool{
-			Runtime:   rt,
-			Committee: committee,
-		}
-
-		// Generate a compute body.
-		childBlk, _, body := generateComputeBody(t)
-
-		// Generate a valid commitment.
-		commit1, err := SignExecutorCommitment(sk1, &body)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		failedBody := ComputeBody{
-			Header: ComputeResultsHeader{
-				Round:        body.Header.Round,
-				PreviousHash: body.Header.PreviousHash,
-			},
-			Failure: FailureStorageUnavailable,
-		}
-		failedBody.TxnSchedSig = generateTxnSchedulerSignature(t, childBlk, &failedBody)
-		commit2, err := SignExecutorCommitment(sk2, &failedBody)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		commit3, err := SignExecutorCommitment(sk3, &body)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		// There should not be enough executor commitments.
-		err = pool.CheckEnoughCommitments(false)
-		require.Error(t, err, "CheckEnoughCommitments")
-		require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-		err = pool.CheckEnoughCommitments(true)
-		require.Error(t, err, "CheckEnoughCommitments")
-		require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-
-		// Adding a commitment should succeed.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit1)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		// Adding a commitment twice for the same node should fail.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit1)
-		require.Error(t, err, "AddExecutorCommitment(context.Background(), duplicate)")
-
-		// There should not be enough executor commitments.
-		err = pool.CheckEnoughCommitments(false)
-		require.Error(t, err, "CheckEnoughCommitments")
-
-		// Adding a failure indicating commitment.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit2)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		// There should be enough commitments.
-		err = pool.CheckEnoughCommitments(false)
-		require.NoError(t, err, "CheckEnoughCommitments")
-
-		// There should be a discrepancy.
-		_, err = pool.DetectDiscrepancy()
-		require.Error(t, err, "DetectDiscrepancy")
-		require.Equal(t, ErrDiscrepancyDetected, err)
-		require.Equal(t, true, pool.Discrepancy)
-
-		// There should not be enough executor commitments from backup workers.
-		err = pool.CheckEnoughCommitments(false)
-		require.Error(t, err, "CheckEnoughCommitments")
-		require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-
-		// Resolve discrepancy with commit from backup worker.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit3)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		// There should be enough executor commitments from backup workers.
-		err = pool.CheckEnoughCommitments(false)
-		require.NoError(t, err, "CheckEnoughCommitments")
-
-		// Discrepancy resolution should succeed.
-		dc, err := pool.ResolveDiscrepancy()
-		require.NoError(t, err, "ResolveDiscrepancy")
-		require.Equal(t, true, pool.Discrepancy)
-		header := dc.ToDDResult().(ComputeResultsHeader)
-		require.EqualValues(t, &body.Header, &header, "DR should return the same header")
-	})
-
-	t.Run("DiscrepancyFailureIndicating", func(t *testing.T) {
-		pool, childBlk, _, body := setupDiscrepancy(t, rt, sks, committee, nl)
-		body.SetFailure(FailureUnknown)
-
-		commit3, err := SignExecutorCommitment(sk3, body)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		// Resolve discrepancy with commit from backup worker.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit3)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		// Discrepancy resolution should fail with failure indicating commitment.
-		dc, err := pool.ResolveDiscrepancy()
-		require.Nil(t, dc, "ResolveDiscrepancy")
-		require.Error(t, err, "ResolveDiscrepancy")
-		require.Equal(t, ErrMajorityFailure, err)
-	})
-}
-
-func TestPoolSerialization(t *testing.T) {
-	genesisTestHelpers.SetTestChainContext()
-
-	// Generate a non-TEE runtime.
-	var rtID common.Namespace
-	_ = rtID.UnmarshalHex("0000000000000000000000000000000000000000000000000000000000000000")
-
-	rt := &registry.Runtime{
-		Versioned:   cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
-		ID:          rtID,
-		Kind:        registry.KindCompute,
-		TEEHardware: node.TEEHardwareInvalid,
-	}
-
-	// Generate a commitment signing key.
-	sk, err := memorySigner.NewSigner(rand.Reader)
-	require.NoError(t, err, "NewSigner")
-
-	// Generate a committee.
-	committee := &scheduler.Committee{
-		Kind: scheduler.KindComputeExecutor,
-		Members: []*scheduler.CommitteeNode{
-			{
-				Role:      scheduler.RoleWorker,
-				PublicKey: sk.Public(),
-			},
-		},
-	}
-
-	// Create a pool.
-	pool := Pool{
-		Runtime:   rt,
-		Committee: committee,
-	}
-
-	nl := &staticNodeLookup{
-		runtime: &node.Runtime{
-			ID: rtID,
-		},
-	}
-
-	// Generate a commitment.
-	childBlk, _, body := generateComputeBody(t)
-
-	commit, err := SignExecutorCommitment(sk, &body)
-	require.NoError(t, err, "SignExecutorCommitment")
-
-	// Adding a commitment should succeed.
-	err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit)
-	require.NoError(t, err, "AddExecutorCommitment")
-
-	m := cbor.Marshal(pool)
-	var d Pool
-	err = cbor.Unmarshal(m, &d)
+	// Committee with 4 + 2 = 6 members,
+	committee, err := generateCommittee(6, 4, 2)
 	require.NoError(t, err)
 
-	// There should be enough executor commitments.
-	err = pool.CheckEnoughCommitments(false)
-	require.NoError(t, err, "CheckEnoughCommitments")
+	// Last block upon which commitments will be constructed.
+	var id common.Namespace
+	lastBlock := block.NewGenesisBlock(id, 0)
 
-	// There should be no discrepancy.
-	dc, err := pool.DetectDiscrepancy()
-	require.NoError(t, err, "DetectDiscrepancy")
-	require.Equal(t, false, pool.Discrepancy)
-	header := dc.ToDDResult().(ComputeResultsHeader)
-	require.EqualValues(t, &body.Header, &header, "DD should return the same header")
+	// The next round is round 3, and the worker at position 1 will be the highest-ranked scheduler.
+	// Formula: rank = (3 + position) % 4.
+	lastBlock.Header.Round = 2
+
+	// Empty pool.
+	pool := NewPool()
+
+	// Only members are allowed to submit commitments.
+	outsider, err := memorySigner.NewSigner(rand.Reader)
+	require.NoError(t, err)
+	ec := generateMemberCommitment(committee, lastBlock, 0, 0)
+	ec.NodeID = outsider.Public()
+	err = ec.Sign(outsider, id)
+	require.NoError(t, err)
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.Error(t, err, ErrNotInCommittee)
+
+	// Only workers are allowed to schedule transactions.
+	ec = generateMemberCommitment(committee, lastBlock, 3, 5) // Backup workers are not allowed.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.ErrorIs(t, err, ErrBadExecutorCommitment)
+
+	// Until the first scheduler commits, anyone can submit commitments.
+	ec = generateMemberCommitment(committee, lastBlock, 3, 0) // Scheduler's rank is 3.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.NoError(t, err)
+
+	ec = generateMemberCommitment(committee, lastBlock, 3, 1) // Scheduler's rank is 0.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.NoError(t, err)
+
+	ec = generateMemberCommitment(committee, lastBlock, 3, 2) // Scheduler's rank is 1.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.NoError(t, err)
+
+	ec = generateMemberCommitment(committee, lastBlock, 4, 0) // Scheduler's rank is 3.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.NoError(t, err)
+
+	ec = generateMemberCommitment(committee, lastBlock, 4, 1) // Scheduler's rank is 0.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.NoError(t, err)
+
+	// Duplicates are always forbidden.
+	ec = generateMemberCommitment(committee, lastBlock, 3, 0) // Scheduler's rank is 3.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.ErrorIs(t, err, ErrAlreadyCommitted)
+
+	// All commitments should be present in the pool.
+	require.Equal(t, uint64(math.MaxUint64), pool.HighestRank)
+	require.Len(t, pool.SchedulerCommitments, 3)
+
+	require.Contains(t, pool.SchedulerCommitments, uint64(0))
+	require.Contains(t, pool.SchedulerCommitments, uint64(1))
+	require.Contains(t, pool.SchedulerCommitments, uint64(3))
+
+	// A scheduler submits a commitment.
+	ec = generateMemberCommitment(committee, lastBlock, 3, 3) // Scheduler's rank is 2.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.NoError(t, err)
+
+	// Commitments with worse rank should be dropped.
+	require.Equal(t, uint64(2), pool.HighestRank)
+	require.Len(t, pool.SchedulerCommitments, 3)
+
+	require.Contains(t, pool.SchedulerCommitments, uint64(0))
+	require.Contains(t, pool.SchedulerCommitments, uint64(1))
+	require.Contains(t, pool.SchedulerCommitments, uint64(2))
+
+	// Commitments with worse rank should not be accepted.
+	ec = generateMemberCommitment(committee, lastBlock, 5, 0) // Scheduler's rank is 3 (not ok).
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.ErrorIs(t, err, ErrBadExecutorCommitment)
+
+	ec = generateMemberCommitment(committee, lastBlock, 5, 3) // Scheduler's rank is 2.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.NoError(t, err)
+
+	// A scheduler submits worse commitment.
+	ec = generateMemberCommitment(committee, lastBlock, 0, 0) // Scheduler's rank is 3 (not ok).
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.ErrorIs(t, err, ErrBadExecutorCommitment)
+
+	// A scheduler submits better commitment.
+	ec = generateMemberCommitment(committee, lastBlock, 2, 2) // Scheduler's rank is 1.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.NoError(t, err)
+
+	// Commitments with worse rank should be dropped.
+	require.Equal(t, uint64(1), pool.HighestRank)
+	require.Len(t, pool.SchedulerCommitments, 2)
+
+	require.Contains(t, pool.SchedulerCommitments, uint64(0))
+	require.Contains(t, pool.SchedulerCommitments, uint64(1))
+
+	// Commitments with worse priorities should not be accepted.
+	ec = generateMemberCommitment(committee, lastBlock, 5, 3) // Scheduler's rank is 2 (not ok).
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.ErrorIs(t, err, ErrBadExecutorCommitment)
+
+	ec = generateMemberCommitment(committee, lastBlock, 5, 2) // Scheduler's rank is 1.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.NoError(t, err)
+
+	// Enable discrepancy.
+	pool.Discrepancy = true
+
+	// All schedulers should be rejected.
+	ec = generateMemberCommitment(committee, lastBlock, 3, 3) // Scheduler's rank is 2 (not ok).
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.ErrorIs(t, err, ErrBadExecutorCommitment)
+
+	ec = generateMemberCommitment(committee, lastBlock, 1, 1) // Scheduler's rank is 0 (not ok).
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.ErrorIs(t, err, ErrBadExecutorCommitment)
+
+	// All workers should be rejected.
+	ec = generateMemberCommitment(committee, lastBlock, 0, 2) // Scheduler's rank is 1.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.ErrorIs(t, err, ErrBadExecutorCommitment)
+
+	ec = generateMemberCommitment(committee, lastBlock, 1, 2) // Scheduler's rank is 1.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.ErrorIs(t, err, ErrBadExecutorCommitment)
+
+	// Only commitments from backup workers with the same rank should be accepted.
+	ec = generateMemberCommitment(committee, lastBlock, 4, 2) // Scheduler's rank is 1.
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.NoError(t, err)
+
+	ec = generateMemberCommitment(committee, lastBlock, 4, 3) // Scheduler's rank is 2 (not ok).
+	err = pool.AddVerifiedExecutorCommitment(committee, ec)
+	require.ErrorIs(t, err, ErrBadExecutorCommitment)
 }
 
-func TestTryFinalize(t *testing.T) {
+func TestProcess(t *testing.T) {
+	// Create a committee consisting of 8 members, with one member serving as both a worker (3)
+	// and a backup worker (4).
+	committee, err := generateCommittee(7, 4, 4)
+	require.NoError(t, err)
+	require.Len(t, committee.Members, 8)
+
+	// Last block upon which commitments will be constructed.
+	var id common.Namespace
+	lastBlock := block.NewGenesisBlock(id, 0)
+
+	// The next round is round 3, and the worker at position 1 will be the highest-ranked scheduler.
+	// Formula: rank = (3 + position) % 4.
+	lastBlock.Header.Round = 2
+
+	var sc *SchedulerCommitment
+
+	t.Run("Happy path, no discrepancy, no stragglers", func(t *testing.T) {
+		pool := NewPool()
+		allowedStragglers := uint16(0)
+
+		// Add commitments from all workers.
+		for i := 0; i < 4; i++ {
+			// Not enough votes.
+			sc, err = pool.ProcessCommitments(committee, allowedStragglers, false)
+			require.ErrorIs(t, err, ErrStillWaiting)
+			require.Nil(t, sc)
+
+			// Add new commitment.
+			ec := generateMemberCommitment(committee, lastBlock, i, 0)
+			err = pool.AddVerifiedExecutorCommitment(committee, ec)
+			require.NoError(t, err)
+		}
+
+		// Scheduler's commitment.
+		ec := generateMemberCommitment(committee, lastBlock, 0, 0)
+
+		// Enough votes (4/4).
+		sc, err = pool.ProcessCommitments(committee, allowedStragglers, false)
+		require.NoError(t, err)
+		require.NotNil(t, sc)
+		require.Equal(t, ec, sc.Commitment)
+		require.Len(t, sc.Votes, 4)
+	})
+
+	t.Run("Happy path, no discrepancy, allow stragglers", func(t *testing.T) {
+		pool := NewPool()
+		allowedStragglers := uint16(2)
+
+		// Add commitments from few workers.
+		for i := 0; i < 2; i++ {
+			// Not enough votes.
+			sc, err = pool.ProcessCommitments(committee, allowedStragglers, false)
+			require.ErrorIs(t, err, ErrStillWaiting)
+			require.Nil(t, sc)
+
+			// Add new commitment.
+			ec := generateMemberCommitment(committee, lastBlock, i, 0)
+			err = pool.AddVerifiedExecutorCommitment(committee, ec)
+			require.NoError(t, err)
+		}
+
+		// Scheduler's commitment.
+		ec := generateMemberCommitment(committee, lastBlock, 0, 0)
+
+		// Enough votes (2/4).
+		sc, err = pool.ProcessCommitments(committee, allowedStragglers, false)
+		require.NoError(t, err)
+		require.NotNil(t, sc)
+		require.Equal(t, ec, sc.Commitment)
+		require.Len(t, sc.Votes, 2)
+	})
+
+	t.Run("Happy path, discrepancy", func(t *testing.T) {
+		pool := NewPool()
+
+		// Add scheduler commitment.
+		ec := generateMemberCommitment(committee, lastBlock, 0, 0)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Enable discrepancy resolution.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Add commitments from 3/4 backup workers.
+		for i := 4; i < 7; i++ {
+			// Not enough votes.
+			sc, err = pool.ProcessCommitments(committee, 0, false)
+			require.ErrorIs(t, err, ErrStillWaiting)
+			require.Nil(t, sc)
+
+			// Add new commitment.
+			ec = generateMemberCommitment(committee, lastBlock, i, 0)
+			err = pool.AddVerifiedExecutorCommitment(committee, ec)
+			require.NoError(t, err)
+		}
+
+		// Scheduler's commitment.
+		ec = generateMemberCommitment(committee, lastBlock, 0, 0)
+
+		// Enough votes (3/4).
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.NoError(t, err)
+		require.NotNil(t, sc)
+		require.Equal(t, ec, sc.Commitment)
+		require.Len(t, sc.Votes, 4)
+	})
+
+	t.Run("No scheduler commitments", func(t *testing.T) {
+		pool := NewPool()
+
+		// No commitments, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// No commitments, timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrNoSchedulerCommitment)
+		require.Nil(t, sc)
+
+		// Add commitments from all workers, except from the scheduler.
+		for i := 1; i < 4; i++ {
+			ec := generateMemberCommitment(committee, lastBlock, i, 0)
+			err = pool.AddVerifiedExecutorCommitment(committee, ec)
+			require.NoError(t, err)
+		}
+
+		// Commitments, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Commitments, timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrNoSchedulerCommitment)
+		require.Nil(t, sc)
+
+		// The rank should still be undefined.
+		require.Equal(t, uint64(math.MaxUint64), pool.HighestRank)
+	})
+
+	t.Run("Discrepancy detection, not enough votes, primary scheduler", func(t *testing.T) {
+		pool := NewPool()
+
+		// One commit from worker, one from the scheduler.
+		ec := generateMemberCommitment(committee, lastBlock, 2, 1)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		ec = generateMemberCommitment(committee, lastBlock, 1, 1)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Enough votes, no timeout
+		sc, err = pool.ProcessCommitments(committee, 2, false)
+		require.NoError(t, err)
+		require.NotNil(t, sc)
+		require.Equal(t, ec, sc.Commitment)
+		require.Len(t, sc.Votes, 2)
+
+		// Enough votes, timeout.
+		sc, err = pool.ProcessCommitments(committee, 2, false)
+		require.NoError(t, err)
+		require.NotNil(t, sc)
+		require.Equal(t, ec, sc.Commitment)
+		require.Len(t, sc.Votes, 2)
+
+		// Not enough votes, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Not enough votes, timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+	})
+
+	t.Run("Discrepancy detection, not enough votes, backup scheduler", func(t *testing.T) {
+		pool := NewPool()
+
+		// One commit from worker, one from the scheduler.
+		ec := generateMemberCommitment(committee, lastBlock, 3, 2)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		ec = generateMemberCommitment(committee, lastBlock, 2, 2)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Enough votes, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 2, false)
+		require.NoError(t, err)
+		require.NotNil(t, sc)
+		require.Equal(t, ec, sc.Commitment)
+		require.Len(t, sc.Votes, 2)
+
+		// Enough votes, timeout.
+		sc, err = pool.ProcessCommitments(committee, 2, false)
+		require.NoError(t, err)
+		require.NotNil(t, sc)
+		require.Equal(t, ec, sc.Commitment)
+		require.Len(t, sc.Votes, 2)
+
+		// Not enough votes, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Not enough votes, timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+	})
+
+	t.Run("Discrepancy detection, unanimous votes, primary scheduler", func(t *testing.T) {
+		pool := NewPool()
+
+		// One commit from worker, one from the scheduler.
+		ec := generateMemberCommitment(committee, lastBlock, 2, 1)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		ec = generateMemberCommitment(committee, lastBlock, 1, 1)
+		ec.Header.Header.InMessagesCount = 10
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Unanimous votes, no timeout
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Restore pool.
+		pool.Discrepancy = false
+
+		// Unanimous votes, timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+	})
+
+	t.Run("Discrepancy detection, unanimous votes, backup scheduler", func(t *testing.T) {
+		pool := NewPool()
+
+		// One commit from worker, one from the scheduler.
+		ec := generateMemberCommitment(committee, lastBlock, 3, 2)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		ec = generateMemberCommitment(committee, lastBlock, 2, 2)
+		ec.Header.Header.InMessagesCount = 10
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Unanimous votes, no timeout
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrStillWaiting) // Backup schedulers need to wait for timeout.
+		require.Nil(t, sc)
+
+		// Unanimous votes, timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+	})
+
+	t.Run("Discrepancy detection, too many failures, primary scheduler", func(t *testing.T) {
+		pool := NewPool()
+
+		// One failure from the scheduler.
+		ec := generateMemberFailure(committee, lastBlock, 1, 1)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Allow 1 failure, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Allow 1 failure, timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Restore pool.
+		pool.Discrepancy = false
+
+		// Allow 0 failures, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Restore pool.
+		pool.Discrepancy = false
+
+		// Allow 0 failures, timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Restore pool.
+		pool.Discrepancy = false
+
+		// Another failure.
+		ec = generateMemberFailure(committee, lastBlock, 2, 1)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Allow 2 failures, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 2, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Allow 2 failures, timeout.
+		sc, err = pool.ProcessCommitments(committee, 2, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Restore pool.
+		pool.Discrepancy = false
+
+		// Allow 1 failure, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, false)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Restore pool.
+		pool.Discrepancy = false
+
+		// Allow 1 failure, timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+	})
+
+	t.Run("Discrepancy detection, too many failures, backup scheduler", func(t *testing.T) {
+		pool := NewPool()
+
+		// One failure from the scheduler.
+		ec := generateMemberFailure(committee, lastBlock, 2, 2)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Allow 1 failure, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Allow 1 failure, timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Restore pool.
+		pool.Discrepancy = false
+
+		// Allow 0 failures, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrStillWaiting) // Backup schedulers need to wait for timeout.
+		require.Nil(t, sc)
+
+		// Allow 0 failures, timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Restore pool.
+		pool.Discrepancy = false
+
+		// Another failure.
+		ec = generateMemberFailure(committee, lastBlock, 3, 2)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Allow 2 failures, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 2, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Allow 2 failures, timeout.
+		sc, err = pool.ProcessCommitments(committee, 2, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Restore pool.
+		pool.Discrepancy = false
+
+		// Allow 1 failure, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, false)
+		require.ErrorIs(t, err, ErrStillWaiting) // Backup schedulers need to wait for timeout.
+		require.Nil(t, sc)
+
+		// Allow 1 failure, timeout.
+		sc, err = pool.ProcessCommitments(committee, 1, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+	})
+
+	t.Run("Discrepancy resolution, not enough votes", func(t *testing.T) {
+		pool := NewPool()
+
+		// One commit from the scheduler.
+		ec := generateMemberCommitment(committee, lastBlock, 0, 0)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Enable discrepancy resolution.
+		sc, err = pool.ProcessCommitments(committee, 2, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// Not enough votes, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Not enough votes, timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrInsufficientVotes)
+		require.Nil(t, sc)
+
+		// Not enough votes (1/4, 3 left), no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Not enough votes (1/4, 3 left), timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrInsufficientVotes)
+		require.Nil(t, sc)
+
+		// Verify that one worker has two roles.
+		ec = generateMemberCommitment(committee, lastBlock, 3, 0)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		ec = generateMemberCommitment(committee, lastBlock, 4, 0)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.ErrorIs(t, err, ErrAlreadyCommitted)
+
+		// Another commit from a backup worker.
+		ec = generateMemberCommitment(committee, lastBlock, 5, 0)
+		ec.Header.Failure = FailureUnknown
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Not enough votes (1/4. 1/4, 2 left), no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Not enough votes (1/4. 1/4, 2 left), timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrInsufficientVotes)
+		require.Nil(t, sc)
+
+		// Another commit from a backup worker.
+		ec = generateMemberCommitment(committee, lastBlock, 6, 0)
+		ec.Header.Header.InMessagesCount = 10
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Not enough votes (1/4. 1/4. 1/4, 1 left), no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrInsufficientVotes) // Insufficient votes remaining.
+		require.Nil(t, sc)
+
+		// Not enough votes (1/4. 1/4. 1/4, 1 left), no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrInsufficientVotes)
+		require.Nil(t, sc)
+
+		// Revert last vote (hackish).
+		delete(pool.SchedulerCommitments[3].Votes, ec.NodeID)
+
+		// Another commit from a backup worker.
+		ec = generateMemberCommitment(committee, lastBlock, 6, 0)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Not enough votes (2/4. 1/4, 1 left), no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrStillWaiting)
+		require.Nil(t, sc)
+
+		// Not enough votes (2/4. 1/4, 1 left), timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrInsufficientVotes)
+		require.Nil(t, sc)
+
+		// Another commit from a backup worker.
+		ec = generateMemberCommitment(committee, lastBlock, 7, 0)
+		ec.Header.Header.InMessagesCount = 10
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Not enough votes (2/4. 1/4, 1/4, 0 left), no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrInsufficientVotes)
+		require.Nil(t, sc)
+
+		// Not enough votes (2/4. 1/4, 1/4, 0 left), timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrInsufficientVotes)
+		require.Nil(t, sc)
+	})
+
+	t.Run("Discrepancy resolution, bad scheduler commitment", func(t *testing.T) {
+		pool := NewPool()
+
+		// One commit from the scheduler.
+		ec := generateMemberCommitment(committee, lastBlock, 0, 0)
+		err = pool.AddVerifiedExecutorCommitment(committee, ec)
+		require.NoError(t, err)
+
+		// Enable discrepancy resolution.
+		sc, err = pool.ProcessCommitments(committee, 2, true)
+		require.ErrorIs(t, err, ErrDiscrepancyDetected)
+		require.Nil(t, sc)
+
+		// The majority of backup workers (3/4) disagrees with the scheduler.
+		for i := 4; i < 7; i++ {
+			ec := generateMemberCommitment(committee, lastBlock, i, 0)
+			ec.Header.Header.InMessagesCount = 10
+			err = pool.AddVerifiedExecutorCommitment(committee, ec)
+			require.NoError(t, err)
+		}
+
+		// Bad scheduler commitment, no timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, false)
+		require.ErrorIs(t, err, ErrBadSchedulerCommitment)
+		require.Nil(t, sc)
+
+		// Bad scheduler commitment, timeout.
+		sc, err = pool.ProcessCommitments(committee, 0, true)
+		require.ErrorIs(t, err, ErrBadSchedulerCommitment)
+		require.Nil(t, sc)
+	})
+}
+
+func TestVerify(t *testing.T) {
+	ctx := context.Background()
+
+	// Set chain domain separation context, required for signing commitments.
 	genesisTestHelpers.SetTestChainContext()
 
-	rt, sks, committee, nl := generateMockCommittee(t)
-	sk1 := sks[0]
-	sk2 := sks[1]
-	sk3 := sks[2]
+	// Prepare a non-TEE runtime.
+	var id common.Namespace
+	err := id.UnmarshalHex("c000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff")
+	require.NoError(t, err)
 
-	now := int64(1)
-	roundTimeout := int64(10)
-
-	t.Run("NoDiscrepancy", func(t *testing.T) {
-		// Create a pool.
-		pool := Pool{
-			Runtime:   rt,
-			Committee: committee,
-		}
-
-		// Generate a commitment.
-		childBlk, _, body := generateComputeBody(t)
-
-		commit1, err := SignExecutorCommitment(sk1, &body)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		commit2, err := SignExecutorCommitment(sk2, &body)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		// Adding commitment 1 should succeed.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit1)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		_, err = pool.TryFinalize(now, roundTimeout, false, true)
-		require.Error(t, err, "TryFinalize")
-		require.Equal(t, ErrStillWaiting, err, "TryFinalize")
-		require.EqualValues(t, now+roundTimeout, pool.NextTimeout, "NextTimeout should be set")
-
-		// Adding commitment 2 should succeed.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit2)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		dc, err := pool.TryFinalize(now, roundTimeout, false, true)
-		require.NoError(t, err, "TryFinalize")
-		header := dc.ToDDResult().(ComputeResultsHeader)
-		require.EqualValues(t, &body.Header, &header, "DD should return the same header")
-		require.EqualValues(t, TimeoutNever, pool.NextTimeout, "NextTimeout should be TimeoutNever")
-	})
-
-	t.Run("Discrepancy", func(t *testing.T) {
-		pool, childBlk, _, correctBody := setupDiscrepancy(t, rt, sks, committee, nl)
-
-		commit3, err := SignExecutorCommitment(sk3, correctBody)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		// Resolve discrepancy with commit from backup worker.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit3)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		dc, err := pool.TryFinalize(now, roundTimeout, false, true)
-		require.NoError(t, err, "TryFinalize")
-		header := dc.ToDDResult().(ComputeResultsHeader)
-		require.EqualValues(t, &correctBody.Header, &header, "DR should return the same header")
-		require.EqualValues(t, TimeoutNever, pool.NextTimeout, "NextTimeout should be TimeoutNever")
-	})
-
-	t.Run("Timeout", func(t *testing.T) {
-		// Create a pool.
-		pool := Pool{
-			Runtime:   rt,
-			Committee: committee,
-		}
-
-		// Generate a commitment.
-		childBlk, _, body := generateComputeBody(t)
-
-		commit1, err := SignExecutorCommitment(sk1, &body)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		commit3, err := SignExecutorCommitment(sk3, &body)
-		require.NoError(t, err, "SignExecutorCommitment")
-
-		correctHeader := body.Header
-
-		// Adding commitment 1 should succeed.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit1)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		_, err = pool.TryFinalize(now, roundTimeout, false, true)
-		require.Error(t, err, "TryFinalize")
-		require.Equal(t, ErrStillWaiting, err, "TryFinalize")
-		require.EqualValues(t, now+roundTimeout, pool.NextTimeout, "NextTimeout should be set")
-
-		// Simulate a non-authoritative timeout -- this should return
-		// a discrepancy detected error, but not change the internal
-		// discrepancy flag.
-		nowAfterTimeout := now + roundTimeout
-		_, err = pool.TryFinalize(nowAfterTimeout, roundTimeout, true, false)
-		require.Error(t, err, "TryFinalize")
-		require.Equal(t, ErrDiscrepancyDetected, err)
-		require.Equal(t, false, pool.Discrepancy)
-		require.EqualValues(t, TimeoutNever, pool.NextTimeout, "NextTimeout should be TimeoutNever")
-
-		// Simulate a timeout -- this should cause a discrepancy.
-		_, err = pool.TryFinalize(nowAfterTimeout, roundTimeout, true, true)
-		require.Error(t, err, "TryFinalize")
-		require.Equal(t, ErrDiscrepancyDetected, err)
-		require.Equal(t, true, pool.Discrepancy)
-		require.EqualValues(t, nowAfterTimeout+(15*roundTimeout)/10, pool.NextTimeout, "NextTimeout should be set to 1.5*RoundTimeout")
-
-		// There should not be enough executor commitments from backup workers.
-		_, err = pool.TryFinalize(nowAfterTimeout, roundTimeout, false, true)
-		require.Error(t, err, "TryFinalize")
-		require.Equal(t, ErrStillWaiting, err)
-		require.EqualValues(t, nowAfterTimeout+roundTimeout, pool.NextTimeout, "NextTimeout should be set")
-
-		// Resolve discrepancy with commit from backup worker.
-		err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit3)
-		require.NoError(t, err, "AddExecutorCommitment")
-
-		dc, err := pool.TryFinalize(now, roundTimeout, false, true)
-		require.NoError(t, err, "TryFinalize")
-		header := dc.ToDDResult().(ComputeResultsHeader)
-		require.EqualValues(t, &correctHeader, &header, "DR should return the same header")
-		require.EqualValues(t, TimeoutNever, pool.NextTimeout, "NextTimeout should be TimeoutNever")
-	})
-}
-
-func TestExecutorTimeoutRequest(t *testing.T) {
-	genesisTestHelpers.SetTestChainContext()
-
-	rt, sks, committee, nl := generateMockCommittee(t)
-	sk1 := sks[0]
-	sk2 := sks[1]
-
-	t.Run("ExecutorProposerTimeoutRequest", func(t *testing.T) {
-		require := require.New(t)
-		ctx := context.Background()
-
-		// Create a pool.
-		pool := Pool{
-			Runtime:   rt,
-			Committee: committee,
-		}
-
-		var id common.Namespace
-		childBlk := block.NewGenesisBlock(id, 0)
-
-		type testCase struct {
-			signer        signature.Signer
-			round         uint64
-			expectedError error
-		}
-		for _, tc := range []*testCase{
-			// Scheduler (sk1 at round 0), is not allowed to request a timeout.
-			{
-				signer:        sk1,
-				round:         0,
-				expectedError: ErrNodeIsScheduler,
-			},
-			// Timeout round needs to match current round.
-			{
-				signer:        sk2,
-				round:         100,
-				expectedError: ErrTimeoutNotCorrectRound,
-			},
-			// Ok timeout request.
-			{
-				signer:        sk2,
-				round:         0,
-				expectedError: nil,
-			},
-		} {
-			err := pool.CheckProposerTimeout(ctx, childBlk, nopSV, nl, tc.signer.Public(), tc.round)
-			switch tc.expectedError {
-			case nil:
-				require.NoError(err, "CheckProposerTimeout unexpected error")
-			default:
-				require.Equal(tc.expectedError, err, "CheckProposerTimeout expected error")
-			}
-		}
-
-		// Generate a commitment.
-		childBlk, _, body := generateComputeBody(t)
-		commit1, err := SignExecutorCommitment(sk1, &body)
-		require.NoError(err, "SignExecutorCommitment")
-		// Adding commitment 1 should succeed.
-		err = pool.AddExecutorCommitment(ctx, childBlk, nopSV, nl, commit1)
-		require.NoError(err, "AddExecutorCommitment")
-
-		// Timeout after commitment should fail.
-		err = pool.CheckProposerTimeout(ctx, childBlk, nopSV, nl, sk2.Public(), 0)
-		require.Error(err, "CheckProposerTimeout commitment exists")
-		require.Equal(ErrAlreadyCommitted, err, "CheckProposerTimeout commitment exists")
-	})
-}
-
-func generateMockCommittee(t *testing.T) (
-	rt *registry.Runtime,
-	sks []signature.Signer,
-	committee *scheduler.Committee,
-	nl NodeLookup,
-) {
-	// Generate a non-TEE runtime.
-	var rtID common.Namespace
-	_ = rtID.UnmarshalHex("0000000000000000000000000000000000000000000000000000000000000000")
-
-	rt = &registry.Runtime{
+	rtTEE := &registry.Runtime{
 		Versioned:   cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
-		ID:          rtID,
+		ID:          id,
 		Kind:        registry.KindCompute,
 		TEEHardware: node.TEEHardwareInvalid,
-		Storage: registry.StorageParameters{
-			GroupSize:           1,
-			MinWriteReplication: 1,
+		Executor: registry.ExecutorParameters{
+			MaxMessages: 32,
 		},
+		GovernanceModel: registry.GovernanceEntity,
 	}
 
-	// Generate commitment signing keys.
-	sk1, err := memorySigner.NewSigner(rand.Reader)
-	require.NoError(t, err, "NewSigner")
-	sk2, err := memorySigner.NewSigner(rand.Reader)
-	require.NoError(t, err, "NewSigner")
-	sk3, err := memorySigner.NewSigner(rand.Reader)
-	require.NoError(t, err, "NewSigner")
-	sks = append(sks, sk1, sk2, sk3)
+	// Generate node signing keys.
+	worker, err := memorySigner.NewSigner(rand.Reader)
+	require.NoError(t, err)
+	backup, err := memorySigner.NewSigner(rand.Reader)
+	require.NoError(t, err)
 
-	// Generate a committee.
-	committee = &scheduler.Committee{
+	// Prepare a simple committee.
+	committee := &scheduler.Committee{
 		Kind: scheduler.KindComputeExecutor,
 		Members: []*scheduler.CommitteeNode{
 			{
 				Role:      scheduler.RoleWorker,
-				PublicKey: sk1.Public(),
-			},
-			{
-				Role:      scheduler.RoleWorker,
-				PublicKey: sk2.Public(),
+				PublicKey: worker.Public(),
 			},
 			{
 				Role:      scheduler.RoleBackupWorker,
-				PublicKey: sk3.Public(),
+				PublicKey: backup.Public(),
 			},
 		},
 	}
-	nl = &staticNodeLookup{
-		runtime: &node.Runtime{
-			ID: rtID,
+
+	// Last block upon which commitments will be constructed.
+	lastBlock := block.NewGenesisBlock(id, 0)
+
+	t.Run("Verify", func(t *testing.T) {
+		ec := generateCommitment(worker.Public(), worker.Public(), lastBlock, nil, nil)
+
+		// Verify a valid signature.
+		err = ec.Sign(worker, id)
+		require.NoError(t, err)
+
+		err = ec.Verify(id)
+		require.NoError(t, err)
+
+		// Verify invalid signature.
+		ec.Signature[0]++ // Corrupt.
+
+		err = ec.Verify(id)
+		require.Error(t, err)
+	})
+
+	t.Run("Validate basic", func(t *testing.T) {
+		// Valid commitment.
+		ec := generateCommitment(worker.Public(), worker.Public(), lastBlock, nil, nil)
+
+		err = ec.Sign(worker, id)
+		require.NoError(t, err)
+
+		err = ec.ValidateBasic()
+		require.NoError(t, err)
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nil)
+		require.NoError(t, err)
+
+		// Invalid commitments.
+		for _, tc := range []struct {
+			name        string
+			fn          func(*ExecutorCommitment)
+			expectedErr error
+		}{
+			{"MissingIORootHash", func(ec *ExecutorCommitment) { ec.Header.Header.IORoot = nil }, ErrBadExecutorCommitment},
+			{"MissingStateRootHash", func(ec *ExecutorCommitment) { ec.Header.Header.StateRoot = nil }, ErrBadExecutorCommitment},
+			{"MissingMessagesHash", func(ec *ExecutorCommitment) { ec.Header.Header.MessagesHash = nil }, ErrBadExecutorCommitment},
+			{"MissingInMessagesHash", func(ec *ExecutorCommitment) { ec.Header.Header.InMessagesHash = nil }, ErrBadExecutorCommitment},
+			{"BadFailureIndicating", func(ec *ExecutorCommitment) { ec.Header.Failure = FailureUnknown }, ErrBadExecutorCommitment},
+		} {
+			ec := generateCommitment(worker.Public(), worker.Public(), lastBlock, nil, nil)
+
+			tc.fn(ec)
+
+			err = ec.Sign(worker, id)
+			require.NoError(t, err)
+
+			err = ec.ValidateBasic()
+			require.Error(t, err)
+
+			err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nil)
+			require.ErrorIs(t, err, tc.expectedErr)
+		}
+	})
+
+	t.Run("Block chaining", func(t *testing.T) {
+		for _, tc := range []struct {
+			name        string
+			fn          func(*ExecutorCommitment)
+			expectedErr error
+		}{
+			{"BlockBadRound", func(ec *ExecutorCommitment) { ec.Header.Header.Round-- }, ErrNotBasedOnCorrectBlock},
+			{"BlockBadPreviousHash", func(ec *ExecutorCommitment) { ec.Header.Header.PreviousHash.FromBytes([]byte("invalid")) }, ErrNotBasedOnCorrectBlock},
+		} {
+			ec := generateCommitment(worker.Public(), worker.Public(), lastBlock, nil, nil)
+
+			tc.fn(ec)
+
+			err = ec.Sign(worker, id)
+			require.NoError(t, err)
+
+			err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nil)
+			require.ErrorIs(t, err, tc.expectedErr)
+		}
+	})
+
+	t.Run("Submitting failure", func(t *testing.T) {
+		// Schedulers are not allowed to submit failures.
+		ec := generateFailure(worker.Public(), worker.Public(), lastBlock)
+		ec.Header.Failure = FailureUnknown
+
+		err = ec.Sign(worker, id)
+		require.NoError(t, err)
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nil)
+		require.ErrorIs(t, err, ErrBadExecutorCommitment)
+
+		// Others are.
+		ec = generateFailure(backup.Public(), worker.Public(), lastBlock)
+
+		err = ec.Sign(backup, id)
+		require.NoError(t, err)
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nil)
+		require.NoError(t, err)
+	})
+
+	t.Run("Emitted messages", func(t *testing.T) {
+		// Prepare messages.
+		msg := message.Message{
+			Staking: &message.StakingMessage{
+				Transfer: &staking.Transfer{},
+			},
+		}
+		msgs := make([]message.Message, 0, rtTEE.Executor.MaxMessages)
+		for i := 0; i < int(rtTEE.Executor.MaxMessages); i++ {
+			msgs = append(msgs, msg)
+		}
+
+		// Non-schedulers are not allowed to emit messages.
+		ec := generateCommitment(backup.Public(), worker.Public(), lastBlock, msgs, nil)
+
+		err = ec.Sign(backup, id)
+		require.NoError(t, err)
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nil)
+		require.ErrorIs(t, err, ErrInvalidMessages)
+
+		// Only schedulers are.
+		ec = generateCommitment(worker.Public(), worker.Public(), lastBlock, msgs, nil)
+
+		err = ec.Sign(worker, id)
+		require.NoError(t, err)
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nil)
+		require.NoError(t, err)
+
+		// But not to many.
+		tooManyMsgs := append(msgs, msg) // This should allocate a new array with larger capacity.
+
+		ec = generateCommitment(worker.Public(), worker.Public(), lastBlock, tooManyMsgs, nil)
+
+		err = ec.Sign(worker, id)
+		require.NoError(t, err)
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nil)
+		require.ErrorIs(t, err, ErrInvalidMessages)
+
+		// And the hash should match.
+		ec = generateCommitment(worker.Public(), worker.Public(), lastBlock, msgs, nil)
+		ec.Header.Header.MessagesHash[0]++ // Corrupt.
+
+		err = ec.Sign(worker, id)
+		require.NoError(t, err)
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nil)
+		require.ErrorIs(t, err, ErrInvalidMessages)
+
+		// And the messages should be valid.
+		ec = generateCommitment(worker.Public(), worker.Public(), lastBlock, msgs, nil)
+
+		err = ec.Sign(worker, id)
+		require.NoError(t, err)
+
+		invalidMsgErr := fmt.Errorf("all messages are invalid")
+		alwaysInvalidValidator := func(_ []message.Message) error {
+			return invalidMsgErr
+		}
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, alwaysInvalidValidator, nil)
+		require.ErrorIs(t, err, invalidMsgErr)
+
+		// And they are.
+		alwaysValidValidator := func(_ []message.Message) error {
+			return nil
+		}
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, alwaysValidValidator, nil)
+		require.NoError(t, err)
+	})
+
+	t.Run("TEE", func(t *testing.T) {
+		// Prepare a TEE runtime.
+		rtTEE = &registry.Runtime{
+			Versioned:       cbor.NewVersioned(registry.LatestRuntimeDescriptorVersion),
+			ID:              id,
+			Kind:            registry.KindCompute,
+			TEEHardware:     node.TEEHardwareIntelSGX,
+			GovernanceModel: registry.GovernanceEntity,
+		}
+
+		// Generate a dummy RAK.
+		rak, err := memorySigner.NewSigner(rand.Reader)
+		require.NoError(t, err)
+
+		// Prepare commitment.
+		ec := generateCommitment(worker.Public(), worker.Public(), lastBlock, nil, nil)
+
+		rakSig, err := signature.Sign(rak, ComputeResultsHeaderSignatureContext, cbor.Marshal(ec.Header.Header))
+		require.NoError(t, err)
+		ec.Header.RAKSignature = &rakSig.Signature
+
+		err = ec.Sign(worker, id)
+		require.NoError(t, err)
+
+		// No runtime.
+		nl := &staticNodeLookup{}
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nl)
+		require.ErrorIs(t, err, ErrNoRuntime)
+
+		// No node runtime.
+		rtTEE.Deployments = []*registry.VersionInfo{
+			{},
+		}
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nl)
+		require.ErrorIs(t, err, ErrNotInCommittee)
+
+		// No TEE capabilities.
+		nl = &staticNodeLookup{
+			runtimes: []*node.Runtime{
+				{
+					ID: id,
+				},
+			},
+		}
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nl)
+		require.ErrorIs(t, err, ErrRakSigInvalid)
+
+		// Valid RAK signature.
+		nl = &staticNodeLookup{
+			runtimes: []*node.Runtime{
+				{
+					ID: id,
+					Capabilities: node.Capabilities{
+						TEE: &node.CapabilityTEE{
+							Hardware:    node.TEEHardwareIntelSGX,
+							RAK:         rak.Public(),
+							Attestation: []byte("My RAK is my attestation. Verify me."),
+						},
+					},
+				},
+			},
+		}
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nl)
+		require.NoError(t, err)
+
+		// Invalid RAK signature.
+		ec.Header.RAKSignature[0]++ // Corrupt.
+
+		err = ec.Sign(worker, id)
+		require.NoError(t, err)
+
+		err = VerifyExecutorCommitment(ctx, lastBlock, rtTEE, committee.ValidFor, ec, nil, nl)
+		require.ErrorIs(t, err, ErrRakSigInvalid)
+	})
+}
+
+func generateCommittee(numNodes int, numWorkers int, numBackupWorkers int) (*scheduler.Committee, error) {
+	if numWorkers > numNodes || numBackupWorkers > numNodes {
+		return nil, fmt.Errorf("the number of workers or backup workers cannot exceed the total number of nodes")
+	}
+
+	// Prepare nodes.
+	nodes := make([]signature.PublicKey, 0, numNodes)
+	for i := 0; i < numNodes; i++ {
+		signer, err := memorySigner.NewSigner(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+
+		nodes = append(nodes, signer.Public())
+	}
+
+	// Generate a committee.
+	committee := scheduler.Committee{
+		Kind: scheduler.KindComputeExecutor,
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		committee.Members = append(committee.Members, &scheduler.CommitteeNode{
+			Role:      scheduler.RoleWorker,
+			PublicKey: nodes[i],
+		})
+	}
+
+	for i := 0; i < numBackupWorkers; i++ {
+		committee.Members = append(committee.Members, &scheduler.CommitteeNode{
+			Role:      scheduler.RoleBackupWorker,
+			PublicKey: nodes[len(nodes)-numBackupWorkers+i],
+		})
+	}
+
+	return &committee, nil
+}
+
+func generateCommitment(nodeID signature.PublicKey, schedulerID signature.PublicKey, lastBlock *block.Block, msgs []message.Message, inMsgs []*message.IncomingMessage) *ExecutorCommitment {
+	blk := block.NewEmptyBlock(lastBlock, 1, block.Normal)
+	msgsHash := message.MessagesHash(msgs)
+	inMsgsHash := message.InMessagesHash(inMsgs)
+
+	return &ExecutorCommitment{
+		NodeID: nodeID,
+		Header: ExecutorCommitmentHeader{
+			SchedulerID: schedulerID,
+			Header: ComputeResultsHeader{
+				Round:          blk.Header.Round,
+				PreviousHash:   blk.Header.PreviousHash,
+				IORoot:         &blk.Header.IORoot,
+				StateRoot:      &blk.Header.StateRoot,
+				MessagesHash:   &msgsHash,
+				InMessagesHash: &inMsgsHash,
+			},
+		},
+		Messages: msgs,
+	}
+}
+
+func generateFailure(nodeID signature.PublicKey, schedulerID signature.PublicKey, lastBlock *block.Block) *ExecutorCommitment {
+	blk := block.NewEmptyBlock(lastBlock, 1, block.Normal)
+
+	return &ExecutorCommitment{
+		NodeID: nodeID,
+		Header: ExecutorCommitmentHeader{
+			SchedulerID: schedulerID,
+			Header: ComputeResultsHeader{
+				Round:        blk.Header.Round,
+				PreviousHash: blk.Header.PreviousHash,
+			},
+			Failure: FailureUnknown,
 		},
 	}
-
-	return
 }
 
-func generateComputeBody(t *testing.T) (*block.Block, *block.Block, ComputeBody) {
-	var id common.Namespace
-	childBlk := block.NewGenesisBlock(id, 0)
-	parentBlk := block.NewEmptyBlock(childBlk, 1, block.Normal)
+func generateMemberCommitment(committee *scheduler.Committee, lastBlock *block.Block, node int, scheduler int) *ExecutorCommitment {
+	nodeID := committee.Members[node].PublicKey
+	schedulerID := committee.Members[scheduler].PublicKey
 
-	body := ComputeBody{
-		Header: ComputeResultsHeader{
-			Round:        parentBlk.Header.Round,
-			PreviousHash: parentBlk.Header.PreviousHash,
-			IORoot:       &parentBlk.Header.IORoot,
-			StateRoot:    &parentBlk.Header.StateRoot,
-		},
-	}
-
-	// Generate dummy storage receipt signature.
-	sig := generateStorageReceiptSignature(t, parentBlk, &body)
-	body.StorageSignatures = []signature.Signature{sig}
-	parentBlk.Header.StorageSignatures = []signature.Signature{sig}
-
-	// Generate dummy txn scheduler signature.
-	body.TxnSchedSig = generateTxnSchedulerSignature(t, childBlk, &body)
-
-	return childBlk, parentBlk, body
+	return generateCommitment(nodeID, schedulerID, lastBlock, nil, nil)
 }
 
-func generateStorageReceiptSignature(t *testing.T, blk *block.Block, body *ComputeBody) signature.Signature {
-	sk, err := memorySigner.NewSigner(rand.Reader)
-	require.NoError(t, err, "NewSigner")
+func generateMemberFailure(committee *scheduler.Committee, lastBlock *block.Block, node int, scheduler int) *ExecutorCommitment {
+	nodeID := committee.Members[node].PublicKey
+	schedulerID := committee.Members[scheduler].PublicKey
 
-	receiptBody := storage.ReceiptBody{
-		Version:   1,
-		Namespace: blk.Header.Namespace,
-		Round:     blk.Header.Round,
-		Roots:     body.RootsForStorageReceipt(),
-	}
-	signed, err := signature.SignSigned(sk, storage.ReceiptSignatureContext, &receiptBody)
-	require.NoError(t, err, "SignSigned")
-
-	return signed.Signature
+	return generateFailure(nodeID, schedulerID, lastBlock)
 }
 
-func generateTxnSchedulerSignature(t *testing.T, childBlk *block.Block, body *ComputeBody) signature.Signature {
-	body.InputRoot = hash.Hash{}
-	body.InputStorageSigs = []signature.Signature{}
-	dispatch := &ProposedBatch{
-		IORoot:            body.InputRoot,
-		StorageSignatures: body.InputStorageSigs,
-		Header:            childBlk.Header,
-	}
-	sk, err := memorySigner.NewSigner(rand.Reader)
-	require.NoError(t, err, "NewSigner")
-	signedDispatch, err := SignProposedBatch(sk, dispatch)
-	require.NoError(t, err, "SignProposedBatch")
-
-	return signedDispatch.Signature
+type staticNodeLookup struct {
+	runtimes []*node.Runtime
 }
 
-func setupDiscrepancy(
-	t *testing.T,
-	rt *registry.Runtime,
-	sks []signature.Signer,
-	committee *scheduler.Committee,
-	nl NodeLookup,
-) (*Pool, *block.Block, *block.Block, *ComputeBody) {
-	sk1 := sks[0]
-	sk2 := sks[1]
-
-	// Create a pool.
-	pool := Pool{
-		Runtime:   rt,
-		Committee: committee,
-	}
-
-	// Generate a commitment.
-	childBlk, parentBlk, body := generateComputeBody(t)
-
-	commit1, err := SignExecutorCommitment(sk1, &body)
-	require.NoError(t, err, "SignExecutorCommitment")
-
-	correctBody := body
-
-	// Update state root and fix the storage receipt.
-	badHash := hash.NewFromBytes([]byte("discrepancy"))
-	body.Header.StateRoot = &badHash
-	body.StorageSignatures = []signature.Signature{generateStorageReceiptSignature(t, parentBlk, &body)}
-
-	commit2, err := SignExecutorCommitment(sk2, &body)
-	require.NoError(t, err, "SignExecutorCommitment")
-
-	// Adding commitment 1 should succeed.
-	err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit1)
-	require.NoError(t, err, "AddExecutorCommitment")
-
-	// There should not be enough executor commitments.
-	err = pool.CheckEnoughCommitments(false)
-	require.Error(t, err, "CheckEnoughCommitments")
-	require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-	err = pool.CheckEnoughCommitments(true)
-	require.Error(t, err, "CheckEnoughCommitments")
-	require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-
-	// Adding commitment 2 should succeed.
-	err = pool.AddExecutorCommitment(context.Background(), childBlk, nopSV, nl, commit2)
-	require.NoError(t, err, "AddExecutorCommitment")
-
-	// There should be enough executor commitments.
-	err = pool.CheckEnoughCommitments(false)
-	require.NoError(t, err, "CheckEnoughCommitments")
-
-	// There should be a discrepancy.
-	_, err = pool.DetectDiscrepancy()
-	require.Error(t, err, "DetectDiscrepancy")
-	require.Equal(t, ErrDiscrepancyDetected, err)
-	require.Equal(t, true, pool.Discrepancy)
-
-	// There should not be enough executor commitments from backup workers.
-	err = pool.CheckEnoughCommitments(false)
-	require.Error(t, err, "CheckEnoughCommitments")
-	require.Equal(t, ErrStillWaiting, err, "CheckEnoughCommitments")
-
-	return &pool, childBlk, parentBlk, &correctBody
+func (n *staticNodeLookup) Node(_ context.Context, id signature.PublicKey) (*node.Node, error) {
+	return &node.Node{
+		Versioned: cbor.NewVersioned(node.LatestNodeDescriptorVersion),
+		ID:        id,
+		Runtimes:  n.runtimes,
+	}, nil
 }

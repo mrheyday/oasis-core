@@ -1,6 +1,7 @@
 package remotesigner
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -9,7 +10,6 @@ import (
 	fileSigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/file"
 	remoteSigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/remote"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/tls"
-	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
@@ -35,7 +35,7 @@ func (sc *basicImpl) Clone() scenario.Scenario {
 	}
 }
 
-func (sc *basicImpl) Run(childEnv *env.Env) error {
+func (sc *basicImpl) Run(ctx context.Context, childEnv *env.Env) error {
 	// Provision the server keys.
 	sc.logger.Info("provisioning the server keys")
 	serverBinary, _ := sc.flags.GetString(cfgServerBinary)
@@ -45,7 +45,7 @@ func (sc *basicImpl) Run(childEnv *env.Env) error {
 		"init",
 		serverBinary,
 		[]string{
-			"--" + cmdCommon.CfgDataDir, childEnv.Dir(),
+			"--datadir", childEnv.Dir(),
 			"init",
 		},
 	); err != nil {
@@ -71,7 +71,7 @@ func (sc *basicImpl) Run(childEnv *env.Env) error {
 		"init_client",
 		serverBinary,
 		[]string{
-			"--" + cmdCommon.CfgDataDir, childEnv.Dir(),
+			"--datadir", childEnv.Dir(),
 			"init_client",
 		},
 	); err != nil {
@@ -90,7 +90,7 @@ func (sc *basicImpl) Run(childEnv *env.Env) error {
 		"server",
 		serverBinary,
 		[]string{
-			"--" + cmdCommon.CfgDataDir, childEnv.Dir(),
+			"--datadir", childEnv.Dir(),
 			"--client.certificate", filepath.Join(childEnv.Dir(), "remote_signer_client_cert.pem"),
 		},
 		lw,
@@ -100,7 +100,13 @@ func (sc *basicImpl) Run(childEnv *env.Env) error {
 		return err
 	}
 	childEnv.AddTermOnCleanup(cmd)
-	time.Sleep(2 * time.Second) // TODO: Is this needed?
+
+	// TODO: Is this needed?
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(2 * time.Second):
+	}
 
 	// Initialize a client.
 	sc.logger.Info("initializing in-process client")
@@ -117,14 +123,13 @@ func (sc *basicImpl) Run(childEnv *env.Env) error {
 			ClientCertificate: clientCert,
 			ServerCertificate: serverCert,
 		},
-		signature.SignerRoles...,
 	)
 	if err != nil {
 		return err
 	}
 
 	// Run basic common signer tests.
-	if err = signerTests.BasicTests(sf, sc.logger); err != nil {
+	if err = signerTests.BasicTests(sf, sc.logger, signature.SignerRoles); err != nil {
 		return err
 	}
 

@@ -9,6 +9,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"hash"
+	"io"
+
+	cmtbytes "github.com/cometbft/cometbft/libs/bytes"
 
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 )
@@ -50,17 +53,28 @@ func (h *Hash) UnmarshalBinary(data []byte) error {
 
 // MarshalText encodes a Hash into text form.
 func (h Hash) MarshalText() (data []byte, err error) {
-	return []byte(base64.StdEncoding.EncodeToString(h[:])), nil
+	return h.MarshalHex()
 }
 
 // UnmarshalText decodes a text marshaled Hash.
 func (h *Hash) UnmarshalText(text []byte) error {
-	b, err := base64.StdEncoding.DecodeString(string(text))
+	err := h.UnmarshalHex(string(text))
 	if err != nil {
-		return err
+		// For backwards compatibility (e.g. to be able to load the
+		// Cobalt Upgrade genesis file), fallback to accepting
+		// Base64-encoded Hash values.
+		b, err := base64.StdEncoding.DecodeString(string(text))
+		if err != nil {
+			return err
+		}
+		return h.UnmarshalBinary(b)
 	}
+	return nil
+}
 
-	return h.UnmarshalBinary(b)
+// MarshalHex encodes a Hash into a hexadecimal form.
+func (h *Hash) MarshalHex() ([]byte, error) {
+	return []byte(hex.EncodeToString(h[:])), nil
 }
 
 // UnmarshalHex deserializes a hexadecimal text string into the given type.
@@ -106,9 +120,14 @@ func (h *Hash) IsEmpty() bool {
 	return subtle.ConstantTimeCompare(h[:], emptyHash[:]) == 1
 }
 
+// Hex returns the hex-encoded representation of a hash.
+func (h Hash) Hex() string {
+	return hex.EncodeToString(h[:])
+}
+
 // String returns the string representation of a hash.
 func (h Hash) String() string {
-	return hex.EncodeToString(h[:])
+	return h.Hex()
 }
 
 // Truncate returns the first n bytes of a hash.
@@ -128,6 +147,22 @@ func NewFrom(v interface{}) (h Hash) {
 // NewFromBytes creates a new hash by hashing the provided byte string(s).
 func NewFromBytes(data ...[]byte) (h Hash) {
 	h.FromBytes(data...)
+	return
+}
+
+// NewFromReader creates a new hash by hashing data from the provided reader until EOF.
+func NewFromReader(reader io.Reader) (Hash, error) {
+	b := NewBuilder()
+	if _, err := io.Copy(b, reader); err != nil {
+		return Hash{}, err
+	}
+	return b.Build(), nil
+}
+
+// LoadFromHexBytes creates a new hash by loading it from the given CometBFT
+// HexBytes byte array.
+func LoadFromHexBytes(data cmtbytes.HexBytes) (h Hash) {
+	_ = h.UnmarshalBinary(data[:])
 	return
 }
 

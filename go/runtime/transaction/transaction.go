@@ -11,6 +11,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/keyformat"
+	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/node"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/syncer"
@@ -75,15 +76,56 @@ func (ak *artifactKind) UnmarshalBinary(data []byte) error {
 }
 
 var (
+	// keyFormat is the namespace for the runtime transaction key formats.
+	keyFormat = keyformat.NewNamespace("runtime transaction")
+
 	// txnKeyFmt is the key format used for transaction artifacts.
 	// The artifactKind parameter is needed to compute the enum size in bytes. We put some marshallable value there.
-	txnKeyFmt = keyformat.New('T', &hash.Hash{}, artifactKind(1))
+	txnKeyFmt = keyFormat.New('T', &hash.Hash{}, artifactKind(1))
 	// tagKeyFmt is the key format used for emitted tags.
 	//
 	// This is kept separate so that clients can query only tags they are
 	// interested in instead of needing to go through all transactions.
-	tagKeyFmt = keyformat.New('E', []byte{}, &hash.Hash{})
+	tagKeyFmt = keyFormat.New('E', []byte{}, &hash.Hash{})
 )
+
+// ValidateIOWriteLog validates the writelog for IO storage.
+func ValidateIOWriteLog(writeLog writelog.WriteLog, maxBatchSize, maxBatchSizeBytes uint64) error {
+	var (
+		hash            hash.Hash
+		kind            artifactKind
+		decKey          []byte
+		inputs, outputs uint64
+		inputSize       uint64
+	)
+	for _, wle := range writeLog {
+		switch {
+		case txnKeyFmt.Decode(wle.Key, &hash, &kind):
+			if kind != kindInput && kind != kindOutput {
+				return fmt.Errorf("transaction: invalid artifact kind")
+			}
+			if kind == kindInput {
+				inputs++
+				inputSize += uint64(len(wle.Value))
+			}
+			if kind == kindOutput {
+				outputs++
+			}
+		case tagKeyFmt.Decode(wle.Key, &decKey, &hash):
+		default:
+			return fmt.Errorf("transaction: invalid key format")
+		}
+
+		if inputs > maxBatchSize || outputs > maxBatchSize {
+			return fmt.Errorf("transaction: too many inputs or outputs")
+		}
+		if inputSize > maxBatchSizeBytes {
+			return fmt.Errorf("transaction: input set size exceeds configuration")
+		}
+	}
+
+	return nil
+}
 
 // inputArtifacts are the input transaction artifacts.
 //
@@ -158,9 +200,18 @@ type Tree struct {
 
 // NewTree creates a new transaction artifacts tree.
 func NewTree(rs syncer.ReadSyncer, ioRoot node.Root) *Tree {
+	var tree mkvs.Tree
+	if ldb, ok := rs.(storage.LocalBackend); ok {
+		// When the passed instance is actually a local storage backend, use it directly instead of
+		// going through the read syncer interface. This avoids some overhead.
+		tree = mkvs.NewWithRoot(nil, ldb.NodeDB(), ioRoot)
+	} else {
+		tree = mkvs.NewWithRoot(rs, nil, ioRoot, mkvs.Capacity(50000, 16*1024*1024))
+	}
+
 	return &Tree{
 		ioRoot: ioRoot,
-		tree:   mkvs.NewWithRoot(rs, nil, ioRoot, mkvs.Capacity(50000, 16*1024*1024)),
+		tree:   tree,
 	}
 }
 
@@ -270,8 +321,7 @@ func (t *Tree) GetInputBatch(ctx context.Context, maxBatchSize, maxBatchSizeByte
 	return bo.batch, nil
 }
 
-// GetTransactions returns a list of all transaction artifacts in the tree
-// in a stable order (transactions are ordered by their hash).
+// GetTransactions returns a list of all transaction artifacts in batch order.
 func (t *Tree) GetTransactions(ctx context.Context) ([]*Transaction, error) {
 	it := t.tree.NewIterator(ctx, mkvs.IteratorPrefetch(prefetchArtifactCount))
 	defer it.Close()
@@ -318,6 +368,11 @@ func (t *Tree) GetTransactions(ctx context.Context) ([]*Transaction, error) {
 	if it.Err() != nil {
 		return nil, fmt.Errorf("transaction: get transactions failed: %w", it.Err())
 	}
+
+	// Reorder transactions so they are in batch order (how they were executed).
+	sort.SliceStable(txs, func(i, j int) bool {
+		return txs[i].BatchOrder < txs[j].BatchOrder
+	})
 
 	return txs, nil
 }
@@ -374,7 +429,7 @@ func (t *Tree) GetTransaction(ctx context.Context, txHash hash.Hash) (*Transacti
 func (t *Tree) GetTransactionMultiple(ctx context.Context, txHashes []hash.Hash) (map[hash.Hash]*Transaction, error) {
 	// Prefetch all of the specified transactions from storage so that we
 	// don't need to do multiple round trips.
-	var keys [][]byte
+	keys := make([][]byte, 0, len(txHashes))
 	for _, txHash := range txHashes {
 		keys = append(keys, txnKeyFmt.Encode(&txHash)) // nolint: gosec
 	}
@@ -415,7 +470,7 @@ func (t *Tree) GetTags(ctx context.Context) (Tags, error) {
 			break
 		}
 
-		tags = append(tags, Tag{
+		tags = append(tags, &Tag{
 			Key:    decKey,
 			Value:  it.Value(),
 			TxHash: decHash,
@@ -426,6 +481,64 @@ func (t *Tree) GetTags(ctx context.Context) (Tags, error) {
 	}
 
 	return tags, nil
+}
+
+// GetTag looks up a specific tag and retrieves its values.
+func (t *Tree) GetTag(ctx context.Context, tag []byte) (Tags, error) {
+	it := t.tree.NewIterator(ctx)
+	defer it.Close()
+
+	var tags Tags
+	for it.Seek(tagKeyFmt.Encode(tag)); it.Valid(); it.Next() {
+		var (
+			decKey  []byte
+			decHash hash.Hash
+		)
+		if !tagKeyFmt.Decode(it.Key(), &decKey, &decHash) {
+			break
+		}
+		if !bytes.Equal(decKey, tag) {
+			break
+		}
+
+		tags = append(tags, &Tag{
+			Key:    decKey,
+			Value:  it.Value(),
+			TxHash: decHash,
+		})
+	}
+	if it.Err() != nil {
+		return nil, it.Err()
+	}
+
+	return tags, nil
+}
+
+// GetTagMultiple looks up multiple tags at once and retrieves their values. Tags that don't exist
+// are skipped.
+//
+// The function behaves identically to multiple GetTag calls, but is more efficient as it performs
+// prefetching to get all the requested tags in one round trip.
+func (t *Tree) GetTagMultiple(ctx context.Context, tags [][]byte) (Tags, error) {
+	// Prefetch all of the specified tags from storage so that we don't need to do multiple round
+	// trips.
+	keys := make([][]byte, 0, len(tags))
+	for _, tag := range tags {
+		keys = append(keys, tagKeyFmt.Encode(tag))
+	}
+	if err := t.tree.PrefetchPrefixes(ctx, keys, prefetchArtifactCount); err != nil {
+		return nil, fmt.Errorf("transaction: prefetch failed: %w", err)
+	}
+
+	var foundTags Tags
+	for _, tg := range tags {
+		tgs, err := t.GetTag(ctx, tg)
+		if err != nil {
+			return nil, err
+		}
+		foundTags = append(foundTags, tgs...)
+	}
+	return foundTags, nil
 }
 
 // Commit commits the updates to the underlying Merkle tree and returns the

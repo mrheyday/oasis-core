@@ -1,24 +1,21 @@
 // Package logging implements support for structured logging.
 //
 // This package is inspired heavily by go-logging, kit/log and the
-// tendermint libs/log packages, and is oriented towards making
+// CometBFT libs/log packages, and is oriented towards making
 // the structured logging experience somewhat easier to use.
 package logging
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
-	goLog "log"
 	"sort"
 	"strings"
 	"sync"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	ipfsLog "github.com/ipfs/go-log/v2"
 	"github.com/spf13/pflag"
-
-	goLogging "github.com/whyrusleeping/go-logging"
 )
 
 var (
@@ -192,6 +189,13 @@ func (l *Logger) With(keyvals ...interface{}) *Logger {
 	}
 }
 
+// NewNopLogger creates a logger that doesn't perform any logging.
+func NewNopLogger() *Logger {
+	return &Logger{
+		logger: log.NewNopLogger(),
+	}
+}
+
 // GetLevel returns the current global log level.
 func GetLevel() Level {
 	return backend.defaultLevel
@@ -214,6 +218,19 @@ func GetLogger(module string) *Logger {
 // additional logging wrappers.
 func GetLoggerEx(module string, extraUnwind int) *Logger {
 	return backend.getLogger(module, extraUnwind)
+}
+
+// GetBaseLogger creates a new non-prefixed logger instance with the
+// specified module.
+//
+// The returned logger will not pre-include any log fields (aka prefixes)
+// except for the module name. Its level will be set in accordance
+// with the global config, which can be per-module.
+//
+// This may be called from any point, including before Initialize is
+// called, allowing for the construction of a package level Logger.
+func GetBaseLogger(module string) *Logger {
+	return backend.getBaseLogger(module)
 }
 
 // Initialize initializes the logging backend to write to the provided
@@ -242,7 +259,6 @@ func Initialize(w io.Writer, format Format, defaultLvl Level, moduleLvls map[str
 	}
 
 	logger = level.NewFilter(logger, defaultLvl.toOption())
-	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
 
 	backend.baseLogger = logger
 	backend.moduleLevels = moduleLvls
@@ -262,13 +278,15 @@ func Initialize(w io.Writer, format Format, defaultLvl Level, moduleLvls map[str
 	backend.earlyLoggers = nil
 
 	// libp2p/IPFS uses yet another logging library, that appears to be a
-	// wrapper around go-logging.  Because it's quality IPFS code, it's
-	// configured via env vars, from the package `init()`.
-	//
-	// Till we can write a nice wrapper around it, to make it do what we
-	// want, reach into the underlying library and squelch it.
-	goLogging.Reset()
-	_ = goLogging.SetBackend(goLogging.NewLogBackend(ioutil.Discard, "libp2p", goLog.LstdFlags))
+	// wrapper around zap.
+	ipfsLogger := newZapCore(log.With(logger, "ts", log.DefaultTimestampUTC), "libp2p", 7)
+	backend.setupLogLevelLocked(ipfsLogger.logger)
+
+	// Update the ipfs core logger.
+	ipfsLog.SetPrimaryCore(ipfsLogger)
+	// Enable all logs on the ipfs logger.
+	// zapCore will filter logs based on the configured logging level of the oasis node.
+	ipfsLog.SetDebugLogging()
 
 	return nil
 }
@@ -324,19 +342,38 @@ func (b *logBackend) getLogger(module string, extraUnwind int) *Logger {
 		logger = &log.SwapLogger{}
 	}
 
-	var keyvals []interface{}
-	if module != "" {
-		keyvals = append(keyvals, []interface{}{
-			"module",
-			module,
-		}...)
+	prefixes := []interface{}{
+		"ts", log.DefaultTimestampUTC,
+		"caller", log.Caller(defaultUnwind + extraUnwind),
+		"module", module,
 	}
-	keyvals = append(keyvals, []interface{}{
-		"caller",
-		log.Caller(defaultUnwind + extraUnwind),
-	}...)
 	l := &Logger{
-		logger: log.WithPrefix(logger, keyvals...),
+		logger: log.WithPrefix(logger, prefixes...),
+		module: module,
+	}
+	b.setupLogLevelLocked(l)
+
+	if !b.initialized {
+		// Stash the logger so that it can be instantiated once logging
+		// is actually initialized.
+		sLog := logger.(*log.SwapLogger)
+		b.earlyLoggers = append(b.earlyLoggers, &earlyLogger{swapLogger: sLog, logger: l})
+	}
+
+	return l
+}
+
+func (b *logBackend) getBaseLogger(module string) *Logger {
+	b.Lock()
+	defer b.Unlock()
+
+	logger := b.baseLogger
+	if !b.initialized {
+		logger = &log.SwapLogger{}
+	}
+
+	l := &Logger{
+		logger: log.WithPrefix(logger, "module", module),
 		module: module,
 	}
 	b.setupLogLevelLocked(l)

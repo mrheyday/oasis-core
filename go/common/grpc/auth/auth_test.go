@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	commonGrpc "github.com/oasisprotocol/oasis-core/go/common/grpc"
@@ -22,7 +23,7 @@ const (
 )
 
 // rejectAll is an auth function that rejects all requests.
-func rejectAll(ctx context.Context, fullMethodName string, req interface{}) error {
+func rejectAll(context.Context, interface{}) error {
 	return status.Errorf(codes.PermissionDenied, "rejecting all")
 }
 
@@ -89,10 +90,9 @@ func testAuth(t *testing.T, testCase *testCase) {
 	}()
 
 	// Connect to gRPC server.
-	conn, err := grpc.DialContext(
-		ctx,
+	conn, err := grpc.NewClient(
 		fmt.Sprintf("%s:%d", testCase.serverConfig.Name, testCase.serverConfig.Port),
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&commonGrpc.CBORCodec{})),
 	)
 
@@ -113,7 +113,7 @@ func testAuth(t *testing.T, testCase *testCase) {
 	}
 
 	// Test WatchPings.
-	ch, sub, err := client.WatchPings(ctx, pingQuery)
+	ch, sub, err := client.WatchPings(ctx)
 	require.NoError(err, "Calling WatchPings shouldn't fail")
 	defer sub.Close()
 

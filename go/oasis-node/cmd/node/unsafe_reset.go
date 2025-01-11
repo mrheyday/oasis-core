@@ -1,6 +1,7 @@
 package node
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -8,8 +9,9 @@ import (
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
+	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
-	tendermintCommon "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/common"
+	cmtCommon "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/common"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	"github.com/oasisprotocol/oasis-core/go/runtime/history"
@@ -17,6 +19,8 @@ import (
 )
 
 const (
+	CfgDataDir = "datadir"
+
 	// CfgPreserveLocalStorage exempts the untrusted local storage from
 	// the unsafe-reset sub-command.
 	CfgPreserveLocalStorage = "preserve.local_storage"
@@ -38,9 +42,9 @@ var (
 	runtimesGlob = filepath.Join(runtimeRegistry.RuntimesDir, "*")
 
 	nodeStateGlobs = []string{
-		"abci-mux-state.*.db",
 		"persistent-store.*.db",
-		tendermintCommon.StateDir,
+		cmtCommon.StateDir,
+		"tendermint", // XXX: Legacy filename for consensus state directory.
 		filepath.Join(runtimesGlob, history.DbFilename),
 	}
 
@@ -50,7 +54,7 @@ var (
 	logger = logging.GetLogger("cmd/unsafe-reset")
 )
 
-func doUnsafeReset(cmd *cobra.Command, args []string) {
+func doUnsafeReset(*cobra.Command, []string) {
 	var ok bool
 	defer func() {
 		if !ok {
@@ -62,10 +66,27 @@ func doUnsafeReset(cmd *cobra.Command, args []string) {
 		cmdCommon.EarlyLogAndExit(err)
 	}
 
-	dataDir := cmdCommon.DataDir()
+	dataDir := viper.GetString(CfgDataDir)
 	if dataDir == "" {
 		logger.Error("data directory must be set")
 		return
+	}
+
+	// Do a state dir sanity check.
+	for _, f := range []string{cmtCommon.StateDir, identity.NodeKeyPubFilename} {
+		glob := filepath.Join(dataDir, f)
+		matches, err := filepath.Glob(glob)
+		if err != nil {
+			logger.Error("invalid glob pattern",
+				"err", err,
+				"glob", glob,
+			)
+			return
+		}
+		if len(matches) == 0 && !cmdFlags.Force() {
+			fmt.Printf("%s does not look like an oasis-node data directory, not removing any files. Use --force to run the command regardless.\n", dataDir)
+			return
+		}
 	}
 
 	isDryRun := cmdFlags.DryRun()
@@ -129,7 +150,8 @@ func doUnsafeReset(cmd *cobra.Command, args []string) {
 }
 
 func init() {
-	unsafeResetFlags.Bool(CfgPreserveLocalStorage, false, "preserve per-runtime untrusted local storage")
-	unsafeResetFlags.Bool(CfgPreserveMKVSDatabase, false, "preserve per-runtime MKVS database")
+	unsafeResetFlags.String(CfgDataDir, "", "data directory")
+	unsafeResetFlags.Bool(CfgPreserveLocalStorage, true, "preserve per-runtime untrusted local storage")
+	unsafeResetFlags.Bool(CfgPreserveMKVSDatabase, true, "preserve per-runtime MKVS database")
 	_ = viper.BindPFlags(unsafeResetFlags)
 }

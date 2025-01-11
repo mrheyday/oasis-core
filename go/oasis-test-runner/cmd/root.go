@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -37,6 +38,11 @@ const (
 	cfgNumRuns          = "num_runs"
 	cfgParallelJobCount = "parallel.job_count"
 	cfgParallelJobIndex = "parallel.job_index"
+	cfgMetricsAddr      = "metrics.address"
+	cfgMetricsLabels    = "metrics.labels"
+	cfgMetricsInterval  = "metrics.interval"
+	cfgTimeout          = "timeout"
+	cfgScenarioTimeout  = "scenario_timeout"
 )
 
 var (
@@ -159,7 +165,7 @@ func parseScenarioParams(toRun []scenario.Scenario) (map[string][]scenario.Scena
 	return scListsToRun, nil
 }
 
-// generalizedScenarioNames returns list of generalized scenario names from the
+// generalizedScenarioName returns list of generalized scenario names from the
 // original name to most general name.
 func generalizedScenarioName(name string) []string {
 	dirs := strings.Split(name, "/")
@@ -265,10 +271,14 @@ func initRootEnv(cmd *cobra.Command) (*env.Env, error) {
 	return env, nil
 }
 
-func runRoot(cmd *cobra.Command, args []string) error { // nolint: gocyclo
+func runRoot(cmd *cobra.Command, _ []string) error { // nolint: gocyclo
 	cmd.SilenceUsage = true
 
-	if viper.IsSet(metrics.CfgMetricsAddr) {
+	// Workaround for viper bug: https://github.com/spf13/viper/issues/233
+	_ = viper.BindPFlag(cfgMetricsAddr, cmd.Flags().Lookup(cfgMetricsAddr))
+	_ = viper.BindPFlag(cfgMetricsLabels, cmd.Flags().Lookup(cfgMetricsLabels))
+
+	if viper.IsSet(cfgMetricsAddr) {
 		oasisTestRunnerOnce.Do(func() {
 			prometheus.MustRegister(oasisTestRunnerCollectors...)
 		})
@@ -364,6 +374,10 @@ func runRoot(cmd *cobra.Command, args []string) error { // nolint: gocyclo
 		return fmt.Errorf("root: failed to parse scenario parameters: %w", err)
 	}
 
+	// Allow scenarios to run for a limited amount of time.
+	ctx, cancel := context.WithTimeout(context.Background(), viper.GetDuration(cfgTimeout))
+	defer cancel()
+
 	// Run all requested scenarios.
 	index := 0
 	for run := 0; run < numRuns; run++ {
@@ -421,8 +435,8 @@ func runRoot(cmd *cobra.Command, args []string) error { // nolint: gocyclo
 				}
 
 				// Init per-run prometheus pusher, if metrics are enabled.
-				if viper.IsSet(metrics.CfgMetricsAddr) {
-					pusher = push.New(viper.GetString(metrics.CfgMetricsAddr), metrics.MetricsJobTestRunner)
+				if viper.IsSet(cfgMetricsAddr) {
+					pusher = push.New(viper.GetString(cfgMetricsAddr), metrics.MetricsJobTestRunner)
 					labels := metrics.GetDefaultPushLabels(childEnv.ScenarioInfo())
 					for k, v := range labels {
 						pusher = pusher.Grouping(k, v)
@@ -430,7 +444,7 @@ func runRoot(cmd *cobra.Command, args []string) error { // nolint: gocyclo
 					pusher = pusher.Gatherer(prometheus.DefaultGatherer)
 				}
 
-				if err = doScenario(childEnv, v); err != nil {
+				if err = doScenario(ctx, childEnv, v); err != nil {
 					logger.Error("failed to run scenario",
 						"err", err,
 						"scenario", name,
@@ -466,14 +480,14 @@ func runRoot(cmd *cobra.Command, args []string) error { // nolint: gocyclo
 	return nil
 }
 
-func doScenario(childEnv *env.Env, sc scenario.Scenario) (err error) {
+func doScenario(ctx context.Context, childEnv *env.Env, sc scenario.Scenario) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("root: panic caught running scenario: %v: %s", r, debug.Stack())
 		}
 	}()
 
-	if err = sc.PreInit(childEnv); err != nil {
+	if err = sc.PreInit(); err != nil {
 		err = fmt.Errorf("root: failed to pre-initialize scenario: %w", err)
 		return
 	}
@@ -498,6 +512,12 @@ func doScenario(childEnv *env.Env, sc scenario.Scenario) (err error) {
 	// datadir for some scenarios exceed the maximum unix socket path length.
 	if net != nil {
 		net.Config().UseShortGrpcSocketPaths = true
+
+		// Populate metrics settings.
+		if viper.IsSet(cfgMetricsAddr) {
+			net.Config().Metrics.Address = viper.GetString(cfgMetricsAddr)
+			net.Config().Metrics.Interval = viper.GetDuration(cfgMetricsInterval)
+		}
 	}
 
 	if err = sc.Init(childEnv, net); err != nil {
@@ -513,7 +533,11 @@ func doScenario(childEnv *env.Env, sc scenario.Scenario) (err error) {
 		}
 	}
 
-	if err = sc.Run(childEnv); err != nil {
+	// Allow scenario to run for a limited amount of time.
+	ctx, cancel := context.WithTimeout(ctx, viper.GetDuration(cfgScenarioTimeout))
+	defer cancel()
+
+	if err = sc.Run(ctx, childEnv); err != nil {
 		err = fmt.Errorf("root: failed to run scenario: %w", err)
 		return
 	}
@@ -541,7 +565,7 @@ func doCleanup(childEnv *env.Env) (err error) {
 	return
 }
 
-func runList(cmd *cobra.Command, args []string) {
+func runList(*cobra.Command, []string) {
 	scNames := common.GetScenarioNames()
 	switch len(scNames) {
 	case 0:
@@ -588,9 +612,9 @@ func init() {
 		nil,
 		"regexp patterns matching names of scenarios to skip",
 	)
-	persistentFlags.String(metrics.CfgMetricsAddr, "", "Prometheus address")
+	persistentFlags.String(cfgMetricsAddr, "", "Prometheus address")
 	persistentFlags.StringToString(
-		metrics.CfgMetricsLabels,
+		cfgMetricsLabels,
 		map[string]string{},
 		"override Prometheus labels",
 	)
@@ -602,13 +626,15 @@ func init() {
 	rootFlags.StringVar(&cfgFile, cfgConfigFile, "", "config file")
 	rootFlags.Bool(cfgLogNoStdout, false, "do not multiplex logs to stdout")
 	rootFlags.Duration(
-		metrics.CfgMetricsInterval,
+		cfgMetricsInterval,
 		5*time.Second,
 		"metrics push interval for test runner and oasis nodes",
 	)
 	rootFlags.IntVarP(&numRuns, cfgNumRuns, "n", 1, "number of runs for given scenario(s)")
 	rootFlags.Int(cfgParallelJobCount, 1, "(for CI) number of overall parallel jobs")
 	rootFlags.Int(cfgParallelJobIndex, 0, "(for CI) index of this parallel job")
+	rootFlags.Duration(cfgTimeout, 24*time.Hour, "the maximum allowable total duration for all scenarios")
+	rootFlags.Duration(cfgScenarioTimeout, 20*time.Minute, "the maximum allowable duration for an individual scenario")
 	_ = viper.BindPFlags(rootFlags)
 	rootCmd.Flags().AddFlagSet(rootFlags)
 	rootCmd.Flags().AddFlagSet(env.Flags)

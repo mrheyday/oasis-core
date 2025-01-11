@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 
 	"github.com/golang/snappy"
 
@@ -29,7 +28,11 @@ func createChunk(
 	nextOffset node.Key,
 	err error,
 ) {
-	it := tree.NewIterator(ctx, mkvs.WithProof(root.Hash))
+	it := tree.NewIterator(
+		ctx,
+		// V1 checkpoints use V0 proofs.
+		mkvs.WithProofBuilder(syncer.NewProofBuilderV0(root.Hash, root.Hash)),
+	)
 	defer it.Close()
 
 	// We build the chunk until the proof becomes too large or we have reached the end.
@@ -39,16 +42,10 @@ func createChunk(
 			err = ctx.Err()
 			return
 		}
-
-		nextOffset = it.Key()
 	}
 	if it.Err() != nil {
 		err = fmt.Errorf("chunk: failed to iterate: %w", it.Err())
 		return
-	}
-	if !it.Valid() {
-		// We have finished iterating.
-		nextOffset = nil
 	}
 
 	// Build our chunk.
@@ -57,6 +54,10 @@ func createChunk(
 		err = fmt.Errorf("chunk: failed to build proof: %w", err)
 		return
 	}
+
+	// Determine the next offset (not included in proof).
+	it.Next()
+	nextOffset = it.Key()
 
 	hb := hash.NewBuilder()
 	sw := snappy.NewBufferedWriter(io.MultiWriter(w, hb))
@@ -85,6 +86,7 @@ func restoreChunk(ctx context.Context, ndb db.NodeDB, chunk *ChunkMetadata, r io
 	// Reconstruct the proof.
 	var decodeErr error
 	var p syncer.Proof
+	p.V = checkpointProofsVersion
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -99,7 +101,7 @@ func restoreChunk(ctx context.Context, ndb db.NodeDB, chunk *ChunkMetadata, r io
 			decodeErr = fmt.Errorf("failed to decode chunk: %w", err)
 
 			// Read everything until EOF so we can verify the overall chunk integrity.
-			_, _ = io.Copy(ioutil.Discard, tr)
+			_, _ = io.Copy(io.Discard, tr)
 			break
 		}
 
@@ -133,6 +135,7 @@ func restoreChunk(ctx context.Context, ndb db.NodeDB, chunk *ChunkMetadata, r io
 	emptyRoot := node.Root{
 		Namespace: chunk.Root.Namespace,
 		Version:   chunk.Root.Version,
+		Type:      chunk.Root.Type,
 	}
 	emptyRoot.Hash.Empty()
 
@@ -143,7 +146,7 @@ func restoreChunk(ctx context.Context, ndb db.NodeDB, chunk *ChunkMetadata, r io
 	defer batch.Reset()
 
 	subtree := batch.MaybeStartSubtree(nil, 0, ptr)
-	if err = doRestoreChunk(ctx, batch, subtree, 0, ptr); err != nil {
+	if err = doRestoreChunk(ctx, batch, subtree, 0, ptr, nil); err != nil {
 		return fmt.Errorf("chunk: node import failed: %w", err)
 	}
 	if err = subtree.Commit(); err != nil {
@@ -162,6 +165,7 @@ func doRestoreChunk(
 	subtree db.Subtree,
 	depth node.Depth,
 	ptr *node.Pointer,
+	parent *node.Pointer,
 ) (err error) {
 	if ptr == nil {
 		return
@@ -169,15 +173,22 @@ func doRestoreChunk(
 
 	switch n := ptr.Node.(type) {
 	case nil:
+		if err = subtree.VisitDirtyNode(depth, ptr, parent); err != nil {
+			return
+		}
 	case *node.InternalNode:
+		if err = subtree.VisitDirtyNode(depth, ptr, parent); err != nil {
+			return
+		}
+
 		// Commit internal leaf (considered to be on the same depth as the internal node).
-		if err = doRestoreChunk(ctx, batch, subtree, depth, n.LeafNode); err != nil {
+		if err = doRestoreChunk(ctx, batch, subtree, depth, n.LeafNode, ptr); err != nil {
 			return
 		}
 
 		for _, subNode := range []*node.Pointer{n.Left, n.Right} {
 			newSubtree := batch.MaybeStartSubtree(subtree, depth+1, subNode)
-			if err = doRestoreChunk(ctx, batch, newSubtree, depth+1, subNode); err != nil {
+			if err = doRestoreChunk(ctx, batch, newSubtree, depth+1, subNode, ptr); err != nil {
 				return
 			}
 			if newSubtree != subtree {
@@ -193,6 +204,9 @@ func doRestoreChunk(
 		}
 	case *node.LeafNode:
 		// Leaf node -- store the node.
+		if err = subtree.VisitDirtyNode(depth, ptr, parent); err != nil {
+			return
+		}
 		if err = subtree.PutNode(depth, ptr); err != nil {
 			return
 		}

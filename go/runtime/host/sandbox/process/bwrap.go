@@ -7,8 +7,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
-	dynlib "gitlab.com/yawning/dynlib.git"
+	"github.com/oasisprotocol/oasis-core/go/common/dynlib"
 )
 
 const (
@@ -16,6 +17,8 @@ const (
 
 	sandboxMountBinary = "/entrypoint"
 	sandboxMountLibDir = "/usr/lib"
+
+	sandboxStartTimeout = 5 * time.Second
 )
 
 type bwrap struct {
@@ -23,13 +26,21 @@ type bwrap struct {
 }
 
 type fdPipeBuilder struct {
-	pipes []*os.File
+	pipes    []*os.File
+	deadline time.Time
 }
 
 func (b *fdPipeBuilder) add() (*os.File, string, error) {
 	r, w, err := os.Pipe()
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to create pipe: %w", err)
+	}
+
+	if err = r.SetDeadline(b.deadline); err != nil {
+		return nil, "", fmt.Errorf("failed to set deadline on read pipe: %w", err)
+	}
+	if err = w.SetDeadline(b.deadline); err != nil {
+		return nil, "", fmt.Errorf("failed to set deadline on write pipe: %w", err)
 	}
 
 	// NOTE: Entry i becomes file descriptor 3+i.
@@ -48,6 +59,8 @@ func (b *fdPipeBuilder) close() {
 // NewBubbleWrap creates a Bubblewrap-based sandbox.
 func NewBubbleWrap(cfg Config) (Process, error) {
 	var fdPipes fdPipeBuilder
+	// Make sure the sandbox starts in the given time.
+	fdPipes.deadline = time.Now().Add(sandboxStartTimeout)
 	defer fdPipes.close()
 
 	// Prepare bwrap command-line arguments.
@@ -83,6 +96,12 @@ func NewBubbleWrap(cfg Config) (Process, error) {
 		"--chdir", "/",
 		// Entrypoint binary.
 		"--ro-bind", cfg.Path, sandboxMountBinary,
+	}
+	if cfg.AllowNetwork {
+		// Share network interfaces.
+		fdArgs = append(fdArgs, "--share-net")
+		// Share DNS resolution.
+		fdArgs = append(fdArgs, "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf")
 	}
 	for key, value := range cfg.Env {
 		fdArgs = append(fdArgs, "--setenv", key, value)

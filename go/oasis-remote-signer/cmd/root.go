@@ -21,6 +21,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdBackground "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/background"
 	cmdGrpc "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/grpc"
@@ -28,6 +29,8 @@ import (
 )
 
 const (
+	CfgDataDir = "datadir"
+
 	cfgClientCertificate = "client.certificate"
 
 	// clientCommonName is the common name on the client TLS certificates.
@@ -67,7 +70,11 @@ func Execute() {
 }
 
 func ensureDataDir() (string, error) {
-	dataDir := cmdCommon.DataDir()
+	if config.GlobalConfig.Common.DataDir != "" {
+		return config.GlobalConfig.Common.DataDir, nil
+	}
+
+	dataDir := viper.GetString(CfgDataDir)
 	if dataDir == "" {
 		return "", fmt.Errorf("remote-signer: datadir is mandatory")
 	}
@@ -75,7 +82,7 @@ func ensureDataDir() (string, error) {
 	return dataDir, nil
 }
 
-func doServerInit(cmd *cobra.Command, args []string) {
+func doServerInit(*cobra.Command, []string) {
 	if _, _, err := serverInit(true); err != nil {
 		logger.Error("failed to initialize server keys",
 			"err", err,
@@ -126,7 +133,7 @@ func serverInit(provisionKeys bool) (signature.SignerFactory, *goTls.Certificate
 	return sf, cert, nil
 }
 
-func doClientInit(cmd *cobra.Command, args []string) {
+func doClientInit(*cobra.Command, []string) {
 	if err := func() error {
 		dataDir, err := ensureDataDir()
 		if err != nil {
@@ -147,7 +154,7 @@ func doClientInit(cmd *cobra.Command, args []string) {
 	}
 }
 
-func runRoot(cmd *cobra.Command, args []string) error {
+func runRoot(*cobra.Command, []string) error {
 	// Initialize all of the server keys.
 	sf, cert, err := serverInit(false)
 	if err != nil {
@@ -179,11 +186,10 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	svrCfg := &grpc.ServerConfig{
 		Name:             "remote-signer",
 		Port:             uint16(viper.GetInt(cmdGrpc.CfgServerPort)),
-		Identity:         &identity.Identity{},
+		Identity:         identity.WithTLSCertificate(cert),
 		AuthFunc:         peerCertAuth.AuthFunc,
 		ClientCommonName: clientCommonName,
 	}
-	svrCfg.Identity.SetTLSCertificate(cert)
 	svr, err := grpc.NewServer(svrCfg)
 	if err != nil {
 		logger.Error("failed to instantiate gRPC server",
@@ -215,6 +221,9 @@ func init() {
 	cmdCommon.SetBasicVersionTemplate(rootCmd)
 
 	_ = viper.BindPFlags(cmdCommon.RootFlags)
+
+	rootCmd.PersistentFlags().String(CfgDataDir, "", "data directory")
+	_ = viper.BindPFlag(CfgDataDir, rootCmd.PersistentFlags().Lookup(CfgDataDir))
 
 	rootFlags.String(cfgClientCertificate, "client_cert.pem", "client TLS certificate (REQUIRED)")
 	_ = viper.BindPFlags(rootFlags)

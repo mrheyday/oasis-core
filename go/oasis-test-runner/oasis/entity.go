@@ -47,6 +47,19 @@ func (ent *Entity) Inner() (*entity.Entity, signature.Signer) {
 	return ent.entity, ent.entitySigner
 }
 
+// ID returns the entity's ID.
+func (ent *Entity) ID() signature.PublicKey {
+	return ent.entity.ID
+}
+
+// Dir returns the path to the entity directory.
+func (ent *Entity) Dir() string {
+	if ent.isDebugTestEntity {
+		return ""
+	}
+	return ent.dir.String()
+}
+
 // EntityKeyPath returns the path to the entity private key.
 func (ent *Entity) EntityKeyPath() string {
 	if ent.isDebugTestEntity {

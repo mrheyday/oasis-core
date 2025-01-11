@@ -5,8 +5,11 @@ use std::{
 };
 
 use lazy_static::lazy_static;
+use slog::error;
 
-const INITIAL_MINIMUM_TIME: i64 = 1554076800; // Mon, 01 Apr 2019 00:00:00 GMT
+use crate::common::{logger::get_logger, process};
+
+const INITIAL_MINIMUM_TIME: i64 = 1704067200; // Mon, 01 Jan 2024 00:00:00 UTC
 
 struct TimeSource {
     inner: Mutex<Inner>,
@@ -29,7 +32,11 @@ pub fn insecure_posix_time() -> i64 {
     let now = now.as_secs() as i64;
 
     if now < inner.timestamp {
-        panic!("time: clock appeared to have ran backwards")
+        error!(
+            get_logger("runtime/time"),
+            "clock appeared to have ran backwards"
+        );
+        process::abort();
     }
     inner.timestamp = now;
 

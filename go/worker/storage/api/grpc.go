@@ -14,8 +14,8 @@ var (
 
 	// methodGetLastSyncedRound is the GetLastSyncedRound method.
 	methodGetLastSyncedRound = serviceName.NewMethod("GetLastSyncedRound", &GetLastSyncedRoundRequest{})
-	// methodForceFinalize is the ForceFinalize method.
-	methodForceFinalize = serviceName.NewMethod("ForceFinalize", &ForceFinalizeRequest{})
+	// methodPauseCheckpointer is the PauseCheckpointer method.
+	methodPauseCheckpointer = serviceName.NewMethod("PauseCheckpointer", &PauseCheckpointerRequest{})
 
 	// serviceDesc is the gRPC service descriptor.
 	serviceDesc = grpc.ServiceDesc{
@@ -27,15 +27,15 @@ var (
 				Handler:    handlerGetLastSyncedRound,
 			},
 			{
-				MethodName: methodForceFinalize.ShortName(),
-				Handler:    handlerForceFinalize,
+				MethodName: methodPauseCheckpointer.ShortName(),
+				Handler:    handlerPauseCheckpointer,
 			},
 		},
 		Streams: []grpc.StreamDesc{},
 	}
 )
 
-func handlerGetLastSyncedRound( // nolint: golint
+func handlerGetLastSyncedRound(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -58,25 +58,25 @@ func handlerGetLastSyncedRound( // nolint: golint
 	return interceptor(ctx, rq, info, handler)
 }
 
-func handlerForceFinalize( // nolint: golint
+func handlerPauseCheckpointer(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
-	rq := new(ForceFinalizeRequest)
+	rq := new(PauseCheckpointerRequest)
 	if err := dec(rq); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return nil, srv.(StorageWorker).ForceFinalize(ctx, rq)
+		return nil, srv.(StorageWorker).PauseCheckpointer(ctx, rq)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: methodForceFinalize.FullName(),
+		FullMethod: methodPauseCheckpointer.FullName(),
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return nil, srv.(StorageWorker).ForceFinalize(ctx, req.(*ForceFinalizeRequest))
+		return nil, srv.(StorageWorker).PauseCheckpointer(ctx, req.(*PauseCheckpointerRequest))
 	}
 	return interceptor(ctx, rq, info, handler)
 }
@@ -98,8 +98,8 @@ func (c *storageWorkerClient) GetLastSyncedRound(ctx context.Context, req *GetLa
 	return &rsp, nil
 }
 
-func (c *storageWorkerClient) ForceFinalize(ctx context.Context, req *ForceFinalizeRequest) error {
-	return c.conn.Invoke(ctx, methodForceFinalize.FullName(), req, nil)
+func (c *storageWorkerClient) PauseCheckpointer(ctx context.Context, req *PauseCheckpointerRequest) error {
+	return c.conn.Invoke(ctx, methodPauseCheckpointer.FullName(), req, nil)
 }
 
 // NewStorageWorkerClient creates a new gRPC transaction scheduler

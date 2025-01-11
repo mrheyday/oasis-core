@@ -1,18 +1,32 @@
 package fixtures
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/viper"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/sgx"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
 	consensusGenesis "github.com/oasisprotocol/oasis-core/go/consensus/genesis"
+	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle/component"
+	runtimeConfig "github.com/oasisprotocol/oasis-core/go/runtime/config"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
+	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
+	"github.com/oasisprotocol/oasis-core/go/storage/database"
+	mkvsAPI "github.com/oasisprotocol/oasis-core/go/storage/mkvs/db/api"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/db/badger"
 )
 
 const (
@@ -23,18 +37,19 @@ const (
 	cfgKeymanagerBinary        = "fixture.default.keymanager.binary"
 	cfgNodeBinary              = "fixture.default.node.binary"
 	cfgNumEntities             = "fixture.default.num_entities"
+	cfgRuntimeID               = "fixture.default.runtime.id"
 	cfgRuntimeBinary           = "fixture.default.runtime.binary"
-	cfgRuntimeGenesisState     = "fixture.default.runtime.genesis_state"
+	cfgRuntimeVersion          = "fixture.default.runtime.version"
+	cfgRuntimeStatePath        = "fixture.default.runtime.state_path"
+	cfgRuntimeProvisioner      = "fixture.default.runtime.provisioner"
 	cfgRuntimeLoader           = "fixture.default.runtime.loader"
 	cfgSetupRuntimes           = "fixture.default.setup_runtimes"
 	cfgTEEHardware             = "fixture.default.tee_hardware"
 	cfgInitialHeight           = "fixture.default.initial_height"
+	cfgStakingGenesis          = "fixture.default.staking_genesis"
 )
 
-var (
-	runtimeID    common.Namespace
-	keymanagerID common.Namespace
-)
+var keymanagerID common.Namespace
 
 // newDefaultFixture returns a default network fixture.
 func newDefaultFixture() (*oasis.NetworkFixture, error) {
@@ -46,6 +61,24 @@ func newDefaultFixture() (*oasis.NetworkFixture, error) {
 	var mrSigner *sgx.MrSigner
 	if tee == node.TEEHardwareIntelSGX {
 		mrSigner = &sgx.FortanixDummyMrSigner
+	}
+
+	// Default staking genesis enables 16 allowances per account which matches the current
+	// mainnet and testnet setting.
+	stakingGenesis := staking.Genesis{
+		Parameters: staking.ConsensusParameters{
+			MaxAllowances: 16,
+		},
+	}
+	if genesis := viper.GetString(cfgStakingGenesis); genesis != "" {
+		var raw []byte
+		raw, err = os.ReadFile(genesis)
+		if err != nil {
+			return nil, fmt.Errorf("loading staking genesis file: %w", err)
+		}
+		if err = json.Unmarshal(raw, &stakingGenesis); err != nil {
+			return nil, fmt.Errorf("loading staking genesis: %w", err)
+		}
 	}
 
 	fixture := &oasis.NetworkFixture{
@@ -61,7 +94,9 @@ func newDefaultFixture() (*oasis.NetworkFixture, error) {
 					TimeoutCommit: 1 * time.Second,
 				},
 			},
-			EpochtimeMock: viper.GetBool(cfgEpochtimeMock),
+			Beacon: beacon.ConsensusParameters{
+				Backend: beacon.BackendInsecure,
+			},
 			InitialHeight: viper.GetInt64(cfgInitialHeight),
 			HaltEpoch:     viper.GetUint64(cfgHaltEpoch),
 			IAS: oasis.IASCfg{
@@ -69,84 +104,226 @@ func newDefaultFixture() (*oasis.NetworkFixture, error) {
 			},
 			DeterministicIdentities: viper.GetBool(cfgDeterministicIdentities),
 			FundEntities:            viper.GetBool(cfgFundEntities),
-			StakingGenesis:          &staking.Genesis{},
+			StakingGenesis:          &stakingGenesis,
 		},
 		Entities: []oasis.EntityCfg{
 			{IsDebugTestEntity: true},
 		},
 		Validators: []oasis.ValidatorFixture{
-			{Entity: 1},
+			{Entity: 1, Consensus: oasis.ConsensusFixture{SupplementarySanityInterval: 1}},
 		},
 		Seeds: []oasis.SeedFixture{{}},
+	}
+	if viper.GetBool(cfgEpochtimeMock) {
+		fixture.Network.SetMockEpoch()
 	}
 
 	for i := 0; i < viper.GetInt(cfgNumEntities); i++ {
 		fixture.Entities = append(fixture.Entities, oasis.EntityCfg{})
 	}
 
+	runtimeProvisionerRaw := []byte(viper.GetString(cfgRuntimeProvisioner))
+	var runtimeProvisioner runtimeConfig.RuntimeProvisioner
+	if err = runtimeProvisioner.UnmarshalText(runtimeProvisionerRaw); err != nil {
+		return nil, err
+	}
+
+	// Always run a client node.
+	fixture.Clients = []oasis.ClientFixture{{
+		RuntimeProvisioner: runtimeProvisioner,
+	}}
+
+	usingKeymanager := len(viper.GetString(cfgKeymanagerBinary)) > 0
+
 	if viper.GetBool(cfgSetupRuntimes) {
-		fixture.Runtimes = []oasis.RuntimeFixture{
+		if usingKeymanager {
 			// Key manager runtime.
-			{
+			fixture.Runtimes = append(fixture.Runtimes, oasis.RuntimeFixture{
 				ID:         keymanagerID,
 				Kind:       registry.KindKeyManager,
 				Entity:     0,
 				Keymanager: -1,
-				Binaries:   viper.GetStringSlice(cfgKeymanagerBinary),
 				AdmissionPolicy: registry.RuntimeAdmissionPolicy{
 					AnyNode: &registry.AnyNodeRuntimeAdmissionPolicy{},
 				},
-			},
+				GovernanceModel: registry.GovernanceEntity,
+				Deployments: []oasis.DeploymentCfg{
+					{
+						Components: []oasis.ComponentCfg{
+							{
+								Kind: component.RONL,
+								Binaries: map[node.TEEHardware]string{
+									tee: viper.GetString(cfgKeymanagerBinary),
+								},
+							},
+						},
+					},
+				},
+			})
+			fixture.KeymanagerPolicies = []oasis.KeymanagerPolicyFixture{
+				{Runtime: 0, Serial: 1, MasterSecretRotationInterval: 0},
+			}
+			fixture.Keymanagers = []oasis.KeymanagerFixture{
+				{
+					Runtime:            0,
+					Entity:             1,
+					Policy:             0,
+					SkipPolicy:         tee != node.TEEHardwareIntelSGX,
+					RuntimeProvisioner: runtimeProvisioner,
+				},
+			}
+		}
+		fixture.ComputeWorkers = []oasis.ComputeWorkerFixture{
+			{Entity: 1, Runtimes: []int{}, RuntimeProvisioner: runtimeProvisioner, RuntimeStatePaths: make(map[int]string)},
+			{Entity: 1, Runtimes: []int{}, RuntimeProvisioner: runtimeProvisioner, RuntimeStatePaths: make(map[int]string)},
+			{Entity: 1, Runtimes: []int{}, RuntimeProvisioner: runtimeProvisioner, RuntimeStatePaths: make(map[int]string)},
+		}
+
+		var runtimeIDs []common.Namespace
+		for _, rtID := range viper.GetStringSlice(cfgRuntimeID) {
+			var rt common.Namespace
+			if err = rt.UnmarshalHex(rtID); err != nil {
+				cmdCommon.EarlyLogAndExit(fmt.Errorf("invalid runtime ID: %s: %w", rtID, err))
+			}
+			runtimeIDs = append(runtimeIDs, rt)
+		}
+
+		runtimes := viper.GetStringSlice(cfgRuntimeBinary)
+		if l1, l2 := len(runtimeIDs), len(runtimes); l1 < l2 {
+			cmdCommon.EarlyLogAndExit(fmt.Errorf("missing runtime IDs, required: %d, provided: %d", l1, l2))
+		}
+
+		// Runtime versions should be ignored or must be one-to-one mapped to runtimes.
+		runtimeVersions := viper.GetStringSlice(cfgRuntimeVersion)
+		if l1, l2 := len(runtimeIDs), len(runtimeVersions); l2 != 0 && l1 != l2 {
+			cmdCommon.EarlyLogAndExit(fmt.Errorf("runtime versions number mismatch, required: %d, provided: %d", l1, l2))
+		}
+
+		keymanagerIdx := -1
+		if usingKeymanager {
+			keymanagerIdx = 0
+		}
+		runtimeStatePaths := viper.GetStringSlice(cfgRuntimeStatePath)
+		if l1, l2 := len(runtimeStatePaths), len(runtimeIDs); l1 > 0 && l1 != l2 {
+			cmdCommon.EarlyLogAndExit(fmt.Errorf("missing runtime state paths: number of runtimes: %d, provided state paths: %d", l2, l1))
+		}
+
+		for i, rt := range runtimes {
 			// Compute runtime.
-			{
-				ID:         runtimeID,
+			rtVersion := version.Version{}
+			if len(runtimeVersions) > i {
+				rtVersion, err = version.FromString(runtimeVersions[i])
+				if err != nil {
+					return nil, fmt.Errorf("parsing runtime version: %w", err)
+				}
+			}
+			fixture.Runtimes = append(fixture.Runtimes, oasis.RuntimeFixture{
+				ID:         runtimeIDs[i],
 				Kind:       registry.KindCompute,
 				Entity:     0,
-				Keymanager: 0,
-				Binaries:   viper.GetStringSlice(cfgRuntimeBinary),
+				Keymanager: keymanagerIdx,
 				Executor: registry.ExecutorParameters{
 					GroupSize:       2,
 					GroupBackupSize: 1,
 					RoundTimeout:    20,
+					MaxMessages:     128,
 				},
 				TxnScheduler: registry.TxnSchedulerParameters{
-					Algorithm:         registry.TxnSchedulerSimple,
-					MaxBatchSize:      1,
+					MaxBatchSize:      1000,
 					MaxBatchSizeBytes: 16 * 1024 * 1024, // 16 MiB
-					BatchFlushTimeout: 20 * time.Second,
-					ProposerTimeout:   20,
-				},
-				Storage: registry.StorageParameters{
-					GroupSize:               1,
-					MinWriteReplication:     1,
-					MaxApplyWriteLogEntries: 100_000,
-					MaxApplyOps:             2,
+					BatchFlushTimeout: time.Second,
+					ProposerTimeout:   2 * time.Second,
 				},
 				AdmissionPolicy: registry.RuntimeAdmissionPolicy{
 					AnyNode: &registry.AnyNodeRuntimeAdmissionPolicy{},
 				},
-				GenesisStatePath: viper.GetString(cfgRuntimeGenesisState),
-				GenesisRound:     0,
-			},
+				GenesisRound:    0,
+				GovernanceModel: registry.GovernanceEntity,
+				Deployments: []oasis.DeploymentCfg{
+					{
+						ValidFrom: 0,
+						Components: []oasis.ComponentCfg{
+							{
+								Kind:    component.RONL,
+								Version: rtVersion,
+								Binaries: map[node.TEEHardware]string{
+									tee: rt,
+								},
+							},
+						},
+					},
+				},
+			})
+			rtIndex := len(fixture.Runtimes) - 1
+
+			for j := range fixture.ComputeWorkers {
+				fixture.ComputeWorkers[j].Runtimes = append(fixture.ComputeWorkers[j].Runtimes, rtIndex)
+			}
+			fixture.Clients[0].Runtimes = append(fixture.Clients[0].Runtimes, rtIndex)
+
+			// Runtime state paths to use to initialize the runtime with.
+			if len(runtimeStatePaths) <= i {
+				continue
+			}
+			runtimeStatePath := runtimeStatePaths[i]
+			if runtimeStatePath == "" {
+				continue
+			}
+
+			// Set workers runtime state.
+			for j := range fixture.ComputeWorkers {
+				fixture.ComputeWorkers[j].RuntimeStatePaths[i] = runtimeStatePath
+			}
+
+			dbPath := filepath.Join(runtimeStatePath, database.DefaultFileName(database.BackendNameBadgerDB))
+			_, err := os.Stat(dbPath)
+			if err != nil {
+				return nil, fmt.Errorf("runtime state path: %w", err)
+			}
+			db, err := badger.New(&mkvsAPI.Config{
+				DB:        dbPath,
+				Namespace: runtimeIDs[i],
+			})
+			if err != nil {
+				return nil, fmt.Errorf("opening state path: %w", err)
+			}
+
+			version, stateRoot, err := getLatestVersionAndStateRoot(db)
+			if err != nil {
+				return nil, fmt.Errorf("loading version and state root: %w", err)
+			}
+
+			// Set runtime genesis state.
+			fixture.Runtimes[i].GenesisRound = version
+			fixture.Runtimes[i].GenesisStateRoot = stateRoot
+
 		}
-		fixture.KeymanagerPolicies = []oasis.KeymanagerPolicyFixture{
-			{Runtime: 0, Serial: 1},
-		}
-		fixture.Keymanagers = []oasis.KeymanagerFixture{
-			{Runtime: 0, Entity: 1},
-		}
-		fixture.StorageWorkers = []oasis.StorageWorkerFixture{
-			{Backend: "badger", Entity: 1},
-		}
-		fixture.ComputeWorkers = []oasis.ComputeWorkerFixture{
-			{Entity: 1, Runtimes: []int{1}},
-			{Entity: 1, Runtimes: []int{1}},
-			{Entity: 1, Runtimes: []int{1}},
-		}
-		fixture.Clients = []oasis.ClientFixture{{}}
 	}
 
 	return fixture, nil
+}
+
+// Loads latest runtime version and state root from the NodeDB.
+func getLatestVersionAndStateRoot(db mkvsAPI.NodeDB) (uint64, *hash.Hash, error) {
+	// Get latest version.
+	dbVersion, exists := db.GetLatestVersion()
+	if !exists {
+		return 0, nil, fmt.Errorf("no version found in runtime state db: %v", dbVersion)
+	}
+	rts, err := db.GetRootsForVersion(dbVersion)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	// Get latest state root.
+	var stateRootHash hash.Hash
+	for _, r := range rts {
+		if r.Type == storage.RootTypeState {
+			stateRootHash = r.Hash
+		}
+	}
+
+	return dbVersion, &stateRootHash, nil
 }
 
 func init() {
@@ -157,15 +334,18 @@ func init() {
 	DefaultFixtureFlags.Int(cfgNumEntities, 1, "number of (non debug) entities in genesis")
 	DefaultFixtureFlags.String(cfgKeymanagerBinary, "simple-keymanager", "path to the keymanager runtime")
 	DefaultFixtureFlags.String(cfgNodeBinary, "oasis-node", "path to the oasis-node binary")
-	DefaultFixtureFlags.String(cfgRuntimeBinary, "simple-keyvalue", "path to the runtime binary")
-	DefaultFixtureFlags.String(cfgRuntimeGenesisState, "", "path to the runtime genesis state")
+	DefaultFixtureFlags.StringSlice(cfgRuntimeID, []string{"8000000000000000000000000000000000000000000000000000000000000000"}, "runtime ID")
+	DefaultFixtureFlags.StringSlice(cfgRuntimeBinary, []string{"simple-keyvalue"}, "path to the runtime binary")
+	DefaultFixtureFlags.StringSlice(cfgRuntimeVersion, []string{"0.1.0"}, "runtime version to register")
+	DefaultFixtureFlags.StringSlice(cfgRuntimeStatePath, []string{""}, "runtime state path to initialize the runtime (and nodes) with")
+	DefaultFixtureFlags.String(cfgRuntimeProvisioner, "sandboxed", "the runtime provisioner: mock, unconfined, or sandboxed")
 	DefaultFixtureFlags.String(cfgRuntimeLoader, "oasis-core-runtime-loader", "path to the runtime loader")
 	DefaultFixtureFlags.String(cfgTEEHardware, "", "TEE hardware to use")
 	DefaultFixtureFlags.Uint64(cfgHaltEpoch, math.MaxUint64, "halt epoch height")
 	DefaultFixtureFlags.Int64(cfgInitialHeight, 1, "initial block height")
+	DefaultFixtureFlags.String(cfgStakingGenesis, "", "path to the staking genesis to use")
 
 	_ = viper.BindPFlags(DefaultFixtureFlags)
 
-	_ = runtimeID.UnmarshalHex("8000000000000000000000000000000000000000000000000000000000000000")
 	_ = keymanagerID.UnmarshalHex("c000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff")
 }

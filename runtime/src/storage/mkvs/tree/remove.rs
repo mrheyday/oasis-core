@@ -1,43 +1,25 @@
-use std::sync::Arc;
-
 use anyhow::Result;
-use io_context::Context;
 
-use crate::storage::mkvs::{cache::*, tree::*};
+use crate::storage::mkvs::{
+    cache::Cache,
+    tree::{
+        Depth, Key, KeyTrait, NodeBox, NodeKind, NodePointer, NodePtrRef, NodeRef, Tree, Value,
+    },
+};
 
 use super::lookup::FetcherSyncGet;
 
 impl Tree {
-    /// Remove a key from the tree and return true if the tree was modified.
-    pub fn remove(&mut self, ctx: Context, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let ctx = ctx.freeze();
+    /// Remove entry with given key, returning the value at the key if the key was previously
+    /// in the database.
+    pub fn remove(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let boxed_key = key.to_vec();
         let pending_root = self.cache.borrow().get_pending_root();
-
-        // If the key has already been removed locally, don't try to remove it again.
-        if let Some(PendingLogEntry { value: None, .. }) = self.pending_write_log.get(&boxed_key) {
-            return Ok(None);
-        }
 
         // Remember where the path from root to target node ends (will end).
         self.cache.borrow_mut().mark_position();
 
-        let (new_root, changed, old_val) = self._remove(&ctx, pending_root, 0, &boxed_key, 0)?;
-        match self.pending_write_log.get_mut(&boxed_key) {
-            None => {
-                self.pending_write_log.insert(
-                    boxed_key.clone(),
-                    PendingLogEntry {
-                        key: boxed_key,
-                        value: None,
-                        existed: changed,
-                    },
-                );
-            }
-            Some(ref mut entry) => {
-                entry.value = None;
-            }
-        };
+        let (new_root, _, old_val) = self._remove(pending_root, 0, &boxed_key)?;
         self.cache.borrow_mut().set_pending_root(new_root);
 
         Ok(old_val)
@@ -45,22 +27,19 @@ impl Tree {
 
     fn _remove(
         &mut self,
-        ctx: &Arc<Context>,
         ptr: NodePtrRef,
         bit_depth: Depth,
         key: &Key,
-        depth: Depth,
     ) -> Result<(NodePtrRef, bool, Option<Value>)> {
-        let node_ref = self.cache.borrow_mut().deref_node_ptr(
-            ctx,
-            ptr.clone(),
-            Some(FetcherSyncGet::new(key, true)),
-        )?;
+        let node_ref = self
+            .cache
+            .borrow_mut()
+            .deref_node_ptr(ptr.clone(), Some(FetcherSyncGet::new(key, true)))?;
 
         match classify_noderef!(?node_ref) {
             NodeKind::None => {
                 // Remove from nil node.
-                return Ok((NodePointer::null_ptr(), false, None));
+                Ok((NodePointer::null_ptr(), false, None))
             }
             NodeKind::Internal => {
                 // Remove from internal node and recursively collapse the path, if needed.
@@ -78,15 +57,15 @@ impl Tree {
 
                     if key.bit_length() < bit_length {
                         // Lookup key is too short for the current n.Label, so it doesn't exist.
-                        return Ok((ptr.clone(), false, None));
+                        return Ok((ptr, false, None));
                     }
 
                     let (new_child, c, o) = if key.bit_length() == bit_length {
-                        self._remove(ctx, n.leaf_node.clone(), bit_depth, key, depth)?
+                        self._remove(n.leaf_node.clone(), bit_depth, key)?
                     } else if key.get_bit(bit_length) {
-                        self._remove(ctx, n.right.clone(), bit_length, key, depth + 1)?
+                        self._remove(n.right.clone(), bit_length, key)?
                     } else {
-                        self._remove(ctx, n.left.clone(), bit_length, key, depth + 1)?
+                        self._remove(n.left.clone(), bit_length, key)?
                     };
 
                     changed = c;
@@ -103,16 +82,14 @@ impl Tree {
                     // Fetch and check the remaining children.
                     // NOTE: The leaf node is always included with the internal node.
                     remaining_leaf = n.leaf_node.borrow().node.clone();
-                    remaining_left = self.cache.borrow_mut().deref_node_ptr(
-                        ctx,
-                        n.left.clone(),
-                        Some(FetcherSyncGet::new(key, true)),
-                    )?;
-                    remaining_right = self.cache.borrow_mut().deref_node_ptr(
-                        ctx,
-                        n.right.clone(),
-                        Some(FetcherSyncGet::new(key, true)),
-                    )?;
+                    remaining_left = self
+                        .cache
+                        .borrow_mut()
+                        .deref_node_ptr(n.left.clone(), Some(FetcherSyncGet::new(key, true)))?;
+                    remaining_right = self
+                        .cache
+                        .borrow_mut()
+                        .deref_node_ptr(n.right.clone(), Some(FetcherSyncGet::new(key, true)))?;
                 } else {
                     unreachable!("node kind is Internal");
                 }
@@ -126,7 +103,7 @@ impl Tree {
                                 let nd_leaf = noderef_as!(node_ref, Internal).leaf_node.clone();
                                 noderef_as_mut!(node_ref, Internal).leaf_node =
                                     NodePointer::null_ptr();
-                                self.cache.borrow_mut().remove_node(ptr.clone());
+                                self.cache.borrow_mut().remove_node(ptr);
                                 return Ok((nd_leaf, true, old_val));
                             }
                             Some(_) => (),
@@ -161,31 +138,24 @@ impl Tree {
 
                         if !both_children {
                             // If child is an internal node, also fix the label.
-                            match nd_child {
-                                Some(_) => match classify_noderef!(?nd_child) {
-                                    NodeKind::Internal => {
-                                        if let NodeBox::Internal(ref mut inode) =
-                                            *nd_child.unwrap().borrow_mut()
-                                        {
-                                            inode.label =
-                                                noderef_as!(node_ref, Internal).label.merge(
-                                                    noderef_as!(node_ref, Internal)
-                                                        .label_bit_length,
-                                                    &inode.label,
-                                                    inode.label_bit_length,
-                                                );
-                                            inode.label_bit_length +=
-                                                noderef_as!(node_ref, Internal).label_bit_length;
-                                            inode.clean = false;
-                                            node_ptr.borrow_mut().clean = false;
-                                        }
+                            if let Some(nd_child) = nd_child {
+                                if let NodeKind::Internal = classify_noderef!(nd_child) {
+                                    if let NodeBox::Internal(ref mut inode) = *nd_child.borrow_mut()
+                                    {
+                                        inode.label = noderef_as!(node_ref, Internal).label.merge(
+                                            noderef_as!(node_ref, Internal).label_bit_length,
+                                            &inode.label,
+                                            inode.label_bit_length,
+                                        );
+                                        inode.label_bit_length +=
+                                            noderef_as!(node_ref, Internal).label_bit_length;
+                                        inode.clean = false;
+                                        node_ptr.borrow_mut().clean = false;
                                     }
-                                    _ => (),
-                                },
-                                _ => (),
+                                }
                             }
 
-                            self.cache.borrow_mut().remove_node(ptr.clone());
+                            self.cache.borrow_mut().remove_node(ptr);
                             return Ok((node_ptr, true, old_val));
                         }
                     }
@@ -201,19 +171,19 @@ impl Tree {
                         .rollback_node(ptr.clone(), NodeKind::Internal);
                 }
 
-                return Ok((ptr.clone(), changed, old_val));
+                Ok((ptr, changed, old_val))
             }
             NodeKind::Leaf => {
                 // Remove from leaf node.
                 let node_ref = node_ref.unwrap();
                 if noderef_as!(node_ref, Leaf).key == *key {
                     let old_val = noderef_as!(node_ref, Leaf).value.clone();
-                    self.cache.borrow_mut().remove_node(ptr.clone());
+                    self.cache.borrow_mut().remove_node(ptr);
                     return Ok((NodePointer::null_ptr(), true, Some(old_val)));
                 }
 
-                return Ok((ptr.clone(), false, None));
+                Ok((ptr, false, None))
             }
-        };
+        }
     }
 }

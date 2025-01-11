@@ -3,37 +3,33 @@ package grpc
 
 import (
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 
 	cmnGrpc "github.com/oasisprotocol/oasis-core/go/common/grpc"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
-	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 )
 
 const (
 	// CfgServerPort configures the server port.
 	CfgServerPort = "grpc.port"
-	// CfgDebugPort configures the remote address.
+	// CfgAddress configures the remote address.
 	CfgAddress = "address"
 	// CfgWait waits for the remote address to become available.
 	CfgWait = "wait"
-	// CfgDebugGrpcInternalSocketPath sets custom internal socket path.
-	CfgDebugGrpcInternalSocketPath = "debug.grpc.internal.socket_path"
+	// CfgInsecureLoopback allows non-TLS connection to loopback addresses.
+	CfgInsecureLoopback = "insecure"
 
-	// LocalSocketFilename is the filename of the unix socket in node datadir.
-	LocalSocketFilename = "internal.sock"
-
-	defaultAddress = "unix:" + LocalSocketFilename
+	defaultAddress = "unix:" + common.InternalSocketName
 )
 
 var (
@@ -56,10 +52,9 @@ func NewServerTCP(cert *tls.Certificate, installWrapper bool) (*cmnGrpc.Server, 
 	config := &cmnGrpc.ServerConfig{
 		Name:           "internal",
 		Port:           uint16(viper.GetInt(CfgServerPort)),
-		Identity:       &identity.Identity{},
+		Identity:       identity.WithTLSCertificate(cert),
 		InstallWrapper: installWrapper,
 	}
-	config.Identity.SetTLSCertificate(cert)
 	return cmnGrpc.NewServer(config)
 }
 
@@ -69,19 +64,9 @@ func NewServerTCP(cert *tls.Certificate, installWrapper bool) (*cmnGrpc.Server, 
 // This internally takes a snapshot of the current global tracer, so
 // make sure you initialize the global tracer before calling this.
 func NewServerLocal(installWrapper bool) (*cmnGrpc.Server, error) {
-	dataDir := common.DataDir()
-	if dataDir == "" {
-		return nil, errors.New("data directory must be set")
-	}
-	path := filepath.Join(dataDir, LocalSocketFilename)
-	if viper.IsSet(CfgDebugGrpcInternalSocketPath) && flags.DebugDontBlameOasis() {
-		logger.Info("overriding internal socket path", "path", viper.GetString(CfgDebugGrpcInternalSocketPath))
-		path = viper.GetString(CfgDebugGrpcInternalSocketPath)
-	}
-
 	config := &cmnGrpc.ServerConfig{
 		Name:           "internal",
-		Path:           path,
+		Path:           common.InternalSocketPath(),
 		InstallWrapper: installWrapper,
 	}
 
@@ -96,7 +81,18 @@ func NewClient(cmd *cobra.Command) (*grpc.ClientConn, error) {
 		addr = "unix:" + addr
 	}
 
-	opts := []grpc.DialOption{grpc.WithInsecure()}
+	var creds credentials.TransportCredentials
+	switch {
+	case cmnGrpc.IsSocketAddress(addr):
+		creds = insecure.NewCredentials()
+	case viper.GetBool(CfgInsecureLoopback) && cmnGrpc.IsLocalAddress(addr):
+		creds = insecure.NewCredentials()
+	case viper.GetBool(CfgInsecureLoopback):
+		return nil, fmt.Errorf("insecure loopback requested but address is not loopback: %s", addr)
+	default:
+		creds = credentials.NewTLS(&tls.Config{})
+	}
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
 	if viper.GetBool(CfgWait) {
 		opts = append(opts, grpc.WithDefaultCallOptions(grpc.WaitForReady(true)))
 	}
@@ -117,13 +113,12 @@ func init() {
 	_ = viper.BindPFlags(ServerTCPFlags)
 	ServerTCPFlags.AddFlagSet(cmnGrpc.Flags)
 
-	ServerLocalFlags.String(CfgDebugGrpcInternalSocketPath, "", "use custom internal unix socket path")
-	_ = ServerLocalFlags.MarkHidden(CfgDebugGrpcInternalSocketPath)
 	_ = viper.BindPFlags(ServerLocalFlags)
 	ServerLocalFlags.AddFlagSet(cmnGrpc.Flags)
 
 	ClientFlags.StringP(CfgAddress, "a", defaultAddress, "remote gRPC address")
 	ClientFlags.Bool(CfgWait, false, "wait for gRPC address to become available")
+	ClientFlags.BoolP(CfgInsecureLoopback, "k", false, "allows non-TLS connection to loopback addresses")
 	ClientFlags.AddFlagSet(cmnGrpc.Flags)
 	_ = viper.BindPFlags(ClientFlags)
 }

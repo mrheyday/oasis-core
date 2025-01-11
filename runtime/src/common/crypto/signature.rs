@@ -1,15 +1,25 @@
 //! Signature types.
-use std::io::Cursor;
+use std::{cmp::Ordering, convert::TryInto, io::Cursor};
 
 use anyhow::Result;
 use byteorder::{LittleEndian, ReadBytesExt};
-use ed25519_dalek::{self, ed25519::signature::Signature as _, Signer as _, Verifier};
+use curve25519_dalek::{
+    edwards::{CompressedEdwardsY, EdwardsPoint},
+    scalar::Scalar,
+};
+use ed25519_dalek::{Digest as _, Sha512, Signer as _};
 use rand::rngs::OsRng;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
 
+use crate::common::namespace::Namespace;
+
 use super::hash::Hash;
+
+/// The chain separator used to add additional domain separation based on the chain context.
+const CHAIN_SIGNATURE_CONTEXT_SEPARATOR: &[u8] = b" for chain ";
+/// The runtime separator used to add additional domain separation based on the runtime ID.
+const RUNTIME_SIGNATURE_CONTEXT_SEPARATOR: &[u8] = b" for runtime ";
 
 impl_bytes!(
     PublicKey,
@@ -20,11 +30,19 @@ impl_bytes!(
 /// Signature error.
 #[derive(Error, Debug)]
 enum SignatureError {
+    #[error("point decompression failed")]
+    PointDecompression,
+    #[error("small order A")]
+    SmallOrderA,
+    #[error("small order R")]
+    SmallOrderR,
     #[error("signature malleability check failed")]
-    MalleabilityError,
+    Malleability,
+    #[error("invalid signature")]
+    InvalidSignature,
 }
 
-static CURVE_ORDER: &'static [u64] = &[
+static CURVE_ORDER: &[u64] = &[
     0x1000000000000000,
     0,
     0x14def9dea2f79cd6,
@@ -32,20 +50,18 @@ static CURVE_ORDER: &'static [u64] = &[
 ];
 
 /// An Ed25519 private key.
-pub struct PrivateKey(pub ed25519_dalek::Keypair);
+pub struct PrivateKey(pub ed25519_dalek::SigningKey);
 
 impl PrivateKey {
     /// Generates a new private key pair.
     pub fn generate() -> Self {
-        let mut rng = OsRng {};
-
-        PrivateKey(ed25519_dalek::Keypair::generate(&mut rng))
+        PrivateKey(ed25519_dalek::SigningKey::generate(&mut OsRng))
     }
 
     /// Convert this private key into bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = self.0.secret.to_bytes();
-        let bvec = (&bytes).to_vec();
+        let mut bytes = self.0.to_bytes();
+        let bvec = bytes.to_vec();
         bytes.zeroize();
         bvec
     }
@@ -55,30 +71,34 @@ impl PrivateKey {
     /// # Panics
     ///
     /// This method will panic in case the passed bytes do not have the correct length.
-    pub fn from_bytes(mut bytes: Vec<u8>) -> PrivateKey {
-        let secret = ed25519_dalek::SecretKey::from_bytes(&bytes).unwrap();
-        bytes.zeroize();
-        let public = (&secret).into();
+    pub fn from_bytes(bytes: Vec<u8>) -> PrivateKey {
+        let mut sk = bytes.try_into().unwrap();
+        let secret = ed25519_dalek::SigningKey::from_bytes(&sk);
+        sk.zeroize();
 
-        PrivateKey(ed25519_dalek::Keypair { secret, public })
+        PrivateKey(secret)
     }
 
     /// Generate a new private key from a test key seed.
     pub fn from_test_seed(seed: String) -> Self {
-        let seed = Hash::digest_bytes(seed.as_bytes());
-        let secret = ed25519_dalek::SecretKey::from_bytes(seed.as_ref()).unwrap();
-        let pk: ed25519_dalek::PublicKey = (&secret).into();
+        let mut seed = Hash::digest_bytes(seed.as_bytes());
+        let sk = Self::from_bytes(seed.as_ref().to_vec());
+        seed.zeroize();
 
-        PrivateKey(ed25519_dalek::Keypair { secret, public: pk })
+        sk
     }
 
     /// Returns the public key.
     pub fn public_key(&self) -> PublicKey {
-        PublicKey(self.0.public.to_bytes())
+        PublicKey(self.0.verifying_key().to_bytes())
     }
 }
 
 impl Signer for PrivateKey {
+    fn public(&self) -> PublicKey {
+        self.public_key()
+    }
+
     fn sign(&self, context: &[u8], message: &[u8]) -> Result<Signature> {
         // TODO/#2103: Replace this with Ed25519ctx.
         let digest = Hash::digest_bytes_list(&[context, message]);
@@ -92,33 +112,119 @@ impl_bytes!(Signature, 64, "An Ed25519 signature.");
 impl Signature {
     /// Verify signature.
     pub fn verify(&self, pk: &PublicKey, context: &[u8], message: &[u8]) -> Result<()> {
-        // TODO/#2103: Replace this with Ed25519ctx.
-        let pk = ed25519_dalek::PublicKey::from_bytes(pk.as_ref()).unwrap();
+        // Apply the Oasis core specific domain separation.
+        //
+        // Note: This should be Ed25519ctx based but "muh Ledger".
         let digest = Hash::digest_bytes_list(&[context, message]);
-        let sig_slice = self.as_ref();
-        let sig = ed25519_dalek::Signature::from_bytes(sig_slice).unwrap();
 
-        // ed25519-dalek does not enforce the RFC 8032 mandated constraint
-        // that s is in range [0, order), so signatures are malleable.
-        if !sc_minimal(&sig_slice[32..]) {
-            return Err(SignatureError::MalleabilityError.into());
+        self.verify_raw(pk, digest.as_ref())
+    }
+
+    /// Verify signature without applying domain separation.
+    #[allow(non_snake_case)] // Variable names matching RFC 8032 is more readable.
+    pub fn verify_raw(&self, pk: &PublicKey, msg: &[u8]) -> Result<()> {
+        // We have a very specific idea of what a valid Ed25519 signature
+        // is, that is different from what ed25519-dalek defines, so this
+        // needs to be done by hand.
+
+        // Decompress A (PublicKey)
+        //
+        // TODO/perf:
+        //  * PublicKey could just be an EdwardsPoint.
+        //  * Could cache the results of is_small_order() in PublicKey.
+        let A = CompressedEdwardsY::from_slice(pk.as_ref())
+            .map_err(|_| SignatureError::PointDecompression)?;
+        let A = A.decompress().ok_or(SignatureError::PointDecompression)?;
+        if A.is_small_order() {
+            return Err(SignatureError::SmallOrderA.into());
         }
 
-        Ok(pk.verify(digest.as_ref(), &sig)?)
+        // Decompress R (signature point), S (signature scalar).
+        //
+        // Note:
+        //  * Reject S > L, small order A/R
+        //  * Accept non-canonical A/R
+        let sig_slice = self.as_ref();
+        let R_bits = &sig_slice[..32];
+        let S_bits = &sig_slice[32..];
+
+        let R = CompressedEdwardsY::from_slice(R_bits)
+            .map_err(|_| SignatureError::PointDecompression)?;
+        let R = R.decompress().ok_or(SignatureError::PointDecompression)?;
+        if R.is_small_order() {
+            return Err(SignatureError::SmallOrderR.into());
+        }
+
+        if !sc_minimal(S_bits) {
+            return Err(SignatureError::Malleability.into());
+        }
+        let mut S: [u8; 32] = [0u8; 32];
+        S.copy_from_slice(S_bits);
+        #[allow(deprecated)] // S is only used for vartime_double_scalar_mul_basepoint.
+        let S = Scalar::from_bits(S);
+
+        // k = H(R,A,m)
+        let mut k: Sha512 = Sha512::new();
+        k.update(R_bits);
+        k.update(pk.as_ref());
+        k.update(msg);
+        let k = Scalar::from_hash(k);
+
+        // Check the cofactored group equation ([8][S]B = [8]R + [8][k]A').
+        let neg_A = -A;
+        let should_be_small_order =
+            EdwardsPoint::vartime_double_scalar_mul_basepoint(&k, &neg_A, &S) - R;
+        match should_be_small_order.is_small_order() {
+            true => Ok(()),
+            false => Err(SignatureError::InvalidSignature.into()),
+        }
     }
 }
 
+/// Blob signed with one public key.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, cbor::Encode, cbor::Decode)]
+pub struct Signed {
+    /// Signed blob.
+    #[cbor(rename = "untrusted_raw_value")]
+    pub blob: Vec<u8>,
+    /// Signature over the blob.
+    pub signature: SignatureBundle,
+}
+
+/// Blob signed by multiple public keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, cbor::Encode, cbor::Decode)]
+pub struct MultiSigned {
+    /// Signed blob.
+    #[cbor(rename = "untrusted_raw_value")]
+    pub blob: Vec<u8>,
+    /// Signatures over the blob.
+    pub signatures: Vec<SignatureBundle>,
+}
+
 /// A signature bundled with a public key.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, cbor::Encode, cbor::Decode)]
 pub struct SignatureBundle {
     /// Public key that produced the signature.
-    pub public_key: Option<PublicKey>,
+    pub public_key: PublicKey,
     /// Actual signature.
     pub signature: Signature,
 }
 
+impl SignatureBundle {
+    /// Verify returns true iff the signature is valid over the given context
+    /// and message.
+    pub fn verify(&self, context: &[u8], message: &[u8]) -> bool {
+        self.signature
+            .verify(&self.public_key, context, message)
+            .is_ok()
+    }
+}
+
 /// A abstract signer.
 pub trait Signer: Send + Sync {
+    /// Returns the public key corresponding to the signer.
+    fn public(&self) -> PublicKey;
+
     /// Generates a signature over the context and message.
     fn sign(&self, context: &[u8], message: &[u8]) -> Result<Signature>;
 }
@@ -136,10 +242,10 @@ fn sc_minimal(raw_s: &[u8]) -> bool {
 
     // Compare each limb, from most significant to least.
     for i in 0..4 {
-        if s[i] > CURVE_ORDER[i] {
-            return false;
-        } else if s[i] < CURVE_ORDER[i] {
-            return true;
+        match s[i].cmp(&CURVE_ORDER[i]) {
+            Ordering::Greater => return false,
+            Ordering::Less => return true,
+            Ordering::Equal => {}
         }
     }
 
@@ -147,9 +253,30 @@ fn sc_minimal(raw_s: &[u8]) -> bool {
     false
 }
 
+/// Extends signature context with additional domain separation based on the runtime ID.
+pub fn signature_context_with_runtime_separation(
+    mut context: Vec<u8>,
+    runtime_id: &Namespace,
+) -> Vec<u8> {
+    context.extend(RUNTIME_SIGNATURE_CONTEXT_SEPARATOR);
+    context.extend(runtime_id.0);
+    context
+}
+
+/// Extends signature context with additional domain separation based on the chain context.
+pub fn signature_context_with_chain_separation(
+    mut context: Vec<u8>,
+    chain_context: &String,
+) -> Vec<u8> {
+    context.extend(CHAIN_SIGNATURE_CONTEXT_SEPARATOR);
+    context.extend(chain_context.as_bytes());
+    context
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustc_hex::FromHex;
 
     #[test]
     fn test_sc_minimal() {
@@ -236,4 +363,69 @@ mod tests {
     fn test_private_key_to_bytes_malformed_b() {
         PrivateKey::from_bytes(vec![1, 2, 3]);
     }
+
+    #[test]
+    fn verification_small_order_a() {
+        // Case 1 from ed25519-speccheck
+        let pbk = "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa";
+        let msg = "9bd9f44f4dcc75bd531b56b2cd280b0bb38fc1cd6d1230e14861d861de092e79";
+        let sig = "f7badec5b8abeaf699583992219b7b223f1df3fbbea919844e3f7c554a43dd43a5bb704786be79fc476f91d3f3f89b03984d8068dcf1bb7dfc6637b45450ac04";
+
+        let pbk: Vec<u8> = pbk.from_hex().unwrap();
+        let msg: Vec<u8> = msg.from_hex().unwrap();
+        let sig: Vec<u8> = sig.from_hex().unwrap();
+
+        let pbk = PublicKey::from(pbk);
+        let sig = Signature::from(sig);
+
+        assert!(
+            sig.verify_raw(&pbk, &msg).is_err(),
+            "small order A not rejected"
+        )
+    }
+
+    #[test]
+    fn verification_small_order_r() {
+        // Case 2 from ed25519-speccheck
+        let pbk = "f7badec5b8abeaf699583992219b7b223f1df3fbbea919844e3f7c554a43dd43";
+        let msg = "aebf3f2601a0c8c5d39cc7d8911642f740b78168218da8471772b35f9d35b9ab";
+        let sig = "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa8c4bd45aecaca5b24fb97bc10ac27ac8751a7dfe1baff8b953ec9f5833ca260e";
+
+        let pbk: Vec<u8> = pbk.from_hex().unwrap();
+        let msg: Vec<u8> = msg.from_hex().unwrap();
+        let sig: Vec<u8> = sig.from_hex().unwrap();
+
+        let pbk = PublicKey::from(pbk);
+        let sig = Signature::from(sig);
+
+        assert!(
+            sig.verify_raw(&pbk, &msg).is_err(),
+            "small order R not rejected"
+        )
+    }
+
+    #[test]
+    fn verification_is_cofactored() {
+        // Case 4 from ed25519-speccheck
+        let pbk = "cdb267ce40c5cd45306fa5d2f29731459387dbf9eb933b7bd5aed9a765b88d4d";
+        let msg = "e47d62c63f830dc7a6851a0b1f33ae4bb2f507fb6cffec4011eaccd55b53f56c";
+        let sig = "160a1cb0dc9c0258cd0a7d23e94d8fa878bcb1925f2c64246b2dee1796bed5125ec6bc982a269b723e0668e540911a9a6a58921d6925e434ab10aa7940551a09";
+
+        let pbk: Vec<u8> = pbk.from_hex().unwrap();
+        let msg: Vec<u8> = msg.from_hex().unwrap();
+        let sig: Vec<u8> = sig.from_hex().unwrap();
+
+        let pbk = PublicKey::from(pbk);
+        let sig = Signature::from(sig);
+
+        assert!(
+            sig.verify_raw(&pbk, &msg).is_ok(),
+            "verification is not cofactored(?)"
+        )
+    }
+
+    // Note: It is hard to test rejects small order A/R combined with
+    // accepts non-canonical A/R as there are no known non-small order
+    // points with a non-canonical encoding, that are not also small
+    // order.
 }

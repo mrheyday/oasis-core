@@ -2,24 +2,27 @@ package oasis
 
 import (
 	"fmt"
+	"strconv"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
+	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 )
 
 // Byzantine is an Oasis byzantine node.
 type Byzantine struct {
-	Node
+	*Node
 
 	script    string
-	extraArgs []string
+	extraArgs []Argument
 
-	entity *Entity
-
+	runtime         int
 	consensusPort   uint16
 	p2pPort         uint16
-	activationEpoch epochtime.EpochTime
+	activationEpoch beacon.EpochTime
 }
 
 // ByzantineCfg is the Oasis byzantine node configuration.
@@ -27,36 +30,58 @@ type ByzantineCfg struct {
 	NodeCfg
 
 	Script    string
-	ExtraArgs []string
+	ExtraArgs []Argument
+
+	ForceElectParams *scheduler.ForceElectCommitteeRole
 
 	IdentitySeed string
-	Entity       *Entity
 
-	ActivationEpoch epochtime.EpochTime
+	ActivationEpoch beacon.EpochTime
+	Runtime         int
 }
 
-func (worker *Byzantine) startNode() error {
-	args := newArgBuilder().
-		debugDontBlameOasis().
-		debugAllowTestKeys().
-		tendermintDebugAllowDuplicateIP().
-		tendermintCoreAddress(worker.consensusPort).
-		tendermintDebugAddrBookLenient().
-		tendermintSubmissionGasPrice(worker.consensus.SubmissionGasPrice).
-		workerP2pPort(worker.p2pPort).
-		appendSeedNodes(worker.net.seeds).
-		appendEntity(worker.entity).
-		byzantineActivationEpoch(worker.activationEpoch)
+func (worker *Byzantine) AddArgs(args *argBuilder) error {
+	args.byzantineActivationEpoch(worker.activationEpoch)
 
+	if worker.entity.isDebugTestEntity {
+		args.appendDebugTestEntity()
+	}
+
+	if worker.runtime > 0 {
+		args.byzantineRuntimeID(worker.net.runtimes[worker.runtime].ID())
+	}
 	for _, v := range worker.net.Runtimes() {
 		if v.kind == registry.KindCompute && v.teeHardware == node.TEEHardwareIntelSGX {
-			args = args.byzantineFakeSGX()
-			args = args.byzantineVersionFakeEnclaveID(v)
+			args.byzantineFakeSGX()
+			args.byzantineVersionFakeEnclaveID(v)
 		}
 	}
 	args.vec = append(args.vec, worker.extraArgs...)
 
-	if err := worker.net.startOasisNode(&worker.Node, []string{"debug", "byzantine", worker.script}, args); err != nil {
+	return nil
+}
+
+func (worker *Byzantine) ModifyConfig() error {
+	worker.Config.Consensus.ListenAddress = allInterfacesAddr + ":" + strconv.Itoa(int(worker.consensusPort))
+	worker.Config.Consensus.ExternalAddress = localhostAddr + ":" + strconv.Itoa(int(worker.consensusPort))
+
+	worker.Config.Consensus.Debug.P2PAllowDuplicateIP = true
+	worker.Config.Consensus.Debug.P2PAddrBookLenient = true
+
+	worker.Config.P2P.Port = worker.p2pPort
+
+	worker.AddSeedNodesToConfig()
+
+	if !worker.entity.isDebugTestEntity {
+		entityID, _ := worker.entity.ID().MarshalText() // Cannot fail.
+		worker.Config.Registration.EntityID = string(entityID)
+	}
+
+	return nil
+}
+
+func (worker *Byzantine) CustomStart(args *argBuilder) error {
+	if err := worker.net.startOasisNode(worker.Node, []string{"debug", "byzantine", worker.script}, args); err != nil {
 		return fmt.Errorf("oasis/byzantine: failed to launch node %s: %w", worker.Name, err)
 	}
 
@@ -66,14 +91,9 @@ func (worker *Byzantine) startNode() error {
 // NewByzantine provisions a new byzantine node and adds it to the network.
 func (net *Network) NewByzantine(cfg *ByzantineCfg) (*Byzantine, error) {
 	byzantineName := fmt.Sprintf("byzantine-%d", len(net.byzantine))
-
-	byzantineDir, err := net.baseDir.NewSubDir(byzantineName)
+	host, err := net.GetNamedNode(byzantineName, &cfg.NodeCfg)
 	if err != nil {
-		net.logger.Error("failed to create byzantine node subdir",
-			"err", err,
-			"byzantine_name", byzantineName,
-		)
-		return nil, fmt.Errorf("oasis/byzantine: failed to create byzantine node subdir: %w", err)
+		return nil, err
 	}
 
 	if cfg.Script == "" {
@@ -87,43 +107,42 @@ func (net *Network) NewByzantine(cfg *ByzantineCfg) (*Byzantine, error) {
 	}
 
 	// Pre-provision the node identity so that we can update the entity.
-	nodeKey, _, _, err := net.provisionNodeIdentity(byzantineDir, cfg.IdentitySeed, false)
+	host.nodeSigner, host.p2pSigner, host.sentryCert, err = net.provisionNodeIdentity(host.dir, cfg.IdentitySeed)
 	if err != nil {
 		return nil, fmt.Errorf("oasis/byzantine: failed to provision node identity: %w", err)
 	}
-	if err := cfg.Entity.addNode(nodeKey); err != nil {
+	if err := cfg.Entity.addNode(host.nodeSigner); err != nil {
 		return nil, err
 	}
 
 	worker := &Byzantine{
-		Node: Node{
-			Name:                                     byzantineName,
-			net:                                      net,
-			dir:                                      byzantineDir,
-			termEarlyOk:                              true,
-			disableDefaultLogWatcherHandlerFactories: cfg.DisableDefaultLogWatcherHandlerFactories,
-			logWatcherHandlerFactories:               cfg.LogWatcherHandlerFactories,
-			consensus:                                cfg.Consensus,
-		},
+		Node:            host,
 		script:          cfg.Script,
 		extraArgs:       cfg.ExtraArgs,
-		entity:          cfg.Entity,
-		consensusPort:   net.nextNodePort,
-		p2pPort:         net.nextNodePort + 1,
+		consensusPort:   host.getProvisionedPort(nodePortConsensus),
+		p2pPort:         host.getProvisionedPort(nodePortP2P),
 		activationEpoch: cfg.ActivationEpoch,
+		runtime:         cfg.Runtime,
 	}
-	worker.doStartNode = worker.startNode
-	copy(worker.NodeID[:], nodeKey[:])
+	copy(worker.NodeID[:], host.nodeSigner[:])
 
 	net.byzantine = append(net.byzantine, worker)
-	net.nextNodePort += 2
+	host.features = append(host.features, worker)
 
-	if err := net.AddLogWatcher(&worker.Node); err != nil {
-		net.logger.Error("failed to add log watcher",
-			"err", err,
-			"byzantine_name", byzantineName,
-		)
-		return nil, fmt.Errorf("oasis/byzantine: failed to add log watcher for %s: %w", byzantineName, err)
+	if cfg.Runtime >= 0 {
+		rt := net.runtimes[cfg.Runtime].ID()
+		pk := host.nodeSigner
+
+		if net.cfg.SchedulerForceElect == nil {
+			net.cfg.SchedulerForceElect = make(map[common.Namespace]map[signature.PublicKey]*scheduler.ForceElectCommitteeRole)
+		}
+		if net.cfg.SchedulerForceElect[rt] == nil {
+			net.cfg.SchedulerForceElect[rt] = make(map[signature.PublicKey]*scheduler.ForceElectCommitteeRole)
+		}
+		if params := cfg.ForceElectParams; params != nil {
+			tmpParams := *params
+			net.cfg.SchedulerForceElect[rt][pk] = &tmpParams
+		}
 	}
 
 	return worker, nil

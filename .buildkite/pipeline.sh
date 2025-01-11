@@ -34,6 +34,7 @@ pr_and_no_code_related_changes() {
       ':(exclude).gitlint' \
       ':(exclude).markdownlint.yml' \
       ':(exclude).punch_config.py' \
+      ':(exclude).punch_version.py' \
       ':(exclude)docs/' \
       ':(exclude)towncrier.toml' \
       ':(exclude).gitbook.yaml'
@@ -50,10 +51,10 @@ pr_and_docker_changes() {
     'docker/'
 }
 
-# Helper that checks if the given tag of the oasisprotocol/oasis-core-ci Docker image exists.
+# Helper that checks if the given tag of the ghcr.io/oasisprotocol/oasis-core-ci Docker image exists.
 check_docker_ci_image_tag_exists() {
   local tag=$1
-  DOCKER_CLI_EXPERIMENTAL=enabled docker manifest inspect oasisprotocol/oasis-core-ci:${tag}
+  docker manifest inspect ghcr.io/oasisprotocol/oasis-core-ci:${tag}
 }
 
 # Determine the oasis-core-ci Docker image tag to use for tests.
@@ -76,11 +77,12 @@ if pr_and_docker_changes; then
 fi
 
 if ! check_docker_ci_image_tag_exists "${docker_tag}"; then
-    echo 1>&2 "Docker image 'oasisprotocol/oasis-core-ci:${docker_tag}' does not exist."
+    echo 1>&2 "Docker image 'ghcr.io/oasisprotocol/oasis-core-ci:${docker_tag}' does not exist."
     exit 1
 fi
 
 export DOCKER_OASIS_CORE_CI_BASE_TAG=${docker_tag}
+export BUILDKITE_BRANCH_SLUG=${BUILDKITE_BRANCH//\//-}
 
 # Decide which pipeline to use.
 pipeline=.buildkite/code.pipeline.yml
@@ -90,4 +92,3 @@ fi
 
 # Upload the selected pipeline.
 cat $pipeline | buildkite-agent pipeline upload
-

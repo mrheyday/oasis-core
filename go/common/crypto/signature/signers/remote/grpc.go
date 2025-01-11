@@ -7,8 +7,10 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"strings"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	cmnGrpc "github.com/oasisprotocol/oasis-core/go/common/grpc"
@@ -22,6 +24,7 @@ var (
 
 	methodPublicKeys = serviceName.NewMethod("PublicKeys", nil)
 	methodSign       = serviceName.NewMethod("Sign", SignRequest{})
+	methodProve      = serviceName.NewMethod("Prove", ProveRequest{})
 
 	serviceDesc = grpc.ServiceDesc{
 		ServiceName: string(serviceName),
@@ -34,6 +37,10 @@ var (
 			{
 				MethodName: methodSign.ShortName(),
 				Handler:    handlerSign,
+			},
+			{
+				MethodName: methodProve.ShortName(),
+				Handler:    handlerProve,
 			},
 		},
 	}
@@ -52,17 +59,24 @@ type SignRequest struct {
 	Message []byte               `json:"message"`
 }
 
+// ProveRequest is a VRF proof request.
+type ProveRequest struct {
+	Role  signature.SignerRole `json:"role"`
+	Alpha []byte               `json:"alpha"`
+}
+
 // Backend is the remote signer backend interface.
 type Backend interface {
-	PublicKeys(context.Context) ([]PublicKey, error)
-	Sign(context.Context, *SignRequest) ([]byte, error)
+	PublicKeys() ([]PublicKey, error)
+	Sign(*SignRequest) ([]byte, error)
+	Prove(*ProveRequest) ([]byte, error)
 }
 
 type wrapper struct {
 	signers map[signature.SignerRole]signature.Signer
 }
 
-func (w *wrapper) PublicKeys(ctx context.Context) ([]PublicKey, error) {
+func (w *wrapper) PublicKeys() ([]PublicKey, error) {
 	var resp []PublicKey
 	for _, v := range signature.SignerRoles { // Return in consistent order.
 		if signer := w.signers[v]; signer != nil {
@@ -75,7 +89,7 @@ func (w *wrapper) PublicKeys(ctx context.Context) ([]PublicKey, error) {
 	return resp, nil
 }
 
-func (w *wrapper) Sign(ctx context.Context, req *SignRequest) ([]byte, error) {
+func (w *wrapper) Sign(req *SignRequest) ([]byte, error) {
 	signer, ok := w.signers[req.Role]
 	if !ok {
 		return nil, signature.ErrNotExist
@@ -83,26 +97,41 @@ func (w *wrapper) Sign(ctx context.Context, req *SignRequest) ([]byte, error) {
 	return signer.ContextSign(signature.Context(req.Context), req.Message)
 }
 
-func handlerPublicKeys( // nolint: golint
+func (w *wrapper) Prove(req *ProveRequest) ([]byte, error) {
+	signer, ok := w.signers[req.Role]
+	if !ok {
+		return nil, signature.ErrNotExist
+	}
+	vrfSigner, ok := signer.(signature.VRFSigner)
+	if !ok {
+		return nil, fmt.Errorf("signature/signer/remote: signer does not support VRF prove")
+	}
+	if req.Role != signature.SignerVRF {
+		return nil, signature.ErrInvalidRole
+	}
+	return vrfSigner.Prove(req.Alpha)
+}
+
+func handlerPublicKeys(
 	srv interface{},
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
 	if interceptor == nil {
-		return srv.(Backend).PublicKeys(ctx)
+		return srv.(Backend).PublicKeys()
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
 		FullMethod: methodPublicKeys.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(Backend).PublicKeys(ctx)
+	handler := func(_ context.Context, _ interface{}) (interface{}, error) {
+		return srv.(Backend).PublicKeys()
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerSign( // nolint: golint
+func handlerSign(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -113,14 +142,37 @@ func handlerSign( // nolint: golint
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(Backend).Sign(ctx, &req)
+		return srv.(Backend).Sign(&req)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
 		FullMethod: methodSign.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(Backend).Sign(ctx, req.(*SignRequest))
+	handler := func(_ context.Context, req interface{}) (interface{}, error) {
+		return srv.(Backend).Sign(req.(*SignRequest))
+	}
+	return interceptor(ctx, &req, info, handler)
+}
+
+func handlerProve(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var req ProveRequest
+	if err := dec(&req); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).Prove(&req)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodProve.FullName(),
+	}
+	handler := func(_ context.Context, req interface{}) (interface{}, error) {
+		return srv.(Backend).Prove(req.(*ProveRequest))
 	}
 	return interceptor(ctx, &req, info, handler)
 }
@@ -160,7 +212,7 @@ func (rf *remoteFactory) EnsureRole(role signature.SignerRole) error {
 	return nil
 }
 
-func (rf *remoteFactory) Generate(role signature.SignerRole, rng io.Reader) (signature.Signer, error) {
+func (rf *remoteFactory) Generate(signature.SignerRole, io.Reader) (signature.Signer, error) {
 	return nil, fmt.Errorf("signature/signer/remote: key re-generation prohibited")
 }
 
@@ -222,34 +274,46 @@ type FactoryConfig struct {
 	ClientCertificate *tls.Certificate
 }
 
+// IsLocal returns true iff the configured endpoint is over AF_LOCAL.
+func (fc *FactoryConfig) IsLocal() bool {
+	return strings.HasPrefix(strings.ToLower(fc.Address), "unix:")
+}
+
 // NewFactory creates a new factory with the specified roles.
-func NewFactory(config interface{}, roles ...signature.SignerRole) (signature.SignerFactory, error) {
+func NewFactory(config interface{}) (signature.SignerFactory, error) {
 	cfg, ok := config.(*FactoryConfig)
 	if !ok {
 		return nil, fmt.Errorf("signature/signer/remote: invalid remote signer configuration provided")
 	}
 
-	if cfg.ServerCertificate == nil {
-		return nil, fmt.Errorf("signature/signer/remote: server certificate is required")
+	var cOpts []grpc.DialOption
+	if !cfg.IsLocal() {
+		if cfg.ServerCertificate == nil {
+			return nil, fmt.Errorf("signature/signer/remote: server certificate is required")
+		}
+
+		serverCert, err := x509.ParseCertificate(cfg.ServerCertificate.Certificate[0])
+		if err != nil {
+			return nil, fmt.Errorf("signature/signer/remote: failed to parse server certificate: %w", err)
+		}
+
+		creds, err := cmnGrpc.NewClientCreds(&cmnGrpc.ClientOptions{
+			Certificates: []tls.Certificate{
+				*cfg.ClientCertificate,
+			},
+			GetServerPubKeys: cmnGrpc.ServerPubKeysGetterFromCertificate(serverCert),
+			CommonName:       "remote-signer-server",
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		cOpts = append(cOpts, grpc.WithTransportCredentials(creds))
+	} else {
+		cOpts = append(cOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	serverCert, err := x509.ParseCertificate(cfg.ServerCertificate.Certificate[0])
-	if err != nil {
-		return nil, fmt.Errorf("signature/signer/remote: failed to parse server certificate: %w", err)
-	}
-
-	creds, err := cmnGrpc.NewClientCreds(&cmnGrpc.ClientOptions{
-		Certificates: []tls.Certificate{
-			*cfg.ClientCertificate,
-		},
-		GetServerPubKeys: cmnGrpc.ServerPubKeysGetterFromCertificate(serverCert),
-		CommonName:       "remote-signer-server",
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	conn, err := cmnGrpc.Dial(cfg.Address, grpc.WithTransportCredentials(creds))
+	conn, err := cmnGrpc.Dial(cfg.Address, cOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("signature/signer/remote: failed to dial server: %w", err)
 	}

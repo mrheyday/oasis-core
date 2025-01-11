@@ -3,29 +3,56 @@ package host
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle/component"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host/protocol"
 )
 
 // Config contains common configuration for the provisioned runtime.
 type Config struct {
-	// RuntimeID is the unique runtime identifier.
-	RuntimeID common.Namespace
+	// Name is the optional human readable runtime name.
+	Name string
 
-	// Path is the path to the resource required for provisioning a runtime. This can be an ELF
-	// binary, an SGXS binary or even a VM image. The semantics of this field are entirely up to the
-	// used provisioner.
-	Path string
+	// ID is the runtime identifier.
+	ID common.Namespace
+
+	// Components are components that should be provisioned.
+	Components []*bundle.ExplodedComponent
 
 	// Extra is an optional provisioner-specific configuration.
 	Extra interface{}
 
 	// MessageHandler is the message handler for the Runtime Host Protocol messages.
-	MessageHandler protocol.Handler
+	MessageHandler RuntimeHandler
+
+	// LocalConfig is the node-local runtime configuration.
+	LocalConfig map[string]interface{}
+}
+
+// GetExplodedComponent ensures that only a single exploded component is configured for this runtime
+// and returns it.
+func (cfg *Config) GetExplodedComponent() (*bundle.ExplodedComponent, error) {
+	if numComps := len(cfg.Components); numComps != 1 {
+		return nil, fmt.Errorf("expected a single component (got %d)", numComps)
+	}
+
+	return cfg.Components[0], nil
+}
+
+// GetComponent ensures that only a single component is configured for this runtime and returns it.
+func (cfg *Config) GetComponent() (*bundle.Component, error) {
+	comp, err := cfg.GetExplodedComponent()
+	if err != nil {
+		return nil, err
+	}
+
+	return comp.Component, nil
 }
 
 // Provisioner is the runtime provisioner interface.
@@ -34,7 +61,10 @@ type Provisioner interface {
 	//
 	// This method may return before the runtime is fully provisioned. The returned runtime will not
 	// be started automatically, you must call Start explicitly.
-	NewRuntime(ctx context.Context, cfg Config) (Runtime, error)
+	NewRuntime(cfg Config) (Runtime, error)
+
+	// Name returns the name of the provisioner.
+	Name() string
 }
 
 // Runtime is a provisioned runtime interface.
@@ -42,15 +72,30 @@ type Runtime interface {
 	// ID is the runtime identifier.
 	ID() common.Namespace
 
+	// GetActiveVersion retrieves the version of the currently active runtime.
+	GetActiveVersion() (*version.Version, error)
+
+	// GetInfo retrieves the runtime information.
+	GetInfo(ctx context.Context) (*protocol.RuntimeInfoResponse, error)
+
+	// GetCapabilityTEE retrieves the CapabilityTEE of the runtime.
+	//
+	// It may be nil in case the CapabilityTEE is not available or if the runtime is not running
+	// inside a TEE.
+	GetCapabilityTEE() (*node.CapabilityTEE, error)
+
 	// Call sends a request message to the runtime over the Runtime Host Protocol and waits for the
 	// response (which may be a failure).
 	Call(ctx context.Context, body *protocol.Body) (*protocol.Body, error)
 
-	// WatchEvents subscribes to runtime status events.
-	WatchEvents(ctx context.Context) (<-chan *Event, pubsub.ClosableSubscription, error)
+	// UpdateCapabilityTEE asks the runtime to update its CapabilityTEE with latest data.
+	UpdateCapabilityTEE()
 
-	// Start attempts to start the runtime.
-	Start() error
+	// WatchEvents subscribes to runtime status events.
+	WatchEvents() (<-chan *Event, pubsub.ClosableSubscription)
+
+	// Start starts the runtime.
+	Start()
 
 	// Abort attempts to abort a runtime so that it will be ready to service new requests.
 	// In case abort fails or force flag is set, the runtime will be restarted.
@@ -58,6 +103,24 @@ type Runtime interface {
 
 	// Stop signals the provisioned runtime to stop.
 	Stop()
+}
+
+// CompositeRuntime is a runtime that provides multiple components which are themselves runtimes.
+type CompositeRuntime interface {
+	// Component returns the runtime component with the given unique identifier.
+	// If the component with the given identifier does not exist, nil is returned.
+	Component(id component.ID) (Runtime, bool)
+}
+
+// RuntimeHandler is the message handler for the host side of the runtime host protocol.
+type RuntimeHandler interface {
+	protocol.Handler
+
+	// NewSubHandler creates a sub-handler specialized for the given runtime component.
+	NewSubHandler(cr CompositeRuntime, component *bundle.Component) (RuntimeHandler, error)
+
+	// AttachRuntime attaches a given hosted runtime instance to this handler.
+	AttachRuntime(host Runtime) error
 }
 
 // RuntimeEventEmitter is the interface for emitting events for a provisioned runtime.
@@ -72,6 +135,7 @@ type Event struct {
 	FailedToStart *FailedToStartEvent
 	Stopped       *StoppedEvent
 	Updated       *UpdatedEvent
+	ConfigUpdated *ConfigUpdatedEvent
 }
 
 // StartedEvent is a runtime started event.
@@ -91,12 +155,20 @@ type FailedToStartEvent struct {
 }
 
 // StoppedEvent is a runtime stopped event.
-type StoppedEvent struct {
-}
+type StoppedEvent struct{}
 
 // UpdatedEvent is a runtime metadata updated event.
 type UpdatedEvent struct {
+	// Version is the runtime version.
+	Version version.Version
+
 	// CapabilityTEE is the updated runtime's CapabilityTEE. It may be nil in case the runtime is
 	// not running inside a TEE.
 	CapabilityTEE *node.CapabilityTEE
 }
+
+// ConfigUpdatedEvent is a runtime configuration updated event.
+//
+// This event can be used by runtime host implementations to signal that the underlying runtime
+// configuration has changed and some things (e.g. registration) may need a refresh.
+type ConfigUpdatedEvent struct{}

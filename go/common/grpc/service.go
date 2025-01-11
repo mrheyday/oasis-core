@@ -24,7 +24,12 @@ type NamespaceExtractorFunc func(ctx context.Context, req interface{}) (common.N
 
 // AccessControlFunc is a function that decides whether access control policy lookup is required for
 // a specific request. In case an error is returned the request is aborted.
-type AccessControlFunc func(ctx context.Context, req interface{}) (bool, error)
+type AccessControlFunc func(req interface{}) (bool, error)
+
+// AccessControlAlways is a utility AccessControlFunc that enables access control for every request.
+func AccessControlAlways(interface{}) (bool, error) {
+	return true, nil
+}
 
 // ServiceNameFromMethod extract service name from method name.
 func ServiceNameFromMethod(methodName string) ServiceName {
@@ -65,10 +70,9 @@ func (sn ServiceName) NewMethod(name string, requestType interface{}) *MethodDes
 		requestType: requestType,
 	}
 
-	if _, isRegistered := registeredMethods.Load(md.FullName()); isRegistered {
+	if _, isRegistered := registeredMethods.LoadOrStore(md.FullName(), md); isRegistered {
 		panic(fmt.Errorf("service: method already registered: %s", name))
 	}
-	registeredMethods.Store(md.FullName(), md)
 
 	return md
 }
@@ -107,11 +111,11 @@ func (m *MethodDesc) FullName() string {
 }
 
 // IsAccessControlled retruns if method is access controlled.
-func (m *MethodDesc) IsAccessControlled(ctx context.Context, req interface{}) (bool, error) {
+func (m *MethodDesc) IsAccessControlled(req interface{}) (bool, error) {
 	if m.accessControl == nil {
 		return false, nil
 	}
-	return m.accessControl(ctx, req)
+	return m.accessControl(req)
 }
 
 // UnmarshalRawMessage unmarshals `cbor.RawMessage` request.

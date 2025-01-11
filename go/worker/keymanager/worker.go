@@ -2,82 +2,81 @@ package keymanager
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
+	"math/rand"
+	"slices"
 	"sync"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/oasisprotocol/curve25519-voi/primitives/x25519"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/accessctl"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
-	"github.com/oasisprotocol/oasis-core/go/common/grpc/policy"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
-	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/common/service"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/keymanager/api"
+	cmdFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
+	"github.com/oasisprotocol/oasis-core/go/p2p/rpc"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
-	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
-	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
-	runtimeCommittee "github.com/oasisprotocol/oasis-core/go/runtime/committee"
+	enclaverpc "github.com/oasisprotocol/oasis-core/go/runtime/enclaverpc/api"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host/protocol"
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 	workerCommon "github.com/oasisprotocol/oasis-core/go/worker/common"
-	committeeCommon "github.com/oasisprotocol/oasis-core/go/worker/common/committee"
-	"github.com/oasisprotocol/oasis-core/go/worker/common/p2p"
+	workerKeymanager "github.com/oasisprotocol/oasis-core/go/worker/keymanager/api"
 	"github.com/oasisprotocol/oasis-core/go/worker/registration"
 )
 
 const (
-	rpcCallTimeout = 5 * time.Second
+	rpcCallTimeout = 2 * time.Second
 )
 
-var (
-	_ service.BackgroundService = (*Worker)(nil)
+// Ensure the key manager worker implements the BackgroundService interface.
+var _ service.BackgroundService = (*Worker)(nil)
 
-	errMalformedResponse = fmt.Errorf("worker/keymanager: malformed response from worker")
-)
-
-// The key manager worker.
+// Worker is the key manager worker.
 //
 // It behaves differently from other workers as the key manager has its
 // own runtime. It needs to keep track of executor committees for other
 // runtimes in order to update the access control lists.
 type Worker struct { // nolint: maligned
 	sync.RWMutex
-	*workerCommon.RuntimeHostNode
+	*runtimeRegistry.RuntimeHostNode
 
 	logger *logging.Logger
 
 	ctx       context.Context
 	cancelCtx context.CancelFunc
-	stopCh    chan struct{}
 	quitCh    chan struct{}
 	initCh    chan struct{}
 
-	initTicker   *backoff.Ticker
-	initTickerCh <-chan time.Time
+	nodeID signature.PublicKey
 
-	runtime            runtimeRegistry.Runtime
-	runtimeHostHandler protocol.Handler
+	runtime      runtimeRegistry.Runtime
+	runtimeID    common.Namespace
+	runtimeLabel string
 
-	clientRuntimes       map[common.Namespace]*clientRuntimeWatcher
-	clientRuntimesQuitCh chan *clientRuntimeWatcher
+	kmNodeWatcher    *kmNodeWatcher
+	kmRuntimeWatcher *kmRuntimeWatcher
+	secretsWorker    *secretsWorker
+	churpWorker      *churpWorker
 
-	commonWorker  *workerCommon.Worker
-	roleProvider  registration.RoleProvider
-	enclaveStatus *api.SignedInitResponse
-	backend       api.Backend
+	accessControllers         []workerKeymanager.RPCAccessController
+	accessControllersByMethod map[string]workerKeymanager.RPCAccessController
 
-	grpcPolicy *policy.DynamicRuntimePolicyChecker
+	peerMap    *PeerMap
+	accessList *AccessList
 
-	enabled     bool
-	mayGenerate bool
+	commonWorker *workerCommon.Worker
+	roleProvider registration.RoleProvider
+	backend      api.Backend
+
+	enabled bool
 }
 
 func (w *Worker) Name() string {
@@ -92,22 +91,21 @@ func (w *Worker) Start() error {
 		return nil
 	}
 
-	w.logger.Info("starting key manager worker")
 	go w.worker()
 
 	return nil
 }
 
 func (w *Worker) Stop() {
-	w.logger.Info("stopping key manager service")
+	w.logger.Info("stopping key manager worker")
 
 	if !w.enabled {
+		close(w.quitCh)
 		return
 	}
 
 	// Stop the sub-components.
 	w.cancelCtx()
-	close(w.stopCh)
 }
 
 // Enabled returns if worker is enabled.
@@ -128,44 +126,75 @@ func (w *Worker) Initialized() <-chan struct{} {
 	return w.initCh
 }
 
-// Implements workerCommon.RuntimeHostHandlerFactory.
-func (w *Worker) GetRuntime() runtimeRegistry.Runtime {
-	return w.runtime
-}
+func (w *Worker) CallEnclave(ctx context.Context, data []byte, kind enclaverpc.Kind) ([]byte, error) {
+	// Peek into the frame/request data to extract the method.
+	var method string
+	switch kind {
+	case enclaverpc.KindNoiseSession:
+		var frame enclaverpc.Frame
+		if err := cbor.Unmarshal(data, &frame); err != nil {
+			return nil, fmt.Errorf("malformed RPC frame")
+		}
+		// Note that the untrusted plaintext is also checked in the enclave, so if the node lied
+		// about what method it's using, we will know and the request will get rejected.
+		method = frame.UntrustedPlaintext
+	case enclaverpc.KindInsecureQuery:
+		var req enclaverpc.Request
+		if err := cbor.Unmarshal(data, &req); err != nil {
+			return nil, fmt.Errorf("malformed RPC request")
+		}
+		method = req.Method
+	default:
+		// Local queries are not allowed.
+		return nil, fmt.Errorf("unsupported RPC kind")
+	}
 
-// Implements workerCommon.RuntimeHostHandlerFactory.
-func (w *Worker) NewNotifier(ctx context.Context, host host.Runtime) protocol.Notifier {
-	return &protocol.NoOpNotifier{}
-}
+	// Handle access control.
+	peerID, ok := rpc.PeerIDFromContext(ctx)
+	if !ok {
+		return nil, fmt.Errorf("not authorized: unknown peer")
+	}
 
-// Implements workerCommon.RuntimeHostHandlerFactory.
-func (w *Worker) NewRuntimeHostHandler() protocol.Handler {
-	return w.runtimeHostHandler
-}
+	switch {
+	case method == api.RPCMethodConnect && kind == enclaverpc.KindNoiseSession:
+		// Allow connection if at least one controller grants authorization.
+		fn := func(ctrl workerKeymanager.RPCAccessController) bool {
+			return ctrl.Connect(ctx, peerID)
+		}
+		if !slices.ContainsFunc(w.accessControllers, fn) {
+			return nil, fmt.Errorf("not authorized to connect")
+		}
+	default:
+		ctrl, ok := w.accessControllersByMethod[method]
+		if !ok {
+			return nil, fmt.Errorf("unsupported RPC method")
+		}
+		if err := ctrl.Authorize(ctx, method, kind, peerID); err != nil {
+			return nil, fmt.Errorf("not authorized: %w", err)
+		}
+	}
 
-func (w *Worker) callLocal(ctx context.Context, data []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, rpcCallTimeout)
 	defer cancel()
-
-	// Wait for initialization to complete.
-	select {
-	case <-w.initCh:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 
 	req := &protocol.Body{
 		RuntimeRPCCallRequest: &protocol.RuntimeRPCCallRequest{
 			Request: data,
+			Kind:    kind,
+			PeerID:  []byte(peerID),
 		},
 	}
 
-	// NOTE: Hosted runtime should not be nil as we wait for initialization above.
 	rt := w.GetHostedRuntime()
+	if rt == nil {
+		return nil, fmt.Errorf("not initialized")
+	}
+
 	response, err := rt.Call(ctx, req)
 	if err != nil {
 		w.logger.Error("failed to dispatch RPC call to runtime",
 			"err", err,
+			"kind", kind,
 		)
 		return nil, err
 	}
@@ -175,524 +204,325 @@ func (w *Worker) callLocal(ctx context.Context, data []byte) ([]byte, error) {
 		w.logger.Error("malformed response from runtime",
 			"response", response,
 		)
-		return nil, errMalformedResponse
+		return nil, fmt.Errorf("malformed response from runtime")
 	}
 
 	return resp.Response, nil
 }
 
-func (w *Worker) updateStatus(status *api.Status, startedEvent *host.StartedEvent) error {
-	var initOk bool
-	defer func() {
-		if !initOk {
-			// If initialization failed setup a retry ticker.
-			if w.initTicker == nil {
-				w.initTicker = backoff.NewTicker(backoff.NewExponentialBackOff())
-				w.initTickerCh = w.initTicker.C
-			}
-		}
-	}()
-
-	// Initialize the key manager.
-	type InitRequest struct {
-		Checksum    []byte `json:"checksum"`
-		Policy      []byte `json:"policy"`
-		MayGenerate bool   `json:"may_generate"`
-	}
-	type InitCall struct { // nolint: maligned
-		Method string      `json:"method"`
-		Args   InitRequest `json:"args"`
-	}
-
-	var policy []byte
-	if status.Policy != nil {
-		policy = cbor.Marshal(status.Policy)
-	}
-
-	call := InitCall{
-		Method: "init",
-		Args: InitRequest{
-			Checksum:    cbor.FixSliceForSerde(status.Checksum),
-			Policy:      cbor.FixSliceForSerde(policy),
-			MayGenerate: w.mayGenerate,
-		},
-	}
-	req := &protocol.Body{
-		RuntimeLocalRPCCallRequest: &protocol.RuntimeLocalRPCCallRequest{
-			Request: cbor.Marshal(&call),
-		},
-	}
-
+func (w *Worker) callEnclaveLocal(ctx context.Context, method string, args interface{}, rsp interface{}) error {
 	rt := w.GetHostedRuntime()
-	response, err := rt.Call(w.ctx, req)
-	if err != nil {
-		w.logger.Error("failed to initialize enclave",
-			"err", err,
-		)
-		return err
+	if rt == nil {
+		return fmt.Errorf("not initialized")
 	}
-
-	resp := response.RuntimeLocalRPCCallResponse
-	if resp == nil {
-		w.logger.Error("malformed response initializing enclave",
-			"response", response,
-		)
-		return errMalformedResponse
-	}
-
-	innerResp, err := extractMessageResponsePayload(resp.Response)
-	if err != nil {
-		w.logger.Error("failed to extract rpc response payload",
-			"err", err,
-		)
-		return fmt.Errorf("worker/keymanager: failed to extract rpc response payload: %w", err)
-	}
-
-	var signedInitResp api.SignedInitResponse
-	if err = cbor.Unmarshal(innerResp, &signedInitResp); err != nil {
-		w.logger.Error("failed to parse response initializing enclave",
-			"err", err,
-			"response", innerResp,
-		)
-		return fmt.Errorf("worker/keymanager: failed to parse response initializing enclave: %w", err)
-	}
-
-	// Validate the signature.
-	if tee := startedEvent.CapabilityTEE; tee != nil {
-		var signingKey signature.PublicKey
-
-		switch tee.Hardware {
-		case node.TEEHardwareInvalid:
-			signingKey = api.TestPublicKey
-		case node.TEEHardwareIntelSGX:
-			signingKey = tee.RAK
-		default:
-			return fmt.Errorf("worker/keymanager: unknown TEE hardware: %v", tee.Hardware)
-		}
-
-		if err = signedInitResp.Verify(signingKey); err != nil {
-			return fmt.Errorf("worker/keymanager: failed to validate initialization response signature: %w", err)
-		}
-	}
-
-	if !signedInitResp.InitResponse.IsSecure {
-		w.logger.Warn("Key manager enclave build is INSECURE")
-	}
-
-	w.logger.Info("Key manager initialized",
-		"checksum", hex.EncodeToString(signedInitResp.InitResponse.Checksum),
-	)
-	if w.initTicker != nil {
-		w.initTickerCh = nil
-		w.initTicker.Stop()
-		w.initTicker = nil
-	}
-
-	// Register as we are now ready to handle requests.
-	initOk = true
-	w.roleProvider.SetAvailableWithCallback(func(n *node.Node) error {
-		rt := n.AddOrUpdateRuntime(w.runtime.ID())
-		rt.Version = startedEvent.Version
-		rt.ExtraInfo = cbor.Marshal(signedInitResp)
-		rt.Capabilities.TEE = startedEvent.CapabilityTEE
-		return nil
-	}, func(context.Context) error {
-		w.logger.Info("Key manager registered")
-
-		// Signal that we are initialized.
-		select {
-		case <-w.initCh:
-		default:
-			close(w.initCh)
-		}
-		return nil
-	})
-
-	// Cache the key manager enclave status.
-	w.Lock()
-	defer w.Unlock()
-
-	w.enclaveStatus = &signedInitResp
-
-	return nil
+	return rt.LocalRPC(ctx, method, args, rsp)
 }
 
-func extractMessageResponsePayload(raw []byte) ([]byte, error) {
-	// See: runtime/src/rpc/types.rs
-	type MessageResponseBody struct {
-		Success interface{} `json:",omitempty"`
-		Error   *string     `json:",omitempty"`
+func (w *Worker) runtimeAttestationKey() (*signature.PublicKey, error) {
+	kmRt, err := w.runtime.RegistryDescriptor(w.ctx)
+	if err != nil {
+		return nil, err
 	}
-	type MessageResponse struct {
-		Response *struct {
-			Body MessageResponseBody `json:"body"`
+
+	var rak *signature.PublicKey
+	switch kmRt.TEEHardware {
+	case node.TEEHardwareInvalid:
+		rak = &api.InsecureRAK
+	case node.TEEHardwareIntelSGX:
+		capabilityTEE, err := w.GetHostedRuntimeCapabilityTEE()
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch TEE capability: %w", err)
 		}
-	}
-
-	var msg MessageResponse
-	if err := cbor.Unmarshal(raw, &msg); err != nil {
-		return nil, fmt.Errorf("malformed message envelope: %w", err)
-	}
-
-	if msg.Response == nil {
-		return nil, fmt.Errorf("message is not a response: '%s'", hex.EncodeToString(raw))
-	}
-
-	switch {
-	case msg.Response.Body.Success != nil:
-	case msg.Response.Body.Error != nil:
-		return nil, fmt.Errorf("rpc failure: '%s'", *msg.Response.Body.Error)
+		if capabilityTEE == nil {
+			return nil, fmt.Errorf("runtime is not running inside a TEE")
+		}
+		rak = &capabilityTEE.RAK
 	default:
-		return nil, fmt.Errorf("unknown rpc response status: '%s'", hex.EncodeToString(raw))
+		return nil, fmt.Errorf("TEE hardware mismatch")
 	}
 
-	return cbor.Marshal(msg.Response.Body.Success), nil
+	return rak, nil
 }
 
-func (w *Worker) startClientRuntimeWatcher(rt *registry.Runtime, status *api.Status) error {
-	runtimeID := w.runtime.ID()
-	if status == nil || !status.IsInitialized {
-		return nil
+func (w *Worker) runtimeEncryptionKeys(nodes []signature.PublicKey) (map[x25519.PublicKey]struct{}, error) {
+	kmRt, err := w.runtime.RegistryDescriptor(w.ctx)
+	if err != nil {
+		return nil, err
 	}
-	if rt.Kind != registry.KindCompute || rt.KeyManager == nil || !rt.KeyManager.Equal(&runtimeID) {
-		return nil
-	}
-	if w.clientRuntimes[rt.ID] != nil {
-		return nil
-	}
-	w.logger.Info("seen new runtime using us as a key manager",
-		"runtime_id", rt.ID,
-	)
 
-	// Check policy document if runtime is allowed to query any of the
-	// key manager enclaves.
-	var found bool
-	switch {
-	case !status.IsSecure && status.Policy == nil:
-		// Insecure test keymanagers can be without a policy.
-		found = true
-	case status.Policy != nil:
-		for _, enc := range status.Policy.Policy.Enclaves {
-			if _, ok := enc.MayQuery[rt.ID]; ok {
-				found = true
-				break
-			}
+	reks := make(map[x25519.PublicKey]struct{})
+	for _, id := range nodes {
+		var n *node.Node
+		n, err := w.commonWorker.Consensus.Registry().GetNode(w.ctx, &registry.IDQuery{
+			Height: consensus.HeightLatest,
+			ID:     id,
+		})
+		switch err {
+		case nil:
+		case registry.ErrNoSuchNode:
+			continue
+		default:
+			return nil, err
 		}
-	}
-	if !found {
-		w.logger.Warn("runtime not found in keymanager policy, skipping",
-			"runtime_id", rt.ID,
-			"status", status,
-		)
-		return nil
-	}
 
-	runtimeUnmg, err := w.commonWorker.RuntimeRegistry.NewUnmanagedRuntime(w.ctx, rt.ID)
-	if err != nil {
-		w.logger.Error("unable to create new unmanaged runtime",
-			"err", err,
-		)
-		return err
-	}
-	node, err := w.commonWorker.NewUnmanagedCommitteeNode(runtimeUnmg, false)
-	if err != nil {
-		w.logger.Error("unable to create new committee node",
-			"runtime_id", rt.ID,
-			"err", err,
-		)
-		return err
-	}
-
-	crw := &clientRuntimeWatcher{
-		w:    w,
-		node: node,
-	}
-	node.AddHooks(crw)
-
-	if err := node.Start(); err != nil {
-		w.logger.Error("unable to start new committee node",
-			"runtime_id", rt.ID,
-			"err", err,
-		)
-		return err
-	}
-
-	go func() {
-		select {
-		case <-node.Quit():
-			w.clientRuntimesQuitCh <- crw
-		case <-w.stopCh:
-		}
-	}()
-
-	w.clientRuntimes[rt.ID] = crw
-
-	return nil
-}
-
-func (w *Worker) recheckAllRuntimes(status *api.Status) error {
-	rts, err := w.commonWorker.Consensus.Registry().GetRuntimes(w.ctx,
-		&registry.GetRuntimesQuery{
-			Height:           consensus.HeightLatest,
-			IncludeSuspended: false,
-		},
-	)
-	if err != nil {
-		w.logger.Error("failed querying runtimes",
-			"err", err,
-		)
-		return fmt.Errorf("failed querying runtimes: %w", err)
-	}
-	for _, rt := range rts {
-		if err := w.startClientRuntimeWatcher(rt, status); err != nil {
-			w.logger.Error("failed to start runtime watcher",
-				"err", err,
-			)
+		idx := slices.IndexFunc(n.Runtimes, func(rt *node.Runtime) bool {
+			// Skipping version check as key managers are running exactly one
+			// version of the runtime.
+			return rt.ID.Equal(&w.runtimeID)
+		})
+		if idx == -1 {
 			continue
 		}
+		nRt := n.Runtimes[idx]
+
+		var rek x25519.PublicKey
+		switch kmRt.TEEHardware {
+		case node.TEEHardwareInvalid:
+			rek = api.InsecureREK
+		case node.TEEHardwareIntelSGX:
+			if nRt.Capabilities.TEE == nil || nRt.Capabilities.TEE.REK == nil {
+				continue
+			}
+			rek = *nRt.Capabilities.TEE.REK
+		default:
+			continue
+		}
+
+		reks[rek] = struct{}{}
 	}
 
-	return nil
+	return reks, nil
 }
 
-func (w *Worker) worker() { // nolint: gocyclo
+// selectBlockHeight returns the height of a random block within the specified
+// percentiles of the given epoch.
+//
+// Calculation is based on the current epoch and its block interval.
+func (w *Worker) selectBlockHeight(epoch beacon.EpochTime, from uint8, to uint8) (int64, error) {
+	// Fetch the height of the first block in the current epoch.
+	now, err := w.commonWorker.Consensus.Beacon().GetEpoch(w.ctx, consensus.HeightLatest)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch epoch: %w", err)
+	}
+	first, err := w.commonWorker.Consensus.Beacon().GetEpochBlock(w.ctx, now)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch epoch block height: %w", err)
+	}
+
+	// Fetch the epoch interval for the current epoch.
+	params, err := w.commonWorker.Consensus.Beacon().ConsensusParameters(w.ctx, consensus.HeightLatest)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch consensus parameters: %w", err)
+	}
+	interval := params.Interval()
+
+	// Use a zero interval when mocking epoch time, as the interval is untrusted.
+	// It is set in genesis to a fixed value, but the real interval can vary
+	// between epochs.
+	if cmdFlags.DebugDontBlameOasis() && params.DebugMockBackend {
+		interval = 0
+	}
+
+	// Pick a random block from the given percentile.
+	offset := interval * int64(from) / 100
+	span := interval * int64(to-from) / 100
+	span = max(1, span)
+	height := first + offset + rand.Int63n(span)
+
+	// Estimate the block height for the given epoch.
+	diff := int64(epoch) - int64(now)
+	height = height + diff*interval
+
+	return height, nil
+}
+
+func (w *Worker) handleRuntimeHostEvent(ev *host.Event) {
+	switch {
+	case ev.Started != nil, ev.Updated != nil:
+		var (
+			version       version.Version
+			capabilityTEE *node.CapabilityTEE
+		)
+		switch {
+		case ev.Started != nil:
+			version = ev.Started.Version
+			capabilityTEE = ev.Started.CapabilityTEE
+		case ev.Updated != nil:
+			version = ev.Updated.Version
+			capabilityTEE = ev.Updated.CapabilityTEE
+		default:
+			return
+		}
+
+		w.roleProvider.SetAvailableWithCallback(func(n *node.Node) error {
+			rt := n.AddOrUpdateRuntime(w.runtime.ID(), version)
+			rt.Version = version
+			rt.Capabilities.TEE = capabilityTEE
+			return nil
+		}, func(context.Context) error {
+			w.logger.Info("key manager registered",
+				"version", version,
+				"tee", capabilityTEE,
+			)
+			return nil
+		})
+	case ev.FailedToStart != nil, ev.Stopped != nil:
+		// We can no longer service requests.
+		w.roleProvider.SetUnavailable()
+	default:
+		// Unknown event.
+		w.logger.Warn("unknown runtime host event",
+			"ev", ev,
+		)
+	}
+}
+
+func (w *Worker) worker() {
+	w.logger.Info("starting key manager worker")
+
 	defer close(w.quitCh)
 
 	// Wait for consensus sync.
-	w.logger.Info("delaying worker start until after initial synchronization")
+	w.logger.Info("waiting consensus to finish initial synchronization")
 	select {
-	case <-w.stopCh:
+	case <-w.ctx.Done():
 		return
 	case <-w.commonWorker.Consensus.Synced():
 	}
+	w.logger.Info("consensus has finished initial synchronization")
 
-	// Need to explicitly watch for updates related to the key manager runtime
-	// itself.
-	knw := newKmNodeWatcher(w)
-	go knw.watchNodes()
+	// Key managers always need to use the enclave version given to them in the bundle
+	// as they need to make sure that replication is possible during upgrades.
+	var version version.Version
 
-	// Subscribe to key manager status updates.
-	statusCh, statusSub := w.backend.WatchStatuses()
-	defer statusSub.Close()
+	if ok := func() bool {
+		// Start watching runtime versions so that we can wait for the runtime
+		// to be discovered.
+		versionCh, versionSub := w.GetRuntime().WatchHostVersions()
+		defer versionSub.Close()
 
-	// Subscribe to runtime registrations in order to know which runtimes
-	// are using us as a key manager.
-	w.clientRuntimes = make(map[common.Namespace]*clientRuntimeWatcher)
-	w.clientRuntimesQuitCh = make(chan *clientRuntimeWatcher)
-	defer func() {
-		for _, crw := range w.clientRuntimes {
-			crw.node.Stop()
-			<-crw.node.Quit()
+		// Make sure we have one version before proceeding.
+		versions := w.runtime.HostVersions()
+
+		switch numVers := len(versions); numVers {
+		case 0:
+			w.logger.Info("waiting runtime version to be discovered")
+
+			select {
+			case version = <-versionCh:
+			case <-w.ctx.Done():
+				return false
+			}
+		case 1:
+			version = versions[0]
+		default:
+			w.logger.Error("expected a single runtime version (got %d)", numVers)
+			return false
 		}
-	}()
 
-	rtCh, rtSub, err := w.commonWorker.Consensus.Registry().WatchRuntimes(w.ctx)
-	if err != nil {
-		w.logger.Error("failed to watch runtimes",
+		w.logger.Info("runtime version discovered",
+			"version", version,
+		)
+
+		return true
+	}(); !ok {
+		return
+	}
+
+	// Provision the specified runtime version.
+	w.logger.Info("provisioning key manager runtime")
+
+	if err := w.ProvisionHostedRuntimeVersion(version); err != nil {
+		w.logger.Error("failed to provision key manager runtime",
 			"err", err,
+			"version", version,
 		)
 		return
 	}
-	defer rtSub.Close()
 
-	var (
-		hrtEventCh          <-chan *host.Event
-		currentStatus       *api.Status
-		currentStartedEvent *host.StartedEvent
+	// Set the runtime to the specified version.
+	w.SetHostedRuntimeVersion(&version, nil)
 
-		runtimeID = w.runtime.ID()
-	)
-	for {
-		select {
-		case ev := <-hrtEventCh:
-			switch {
-			case ev.Started != nil, ev.Updated != nil:
-				// Runtime has started successfully.
-				currentStartedEvent = ev.Started
-				if currentStatus == nil {
-					continue
-				}
+	// Start the runtime and its notifier.
+	hrt := w.GetHostedRuntime()
+	hrtNotifier := w.GetRuntimeHostNotifier()
 
-				// Send a node preregistration, so that other nodes know to update their access
-				// control.
-				if w.enclaveStatus == nil {
-					w.roleProvider.SetAvailable(func(n *node.Node) error {
-						rt := n.AddOrUpdateRuntime(w.runtime.ID())
-						rt.Version = currentStartedEvent.Version
-						rt.ExtraInfo = nil
-						rt.Capabilities.TEE = currentStartedEvent.CapabilityTEE
-						return nil
-					})
-				}
+	hrtEventCh, hrtSub := hrt.WatchEvents()
+	defer hrtSub.Close()
 
-				// Forward status update to key manager runtime.
-				if err = w.updateStatus(currentStatus, currentStartedEvent); err != nil {
-					w.logger.Error("failed to handle status update",
-						"err", err,
-					)
-					continue
-				}
-			case ev.FailedToStart != nil, ev.Stopped != nil:
-				// Worker failed to start or was stopped -- we can no longer service requests.
-				currentStartedEvent = nil
-				w.roleProvider.SetUnavailable()
-			default:
-				// Unknown event.
-				w.logger.Warn("unknown worker event",
-					"ev", ev,
-				)
+	hrt.Start()
+	defer hrt.Stop()
+
+	hrtNotifier.Start()
+	defer hrtNotifier.Stop()
+
+	// Ensure that the runtime version is active.
+	if _, err := w.GetHostedRuntimeActiveVersion(); err != nil {
+		w.logger.Error("failed to activate key manager runtime version",
+			"err", err,
+			"version", version,
+		)
+		return
+	}
+
+	// Always wait for the background watchers and workers to finish.
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	wg.Add(5)
+
+	// Need to explicitly watch for updates related to the key manager runtime
+	// itself.
+	go func() {
+		defer wg.Done()
+		w.kmNodeWatcher.watch(w.ctx)
+	}()
+
+	// Watch runtime registrations in order to know which runtimes are using
+	// us as a key manager.
+	go func() {
+		defer wg.Done()
+		w.kmRuntimeWatcher.watch(w.ctx)
+	}()
+
+	// Serve master and ephemeral secrets.
+	go func() {
+		defer wg.Done()
+		w.secretsWorker.work(w.ctx, hrt)
+	}()
+
+	// Serve CHURP secrets.
+	go func() {
+		defer wg.Done()
+		w.churpWorker.work(w.ctx, hrt)
+	}()
+
+	// Watch runtime updates and register with new capabilities on restarts.
+	go func() {
+		defer wg.Done()
+
+		for {
+			select {
+			case ev := <-hrtEventCh:
+				w.handleRuntimeHostEvent(ev)
+			case <-w.ctx.Done():
+				return
 			}
-		case status := <-statusCh:
-			if !status.ID.Equal(&runtimeID) {
-				continue
-			}
-
-			w.logger.Info("received key manager status update")
-
-			// Check if this is the first update and we need to initialize the
-			// worker host.
-			hrt := w.GetHostedRuntime()
-			if hrt == nil {
-				// Start key manager runtime.
-				w.logger.Info("provisioning key manager runtime")
-
-				var hrtNotifier protocol.Notifier
-				hrt, hrtNotifier, err = w.ProvisionHostedRuntime(w.ctx)
-				if err != nil {
-					w.logger.Error("failed to provision key manager runtime",
-						"err", err,
-					)
-					return
-				}
-
-				var sub pubsub.ClosableSubscription
-				if hrtEventCh, sub, err = hrt.WatchEvents(w.ctx); err != nil {
-					w.logger.Error("failed to subscribe to runtime events",
-						"err", err,
-					)
-					return
-				}
-				defer sub.Close()
-
-				if err = hrt.Start(); err != nil {
-					w.logger.Error("failed to start runtime",
-						"err", err,
-					)
-					return
-				}
-				defer hrt.Stop()
-
-				if err = hrtNotifier.Start(); err != nil {
-					w.logger.Error("failed to start runtime notifier",
-						"err", err,
-					)
-					return
-				}
-				defer hrtNotifier.Stop()
-			}
-
-			currentStatus = status
-			if currentStartedEvent == nil {
-				continue
-			}
-
-			// Forward status update to key manager runtime.
-			if err = w.updateStatus(currentStatus, currentStartedEvent); err != nil {
-				w.logger.Error("failed to handle status update",
-					"err", err,
-				)
-				continue
-			}
-			// New runtimes can be allowed with the policy update.
-			if err = w.recheckAllRuntimes(currentStatus); err != nil {
-				w.logger.Error("failed rechecking runtimes",
-					"err", err,
-				)
-				continue
-			}
-		case <-w.initTickerCh:
-			if currentStatus == nil || currentStartedEvent == nil {
-				continue
-			}
-			if err = w.updateStatus(currentStatus, currentStartedEvent); err != nil {
-				w.logger.Error("failed to handle status update", "err", err)
-				continue
-			}
-			// New runtimes can be allowed with the policy update.
-			if err = w.recheckAllRuntimes(currentStatus); err != nil {
-				w.logger.Error("failed rechecking runtimes",
-					"err", err,
-				)
-				continue
-			}
-		case rt := <-rtCh:
-			if err = w.startClientRuntimeWatcher(rt, currentStatus); err != nil {
-				w.logger.Error("failed to start runtime watcher",
-					"err", err,
-				)
-				continue
-			}
-		case crw := <-w.clientRuntimesQuitCh:
-			w.logger.Error("client runtime watcher quit unexpectedly, terminating",
-				"runtme_id", crw.node.Runtime.ID(),
-			)
-			return
-		case <-w.stopCh:
-			w.logger.Info("termination requested")
-			return
 		}
-	}
-}
+	}()
 
-type clientRuntimeWatcher struct {
-	w    *Worker
-	node *committeeCommon.Node
-}
-
-func (crw *clientRuntimeWatcher) HandlePeerMessage(context.Context, *p2p.Message, bool) (bool, error) {
-	// This should never be called as P2P is disabled.
-	panic("keymanager/worker: must never be called")
-}
-
-func (crw *clientRuntimeWatcher) updateExternalServicePolicyLocked(snapshot *committeeCommon.EpochSnapshot) {
-	// Update key manager access control policy on epoch transitions.
-	policy := accessctl.NewPolicy()
-
-	// Apply rules to current executor committee members.
-	if xc := snapshot.GetExecutorCommittee(); xc != nil {
-		executorCommitteePolicy.AddRulesForCommittee(&policy, xc, snapshot.Nodes())
+	// Wait for all workers to initialize.
+	select {
+	case <-w.secretsWorker.Initialized():
+	case <-w.ctx.Done():
+		return
 	}
 
-	// Apply rules for configured sentry nodes.
-	for _, addr := range crw.w.commonWorker.GetConfig().SentryAddresses {
-		sentryNodesPolicy.AddPublicKeyPolicy(&policy, addr.PubKey)
+	select {
+	case <-w.churpWorker.Initialized():
+	case <-w.ctx.Done():
+		return
 	}
 
-	crw.w.grpcPolicy.SetAccessPolicy(policy, crw.node.Runtime.ID())
-	crw.w.logger.Debug("worker/keymanager: new normal runtime access policy in effect", "policy", policy)
-}
-
-// Guarded by CrossNode.
-func (crw *clientRuntimeWatcher) HandleEpochTransitionLocked(snapshot *committeeCommon.EpochSnapshot) {
-	crw.updateExternalServicePolicyLocked(snapshot)
-}
-
-// Guarded by CrossNode.
-func (crw *clientRuntimeWatcher) HandleNewBlockEarlyLocked(*block.Block) {
-	// Nothing to do here.
-}
-
-// Guarded by CrossNode.
-func (crw *clientRuntimeWatcher) HandleNewBlockLocked(*block.Block) {
-	// Nothing to do here.
-}
-
-// Guarded by CrossNode.
-func (crw *clientRuntimeWatcher) HandleNewEventLocked(*roothash.Event) {
-	// Nothing to do here.
-}
-
-// Guarded by CrossNode.
-func (crw *clientRuntimeWatcher) HandleNodeUpdateLocked(update *runtimeCommittee.NodeUpdate, snapshot *committeeCommon.EpochSnapshot) {
-	crw.updateExternalServicePolicyLocked(snapshot)
+	close(w.initCh)
 }

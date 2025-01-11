@@ -19,13 +19,13 @@ import (
 var (
 	// GasFeesStaking is the staking gas fees scenario.
 	GasFeesStaking scenario.Scenario = &gasFeesImpl{
-		E2E: *NewE2E("gas-fees/staking"),
+		Scenario: *NewScenario("gas-fees/staking"),
 	}
 
 	// GasFeesStakingDumpRestore is the staking gas fees scenario with
 	// dump-restore.
 	GasFeesStakingDumpRestore scenario.Scenario = &gasFeesImpl{
-		E2E:         *NewE2E("gas-fees/staking-dump-restore"),
+		Scenario:    *NewScenario("gas-fees/staking-dump-restore"),
 		dumpRestore: true,
 	}
 
@@ -44,28 +44,27 @@ var (
 )
 
 type gasFeesImpl struct {
-	E2E
+	Scenario
 
 	dumpRestore bool
 }
 
 func (sc *gasFeesImpl) Clone() scenario.Scenario {
 	return &gasFeesImpl{
-		E2E:         sc.E2E.Clone(),
+		Scenario:    *sc.Scenario.Clone().(*Scenario),
 		dumpRestore: sc.dumpRestore,
 	}
 }
 
 func (sc *gasFeesImpl) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := sc.E2E.Fixture()
+	f, err := sc.Scenario.Fixture()
 	if err != nil {
 		return nil, err
 	}
 
-	return &oasis.NetworkFixture{
+	ff := &oasis.NetworkFixture{
 		Network: oasis.NetworkCfg{
-			NodeBinary:    f.Network.NodeBinary,
-			EpochtimeMock: true,
+			NodeBinary: f.Network.NodeBinary,
 			StakingGenesis: &staking.Genesis{
 				Parameters: staking.ConsensusParameters{
 					DebondingInterval: 1,
@@ -83,7 +82,7 @@ func (sc *gasFeesImpl) Fixture() (*oasis.NetworkFixture, error) {
 				CommonPool:    *quantity.NewFromUint64(150),
 				LastBlockFees: *quantity.NewFromUint64(50),
 				Ledger: map[staking.Address]*staking.Account{
-					EntityAccount: {
+					TestEntityAccount: {
 						General: staking.GeneralAccount{
 							Balance: *quantity.NewFromUint64(1000),
 						},
@@ -107,17 +106,20 @@ func (sc *gasFeesImpl) Fixture() (*oasis.NetworkFixture, error) {
 		Validators: []oasis.ValidatorFixture{
 			// Create three validators, each with its own entity so we can test
 			// if gas disbursement works correctly.
-			{Entity: 1, Consensus: oasis.ConsensusFixture{MinGasPrice: 1}},
+			{Entity: 1, Consensus: oasis.ConsensusFixture{MinGasPrice: 1, SupplementarySanityInterval: 1}},
 			{Entity: 2, Consensus: oasis.ConsensusFixture{MinGasPrice: 1}},
 			{Entity: 3, Consensus: oasis.ConsensusFixture{MinGasPrice: 1}},
 		},
 		Seeds: []oasis.SeedFixture{{}},
-	}, nil
+	}
+
+	ff.Network.SetMockEpoch()
+	ff.Network.SetInsecureBeacon()
+
+	return ff, nil
 }
 
-func (sc *gasFeesImpl) Run(childEnv *env.Env) error {
-	ctx := context.Background()
-
+func (sc *gasFeesImpl) Run(ctx context.Context, childEnv *env.Env) error {
 	if err := sc.runTests(ctx); err != nil {
 		return err
 	}
@@ -128,7 +130,7 @@ func (sc *gasFeesImpl) Run(childEnv *env.Env) error {
 		if err != nil {
 			return err
 		}
-		if err := sc.DumpRestoreNetwork(childEnv, fixture, false); err != nil {
+		if err := sc.DumpRestoreNetwork(childEnv, fixture, false, nil, nil); err != nil {
 			return err
 		}
 		if err := sc.runTests(ctx); err != nil {
@@ -243,11 +245,7 @@ func (sc *gasFeesImpl) runTests(ctx context.Context) error {
 		)
 	}
 
-	if err := sc.Net.CheckLogWatchers(); err != nil {
-		return err
-	}
-
-	return nil
+	return sc.Net.CheckLogWatchers()
 }
 
 func (sc *gasFeesImpl) getInitialCommonPoolBalance(ctx context.Context) (*quantity.Quantity, error) {
@@ -423,7 +421,7 @@ func (sc *gasFeesImpl) testStakingGas(
 		}
 
 		if t.checkOk {
-			_ = totalFees.Add(&t.fee.Amount)
+			_ = totalFees.Add(&t.fee.Amount) //nolint:gosec
 		}
 	}
 

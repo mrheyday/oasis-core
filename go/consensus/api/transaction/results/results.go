@@ -2,6 +2,7 @@ package results
 
 import (
 	"github.com/oasisprotocol/oasis-core/go/common/errors"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
@@ -10,9 +11,10 @@ import (
 // Event is a consensus service event that may be emitted during processing of
 // a transaction.
 type Event struct {
-	Staking  *staking.Event  `json:"staking,omitempty"`
-	Registry *registry.Event `json:"registry,omitempty"`
-	RootHash *roothash.Event `json:"roothash,omitempty"`
+	Staking    *staking.Event    `json:"staking,omitempty"`
+	Registry   *registry.Event   `json:"registry,omitempty"`
+	RootHash   *roothash.Event   `json:"roothash,omitempty"`
+	Governance *governance.Event `json:"governance,omitempty"`
 }
 
 // Error is a transaction execution error.
@@ -24,8 +26,9 @@ type Error struct {
 
 // Result is a transaction execution result.
 type Result struct {
-	Error  Error    `json:"error"`
-	Events []*Event `json:"events"`
+	Error   Error    `json:"error"`
+	Events  []*Event `json:"events"`
+	GasUsed uint64   `json:"gas_used,omitempty"`
 }
 
 // IsSuccess returns true if transaction execution was successful.

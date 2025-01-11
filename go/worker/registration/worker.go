@@ -3,56 +3,49 @@ package registration
 import (
 	"context"
 	"fmt"
+	"math"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/prometheus/client_golang/prometheus"
-	flag "github.com/spf13/pflag"
-	"github.com/spf13/viper"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/accessctl"
+	cmnBackoff "github.com/oasisprotocol/oasis-core/go/common/backoff"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
-	fileSigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/file"
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/persistent"
+	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	control "github.com/oasisprotocol/oasis-core/go/control/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
+	cmmetrics "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/metrics"
+	p2p "github.com/oasisprotocol/oasis-core/go/p2p/api"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 	sentryClient "github.com/oasisprotocol/oasis-core/go/sentry/client"
 	workerCommon "github.com/oasisprotocol/oasis-core/go/worker/common"
-	"github.com/oasisprotocol/oasis-core/go/worker/common/p2p"
 )
 
 const (
-	workerRegistrationDBBucketName = "worker/registration"
+	// DBBucketName is the name of the database bucket for the registration
+	// worker's service store.
+	DBBucketName = "worker/registration"
 
-	// CfgRegistrationEntity configures the registration worker entity.
-	CfgRegistrationEntity = "worker.registration.entity"
-	// CfgDebugRegistrationPrivateKey configures the registration worker private key.
-	CfgDebugRegistrationPrivateKey = "worker.registration.debug.private_key"
-	// CfgRegistrationForceRegister overrides a previously saved deregistration
-	// request.
-	CfgRegistrationForceRegister = "worker.registration.force_register"
-	// CfgRegistrationRotateCerts sets the number of epochs that a node's TLS
-	// certificate should be valid for.
-	CfgRegistrationRotateCerts = "worker.registration.rotate_certs"
+	periodicMetricsInterval = 60 * time.Second
 )
 
 var (
 	deregistrationRequestStoreKey = []byte("deregistration requested")
-
-	// Flags has the configuration flags.
-	Flags = flag.NewFlagSet("", flag.ContinueOnError)
 
 	allowUnroutableAddresses bool
 
@@ -62,9 +55,39 @@ var (
 			Help: "Is oasis node registered (binary).",
 		},
 	)
+	workerNodeStatusFrozen = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "oasis_worker_node_status_frozen",
+			Help: "Is oasis node frozen (binary).",
+		},
+	)
+	workerNodeRegistrationEligible = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "oasis_worker_node_registration_eligible",
+			Help: "Is oasis node eligible for registration (binary).",
+		},
+	)
+	workerNodeStatusFaults = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "oasis_worker_node_status_runtime_faults",
+			Help: "Number of runtime faults.",
+		},
+		[]string{"runtime"},
+	)
+	workerNodeRuntimeSuspended = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "oasis_worker_node_status_runtime_suspended",
+			Help: "Runtime node suspension status (binary).",
+		},
+		[]string{"runtime"},
+	)
 
 	nodeCollectors = []prometheus.Collector{
 		workerNodeRegistered,
+		workerNodeStatusFrozen,
+		workerNodeRegistrationEligible,
+		workerNodeStatusFaults,
+		workerNodeRuntimeSuspended,
 	}
 
 	metricsOnce sync.Once
@@ -90,6 +113,9 @@ type Delegate interface {
 //
 // An unavailable role provider will prevent the node from being (re-)registered.
 type RoleProvider interface {
+	// IsAvailable returns true if the role provider is available.
+	IsAvailable() bool
+
 	// SetAvailable signals that the role provider is available and that node registration can
 	// thus proceed.
 	SetAvailable(hook RegisterNodeHook)
@@ -118,6 +144,13 @@ type roleProvider struct {
 	cb        RegisterNodeCallback
 }
 
+func (rp *roleProvider) IsAvailable() bool {
+	rp.Lock()
+	available := (rp.hook != nil)
+	rp.Unlock()
+	return available
+}
+
 func (rp *roleProvider) SetAvailable(hook RegisterNodeHook) {
 	rp.SetAvailableWithCallback(hook, nil)
 }
@@ -129,7 +162,11 @@ func (rp *roleProvider) SetAvailableWithCallback(hook RegisterNodeHook, cb Regis
 	rp.cb = cb
 	rp.Unlock()
 
-	rp.w.registerCh <- struct{}{}
+	// Notify worker that role provider has been updated.
+	select {
+	case rp.w.registerCh <- struct{}{}:
+	default:
+	}
 }
 
 func (rp *roleProvider) SetUnavailable() {
@@ -153,10 +190,10 @@ type Worker struct { // nolint: maligned
 	sentryAddresses []node.TLSAddress
 
 	runtimeRegistry runtimeRegistry.Registry
-	epochtime       epochtime.Backend
+	beacon          beacon.Backend
 	registry        registry.Backend
 	identity        *identity.Identity
-	p2p             *p2p.P2P
+	p2p             p2p.Service
 	ctx             context.Context
 
 	// Bandaid: Idempotent Stop for testing.
@@ -175,65 +212,89 @@ type Worker struct { // nolint: maligned
 	status control.RegistrationStatus
 }
 
-// DebugForceallowUnroutableAddresses allows unroutable addresses.
+// DebugForceAllowUnroutableAddresses allows unroutable addresses.
 func DebugForceAllowUnroutableAddresses() {
 	allowUnroutableAddresses = true
 }
 
 func (w *Worker) registrationLoop() { // nolint: gocyclo
-	// If we have any sentry nodes, let them know about our TLS certs.
-	if len(w.sentryAddresses) > 0 {
-		pubKeys := w.identity.GetTLSPubKeys()
-		for _, sentryAddr := range w.sentryAddresses {
-			pushCerts := func() error {
-				client, err := sentryClient.New(sentryAddr, w.identity)
-				if err != nil {
-					return err
-				}
-				defer client.Close()
-
-				err = client.SetUpstreamTLSPubKeys(w.ctx, pubKeys)
-				if err != nil {
-					return err
-				}
-				return nil
-			}
-
-			sched := backoff.WithMaxRetries(backoff.NewConstantBackOff(1*time.Second), 60)
-			err := backoff.Retry(pushCerts, backoff.WithContext(sched, w.ctx))
-			if err != nil {
-				w.logger.Error("unable to push upstream TLS certificates to sentry node",
-					"err", err,
-					"sentry_address", sentryAddr,
-				)
-			}
-		}
-	}
-
 	// Delay node registration till after the consensus service has
 	// finished initial synchronization if applicable.
+	var (
+		blockCh <-chan *consensus.Block
+
+		delayReregistration    bool
+		maxReregistrationDelay int64
+	)
 	if w.consensus != nil {
+		w.logger.Debug("waiting for consensus sync")
 		select {
 		case <-w.stopCh:
 			return
+		case <-w.stopRegCh:
+			return
 		case <-w.consensus.Synced():
+		}
+		w.logger.Debug("consensus synced, entering registration loop")
+
+		beaconParameters, err := w.beacon.ConsensusParameters(w.ctx, consensus.HeightLatest)
+		switch err {
+		case nil:
+			delayReregistration = beaconParameters.Backend == beacon.BackendVRF
+			if delayReregistration {
+				epochInterval := beaconParameters.VRFParameters.Interval
+				maxReregistrationDelay = epochInterval / 100 * 5 // 5%
+				if maxReregistrationDelay == 0 {
+					w.logger.Warn("epoch interval too short to provide meaningful re-registration delay",
+						"epoch_interval", epochInterval,
+					)
+					delayReregistration = false
+				}
+			}
+		default:
+			w.logger.Error("failed to query beacon parameters",
+				"err", err,
+			)
+		}
+
+	}
+	if delayReregistration {
+		// Register for block heights so we can impose a random re-registration
+		// delay if needed.
+		var (
+			blockSub pubsub.ClosableSubscription
+			err      error
+		)
+		blockCh, blockSub, err = w.consensus.WatchBlocks(w.ctx)
+		switch err {
+		case nil:
+			defer blockSub.Close()
+		default:
+			w.logger.Error("failed to watch blocks",
+				"err", err,
+			)
 		}
 	}
 
 	// (re-)register the node on each epoch transition. This doesn't
 	// need to be strict block-epoch time, since it just serves to
-	// extend the node's expiration.
-	ch, sub := w.epochtime.WatchLatestEpoch()
+	// extend the node's expiration, and we add a randomized delay
+	// anyway.
+	ch, sub, err := w.beacon.WatchLatestEpoch(w.ctx)
+	if err != nil {
+		w.logger.Error("failed to watch epochs",
+			"err", err,
+		)
+		return
+	}
 	defer sub.Close()
 
-	regFn := func(epoch epochtime.EpochTime, hook RegisterNodeHook, retry bool) error {
+	regFn := func(epoch beacon.EpochTime, hook RegisterNodeHook, retry bool) error {
 		var off backoff.BackOff
 
 		switch retry {
 		case true:
-			expBackoff := backoff.NewExponentialBackOff()
-			expBackoff.MaxElapsedTime = 0
-			off = expBackoff
+			off = cmnBackoff.NewExponentialBackOff()
 		case false:
 			off = &backoff.StopBackOff{}
 		}
@@ -250,7 +311,9 @@ func (w *Worker) registrationLoop() { // nolint: gocyclo
 			var ok bool
 			select {
 			case <-w.stopCh:
-				return context.Canceled
+				return backoff.Permanent(context.Canceled)
+			case <-w.stopRegCh:
+				return backoff.Permanent(context.Canceled)
 			case epoch, ok = <-ch:
 				if !ok {
 					return context.Canceled
@@ -273,10 +336,13 @@ func (w *Worker) registrationLoop() { // nolint: gocyclo
 	entityCh, entitySub, _ := w.registry.WatchEntities(w.ctx)
 	defer entitySub.Close()
 
-	var epoch epochtime.EpochTime
-	var lastTLSRotationEpoch epochtime.EpochTime
-	tlsRotationPending := true
-	first := true
+	var (
+		epoch beacon.EpochTime = beacon.EpochInvalid
+
+		reregisterHeight int64 = math.MaxInt64
+
+		first = true
+	)
 Loop:
 	for {
 		select {
@@ -285,33 +351,35 @@ Loop:
 		case <-w.stopRegCh:
 			w.logger.Info("node deregistration and eventual shutdown requested")
 			return
+		case block := <-blockCh:
+			if block.Height < reregisterHeight {
+				continue
+			}
+
+			// Target re-registration height reached.
+			w.logger.Info("re-register height reached for current epoch",
+				"epoch", epoch,
+				"height", block.Height,
+			)
 		case epoch = <-ch:
 			// Epoch updated, check if we can submit a registration.
-
-			// Check if we need to rotate the node's TLS certificate.
-			if !w.identity.DoNotRotateTLS && !tlsRotationPending {
-				// Per how many epochs should we do rotations?
-				// TODO: Make this time-based instead.
-				rotateTLSCertsPer := epochtime.EpochTime(viper.GetUint64(CfgRegistrationRotateCerts))
-				if rotateTLSCertsPer != 0 && (epoch-lastTLSRotationEpoch) >= rotateTLSCertsPer {
-					// Rotate node TLS certificates.
-					err := w.identity.RotateCertificates()
-					if err != nil {
-						w.logger.Error("node TLS certificate rotation failed",
-							"new_epoch", epoch,
-							"err", err,
-						)
-					} else {
-						pub1 := w.identity.GetTLSSigner().Public()
-						pub2 := w.identity.GetNextTLSSigner().Public()
-						tlsRotationPending = true
-
-						w.logger.Info("node TLS certificates have been rotated",
-							"new_epoch", epoch,
-							"new_pub1", accessctl.SubjectFromPublicKey(pub1),
-							"new_pub2", accessctl.SubjectFromPublicKey(pub2),
-						)
-					}
+			if delayReregistration {
+				// Derive the re-registration delay.
+				epochHeight, err := w.beacon.GetEpochBlock(w.ctx, epoch)
+				switch err {
+				case nil:
+					// Schedule the re-registration, and wait till the target height.
+					reregisterHeight = epochHeight + rand.Int63n(maxReregistrationDelay)
+					w.logger.Info("per-epoch re-registration scheduled",
+						"epoch_height", epochHeight,
+						"target_height", reregisterHeight,
+					)
+					continue
+				default:
+					w.logger.Error("failed to query block height for epoch",
+						"err", err,
+						"epoch", epoch,
+					)
 				}
 			}
 		case ev := <-entityCh:
@@ -323,11 +391,21 @@ Loop:
 			// Notification that a role provider has been updated.
 		}
 
+		// We need to know the current epoch before we can register.
+		if epoch == beacon.EpochInvalid {
+			continue
+		}
+
+		// Disarm the re-registration delay height.
+		reregisterHeight = math.MaxInt64
+
 		// If there are any role providers which are still not ready, we must wait for more
 		// notifications.
 		hooks, cbs, vers := func() (h []RegisterNodeHook, cbs []RegisterNodeCallback, vers []uint64) {
 			w.RLock()
 			defer w.RUnlock()
+
+			w.logger.Debug("enumerating role provider hooks")
 
 			for _, rp := range w.roleProviders {
 				rp.Lock()
@@ -337,7 +415,18 @@ Loop:
 				ver := rp.version
 				rp.Unlock()
 
+				w.logger.Debug("role provider hook",
+					"ver", ver,
+					"role", role,
+					"hook", hook,
+					"cb", cb,
+				)
+
 				if hook == nil {
+					w.logger.Debug("nil hook for role",
+						"role", role,
+						"ver", ver,
+					)
 					return nil, nil, nil
 				}
 
@@ -351,11 +440,12 @@ Loop:
 			return
 		}()
 		if hooks == nil {
+			w.logger.Debug("not registering, no role provider hooks")
 			continue Loop
 		}
 
 		// Check if the entity under which we are registering actually exists.
-		_, err := w.registry.GetEntity(w.ctx, &registry.IDQuery{
+		ent, err := w.registry.GetEntity(w.ctx, &registry.IDQuery{
 			Height: consensus.HeightLatest,
 			ID:     w.entityID,
 		})
@@ -363,7 +453,7 @@ Loop:
 		case nil:
 		case registry.ErrNoSuchEntity:
 			// Entity does not yet exist.
-			w.logger.Warn("defering registration as the owning entity does not exist",
+			w.logger.Warn("deferring registration as the owning entity does not exist",
 				"entity_id", w.entityID,
 			)
 			continue
@@ -372,6 +462,23 @@ Loop:
 			w.logger.Error("failed to query owning entity",
 				"err", err,
 				"entity_id", w.entityID,
+			)
+			continue
+		}
+
+		// Check if we are whitelisted by the entity.
+		nodeID := w.identity.NodeSigner.Public()
+		var whitelisted bool
+		for _, id := range ent.Nodes {
+			if id.Equal(nodeID) {
+				whitelisted = true
+				break
+			}
+		}
+		if !whitelisted {
+			w.logger.Warn("deferring registration as the owning entity does not have us in its node list",
+				"entity_id", w.entityID,
+				"node_id", nodeID,
 			)
 			continue
 		}
@@ -430,24 +537,124 @@ Loop:
 				}
 			}
 		}()
+	}
+}
 
-		// Do not perform TLS rotation unless we have successfully (re-)registered.
-		if tlsRotationPending {
-			lastTLSRotationEpoch = epoch
-			tlsRotationPending = false
+func (w *Worker) metricsWorker() {
+	w.logger.Info("delaying metrics worker start until initial registration")
+	select {
+	case <-w.stopCh:
+		return
+	case <-w.ctx.Done():
+		return
+	case <-w.initialRegCh:
+	}
+
+	w.logger.Debug("starting metrics worker")
+
+	t := time.NewTicker(periodicMetricsInterval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-w.stopCh:
+			return
+		case <-w.ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		// Update metrics.
+		epoch, err := w.beacon.GetEpoch(w.ctx, consensus.HeightLatest)
+		if err != nil {
+			w.logger.Warn("unable to query epoch", "err", err)
+			continue
+		}
+		status, err := w.GetRegistrationStatus(w.ctx)
+		if err != nil {
+			w.logger.Warn("unable to get registration status", "err", err)
+			continue
+		}
+		nodeStatus := status.NodeStatus
+		if nodeStatus == nil {
+			w.logger.Debug("skipping node status metrics, empty node status")
+			continue
+		}
+
+		// Frozen metric.
+		switch nodeStatus.IsFrozen() {
+		case true:
+			workerNodeStatusFrozen.Set(1)
+		case false:
+			workerNodeStatusFrozen.Set(0)
+		}
+
+		// Election eligible metric.
+		switch {
+		case nodeStatus.ElectionEligibleAfter == 0:
+			workerNodeRegistrationEligible.Set(0)
+		case nodeStatus.ElectionEligibleAfter >= epoch:
+			workerNodeRegistrationEligible.Set(0)
+		default:
+			workerNodeRegistrationEligible.Set(1)
+		}
+
+		// Runtime metrics.
+		for _, rt := range w.runtimeRegistry.Runtimes() {
+			if !rt.IsManaged() {
+				continue
+			}
+
+			rtLabel := rt.ID().String()
+
+			faults := nodeStatus.Faults[rt.ID()]
+			switch faults {
+			case nil:
+				// No faults.
+				workerNodeRuntimeSuspended.WithLabelValues(rtLabel).Set(0)
+				workerNodeStatusFaults.WithLabelValues(rtLabel).Set(0)
+			default:
+				workerNodeStatusFaults.WithLabelValues(rtLabel).Set(float64(faults.Failures))
+				switch faults.IsSuspended(epoch) {
+				case true:
+					workerNodeRuntimeSuspended.WithLabelValues(rtLabel).Set(1)
+				case false:
+					workerNodeRuntimeSuspended.WithLabelValues(rtLabel).Set(0)
+				}
+			}
 		}
 	}
 }
 
 func (w *Worker) doNodeRegistration() {
-	defer close(w.quitCh)
-	defer workerNodeRegistered.Set(0.0)
+	defer func() {
+		close(w.quitCh)
+		workerNodeRegistered.Set(0.0)
+	}()
 
 	if !w.storedDeregister {
 		w.registrationLoop()
+	} else {
+		w.logger.Debug("registration disabled, dropping to direct shutdown")
 	}
 
 	// Loop broken; shutdown requested.
+	//
+	// This is the primary driver of the operator gracefully halting the
+	// node after the node's registration expires.  To ensure that the
+	// deregistration and shutdown occurs, the node will persist the fact
+	// that it is mid-shutdown in a flag.
+	//
+	// Previously, this flag had to be cleared manually by the node operator
+	// which, while serving to ensure that the node does not get restarted
+	// and re-register, is sub-optimal as it required manual intervention.
+	//
+	// Instead, if the node is deregistered cleanly, we will clear the flag
+	// under the assumption that the operator can configure whatever
+	// automation they are using to do the right thing.
+	//
+	// See: `Worker.registrationStopped()` for where this happens.
+
 	publicKey := w.identity.NodeSigner.Public()
 
 	regCh, sub, err := w.registry.WatchNodes(w.ctx)
@@ -491,6 +698,22 @@ func (w *Worker) doNodeRegistration() {
 }
 
 func (w *Worker) registrationStopped() {
+	w.logger.Info("registration stopped, shutting down")
+
+	// If the registration was stopped via-graceful shutdown, clear the
+	// persisted deregister flag.
+	//
+	// This routine is only called if:
+	//  * Registration is never enabled in the first place.
+	//  * The node is deregistered when the shutdown request happens.
+	//  * The node successfully deregisters.
+	if err := SetForcedDeregister(w.store, false); err != nil {
+		// Can't do anything about this, and we are mid-teardown, just log.
+		w.logger.Error("failed to clear persisted force-deregister",
+			"err", err,
+		)
+	}
+
 	if w.delegate != nil {
 		w.delegate.RegistrationStopped()
 	}
@@ -499,10 +722,20 @@ func (w *Worker) registrationStopped() {
 // GetRegistrationStatus returns the node's current registration status.
 func (w *Worker) GetRegistrationStatus(ctx context.Context) (*control.RegistrationStatus, error) {
 	w.RLock()
-	defer w.RUnlock()
-
 	status := new(control.RegistrationStatus)
 	*status = w.status
+	w.RUnlock()
+
+	if status == nil || status.Descriptor == nil {
+		return status, nil
+	}
+
+	ns, err := w.registry.GetNodeStatus(ctx, &registry.IDQuery{ID: status.Descriptor.ID, Height: consensus.HeightLatest})
+	if err != nil {
+		return nil, err
+	}
+	status.NodeStatus = ns
+
 	return status, nil
 }
 
@@ -536,8 +769,12 @@ func (w *Worker) NewRuntimeRoleProvider(role node.RolesMask, runtimeID common.Na
 }
 
 func (w *Worker) newRoleProvider(role node.RolesMask, runtimeID *common.Namespace) (RoleProvider, error) {
-	if !role.IsSingleRole() {
-		return nil, fmt.Errorf("RegisterRole: registration role mask does not encode a single role. RoleMask: '%s'", role)
+	w.logger.Debug("new role provider",
+		"id", runtimeID,
+		"role", role,
+	)
+	if !role.IsEmptyRole() && !role.IsSingleRole() {
+		return nil, fmt.Errorf("registration role mask is non-empty and does not encode a single role: '%s'", role)
 	}
 
 	rp := &roleProvider{
@@ -593,73 +830,12 @@ func (w *Worker) gatherConsensusAddresses(sentryConsensusAddrs []node.ConsensusA
 	return validatedAddrs, nil
 }
 
-func (w *Worker) gatherTLSAddresses(sentryTLSAddrs []node.TLSAddress) ([]node.TLSAddress, error) {
-	var tlsAddresses []node.TLSAddress
-
-	switch len(w.sentryAddresses) > 0 {
-	// If sentry nodes are used, use sentry addresses.
-	case true:
-		tlsAddresses = sentryTLSAddrs
-	// Otherwise gather TLS addresses.
-	case false:
-		addrs, err := w.workerCommonCfg.GetNodeAddresses()
-		if err != nil {
-			return nil, fmt.Errorf("worker/registration: failed to register node: unable to get node addresses: %w", err)
-		}
-		for _, addr := range addrs {
-			tlsAddresses = append(tlsAddresses, node.TLSAddress{
-				PubKey:  w.identity.GetTLSSigner().Public(),
-				Address: addr,
-			})
-			// Make sure to also include the certificate that will be valid
-			// in the next epoch, so that the node remains reachable.
-			if nextSigner := w.identity.GetNextTLSSigner(); nextSigner != nil {
-				tlsAddresses = append(tlsAddresses, node.TLSAddress{
-					PubKey:  nextSigner.Public(),
-					Address: addr,
-				})
-			}
-		}
-	}
-
-	// Filter out any potentially invalid addresses.
-	var validatedAddrs []node.TLSAddress
-	for _, addr := range tlsAddresses {
-		if !addr.PubKey.IsValid() {
-			w.logger.Error("worker/registration: skipping node address due to invalid public key",
-				"addr", addr,
-			)
-			continue
-		}
-
-		if err := registry.VerifyAddress(addr.Address, allowUnroutableAddresses); err != nil {
-			w.logger.Error("worker/registration: skipping node address due to invalid address",
-				"addr", addr,
-				"err", err,
-			)
-			continue
-		}
-		validatedAddrs = append(validatedAddrs, addr)
-	}
-
-	if len(validatedAddrs) == 0 {
-		return nil, fmt.Errorf("worker/registration: node has no valid TLS addresses")
-	}
-
-	return validatedAddrs, nil
-}
-
-func (w *Worker) registerNode(epoch epochtime.EpochTime, hook RegisterNodeHook) error {
+func (w *Worker) registerNode(epoch beacon.EpochTime, hook RegisterNodeHook) (err error) {
 	identityPublic := w.identity.NodeSigner.Public()
 	w.logger.Info("performing node (re-)registration",
 		"epoch", epoch,
 		"node_id", identityPublic.String(),
 	)
-
-	var nextPubKey signature.PublicKey
-	if s := w.identity.GetNextTLSSigner(); s != nil {
-		nextPubKey = s.Public()
-	}
 
 	nodeDesc := node.Node{
 		Versioned:  cbor.NewVersioned(node.LatestNodeDescriptorVersion),
@@ -667,8 +843,7 @@ func (w *Worker) registerNode(epoch epochtime.EpochTime, hook RegisterNodeHook) 
 		EntityID:   w.entityID,
 		Expiration: uint64(epoch) + 2,
 		TLS: node.TLSInfo{
-			PubKey:     w.identity.GetTLSSigner().Public(),
-			NextPubKey: nextPubKey,
+			PubKey: w.identity.TLSSigner.Public(),
 		},
 		P2P: node.P2PInfo{
 			ID: w.identity.P2PSigner.Public(),
@@ -676,10 +851,46 @@ func (w *Worker) registerNode(epoch epochtime.EpochTime, hook RegisterNodeHook) 
 		Consensus: node.ConsensusInfo{
 			ID: w.identity.ConsensusSigner.Public(),
 		},
+		VRF: node.VRFInfo{
+			ID: w.identity.VRFSigner.Public(),
+		},
+		SoftwareVersion: node.SoftwareVersion(version.SoftwareVersion),
 	}
 
-	if err := hook(&nodeDesc); err != nil {
+	// Update the registration status on successful or failed registration.
+	defer func() {
+		w.Lock()
+		defer w.Unlock()
+
+		switch err {
+		case nil:
+			w.status.LastAttemptSuccessful = true
+			w.status.LastAttemptErrorMessage = ""
+			w.status.LastAttempt = time.Now()
+			w.status.LastRegistration = w.status.LastAttempt
+			w.status.Descriptor = &nodeDesc
+		default:
+			w.status.LastAttemptSuccessful = false
+			w.status.LastAttemptErrorMessage = err.Error()
+			w.status.LastAttempt = time.Now()
+			if w.status.Descriptor != nil {
+				if w.status.Descriptor.Expiration < uint64(epoch) {
+					w.status.Descriptor = nil
+				}
+			}
+		}
+	}()
+
+	if err = hook(&nodeDesc); err != nil {
 		return err
+	}
+
+	// Make sure there is at least one role to register for.
+	if nodeDesc.Roles.IsEmptyRole() {
+		w.logger.Error("not registering: no roles to register for",
+			"node_descriptor", nodeDesc,
+		)
+		return fmt.Errorf("registration: no roles to register for")
 	}
 
 	// Sanity check to prevent an invalid registration when no role provider added any runtimes but
@@ -691,28 +902,15 @@ func (w *Worker) registerNode(epoch epochtime.EpochTime, hook RegisterNodeHook) 
 		return fmt.Errorf("registration: no runtimes provided while runtimes are required")
 	}
 
-	var sentryConsensusAddrs []node.ConsensusAddress
-	var sentryTLSAddrs []node.TLSAddress
-	if len(w.sentryAddresses) > 0 {
-		sentryConsensusAddrs, sentryTLSAddrs = w.querySentries()
-	}
+	sentryConsensusAddrs := w.querySentries()
 
 	// Add Consensus Addresses if required.
 	if nodeDesc.HasRoles(registry.ConsensusAddressRequiredRoles) {
-		addrs, err := w.gatherConsensusAddresses(sentryConsensusAddrs)
-		if err != nil {
-			return fmt.Errorf("error gathering consensus addresses: %w", err)
+		addrs, grr := w.gatherConsensusAddresses(sentryConsensusAddrs)
+		if grr != nil {
+			return fmt.Errorf("error gathering consensus addresses: %w", grr)
 		}
 		nodeDesc.Consensus.Addresses = addrs
-	}
-
-	// Add TLS Addresses if required.
-	if nodeDesc.HasRoles(registry.TLSAddressRequiredRoles) {
-		addrs, err := w.gatherTLSAddresses(sentryTLSAddrs)
-		if err != nil {
-			return fmt.Errorf("error gathering TLS addresses: %w", err)
-		}
-		nodeDesc.TLS.Addresses = addrs
 	}
 
 	// Add P2P Addresses if required.
@@ -724,7 +922,8 @@ func (w *Worker) registerNode(epoch epochtime.EpochTime, hook RegisterNodeHook) 
 		w.registrationSigner,
 		w.identity.P2PSigner,
 		w.identity.ConsensusSigner,
-		w.identity.GetTLSSigner(),
+		w.identity.VRFSigner,
+		w.identity.TLSSigner,
 	}
 	if !w.identity.NodeSigner.Public().Equal(w.registrationSigner.Public()) {
 		// In the case where the registration signer is the entity signer
@@ -733,38 +932,30 @@ func (w *Worker) registerNode(epoch epochtime.EpochTime, hook RegisterNodeHook) 
 		nodeSigners = append([]signature.Signer{w.identity.NodeSigner}, nodeSigners...)
 	}
 
-	sigNode, err := node.MultiSignNode(nodeSigners, registry.RegisterNodeSignatureContext, &nodeDesc)
-	if err != nil {
+	sigNode, grr := node.MultiSignNode(nodeSigners, registry.RegisterNodeSignatureContext, &nodeDesc)
+	if grr != nil {
 		w.logger.Error("failed to register node: unable to sign node descriptor",
-			"err", err,
+			"err", grr,
 		)
-		return err
+		return fmt.Errorf("unable to sign node descriptor: %w", grr)
 	}
 
 	tx := registry.NewRegisterNodeTx(0, nil, sigNode)
-	if err := consensus.SignAndSubmitTx(w.ctx, w.consensus, w.registrationSigner, tx); err != nil {
+	if err = consensus.SignAndSubmitTx(w.ctx, w.consensus, w.registrationSigner, tx); err != nil {
 		w.logger.Error("failed to register node",
 			"err", err,
 		)
 		return err
 	}
 
-	// Update the registration status on successful registration.
-	w.RLock()
-	w.status.LastRegistration = time.Now()
-	w.status.Descriptor = &nodeDesc
-	w.RUnlock()
-
 	w.logger.Info("node registered with the registry")
 	return nil
 }
 
-func (w *Worker) querySentries() ([]node.ConsensusAddress, []node.TLSAddress) {
+func (w *Worker) querySentries() []node.ConsensusAddress {
 	var consensusAddrs []node.ConsensusAddress
-	var tlsAddrs []node.TLSAddress
 	var err error
 
-	pubKeys := w.identity.GetTLSPubKeys()
 	for _, sentryAddr := range w.sentryAddresses {
 		var client *sentryClient.Client
 		client, err = sentryClient.New(sentryAddr, w.identity)
@@ -786,18 +977,7 @@ func (w *Worker) querySentries() ([]node.ConsensusAddress, []node.TLSAddress) {
 			)
 			continue
 		}
-
-		// Keep sentries updated with our latest TLS certificates.
-		err = client.SetUpstreamTLSPubKeys(w.ctx, pubKeys)
-		if err != nil {
-			w.logger.Warn("failed to provide upstream TLS certificates to sentry node",
-				"err", err,
-				"sentry_address", sentryAddr,
-			)
-		}
-
 		consensusAddrs = append(consensusAddrs, sentryAddresses.Consensus...)
-		tlsAddrs = append(tlsAddrs, sentryAddresses.TLS...)
 	}
 
 	if len(consensusAddrs) == 0 {
@@ -805,13 +985,8 @@ func (w *Worker) querySentries() ([]node.ConsensusAddress, []node.TLSAddress) {
 			"sentry_addresses", w.sentryAddresses,
 		)
 	}
-	if len(tlsAddrs) == 0 {
-		w.logger.Error("failed to obtain any TLS address from the configured sentry nodes",
-			"sentry_addresses", w.sentryAddresses,
-		)
-	}
 
-	return consensusAddrs, tlsAddrs
+	return consensusAddrs
 }
 
 // RequestDeregistration requests that the node not register itself in the next epoch.
@@ -820,9 +995,7 @@ func (w *Worker) RequestDeregistration() error {
 		// Deregistration already requested, don't do anything.
 		return nil
 	}
-	storedDeregister := true
-	err := w.store.PutCBOR(deregistrationRequestStoreKey, &storedDeregister)
-	if err != nil {
+	if err := SetForcedDeregister(w.store, true); err != nil {
 		w.logger.Error("can't persist deregistration request",
 			"err", err,
 		)
@@ -834,8 +1007,13 @@ func (w *Worker) RequestDeregistration() error {
 	return nil
 }
 
+// WillNeverRegister returns true iff the worker will never register.
+func (w *Worker) WillNeverRegister() bool {
+	return !w.entityID.IsValid() || w.registrationSigner == nil
+}
+
 // GetRegistrationSigner loads the signing credentials as configured by this package's flags.
-func GetRegistrationSigner(logger *logging.Logger, dataDir string, identity *identity.Identity) (signature.PublicKey, signature.Signer, error) {
+func GetRegistrationSigner(identity *identity.Identity) (signature.PublicKey, signature.Signer, error) {
 	var defaultPk signature.PublicKey
 
 	// If the test entity is enabled, use the entity signing key for signing
@@ -845,81 +1023,43 @@ func GetRegistrationSigner(logger *logging.Logger, dataDir string, identity *ide
 		return testEntity.ID, testSigner, nil
 	}
 
-	// Load the registration entity descriptor.
-	f := viper.GetString(CfgRegistrationEntity)
-	if f == "" {
+	// Determine the owning entity ID.
+	cfgEntityFn := config.GlobalConfig.Registration.Entity
+	cfgEntityID := config.GlobalConfig.Registration.EntityID
+
+	switch {
+	case cfgEntityFn != "":
+		// Attempt to load the entity descriptor.
+		entity, err := entity.LoadDescriptor(cfgEntityFn)
+		if err != nil {
+			return defaultPk, nil, fmt.Errorf("worker/registration: failed to load entity descriptor: %w", err)
+		}
+
+		return entity.ID, identity.NodeSigner, nil
+	case cfgEntityID != "":
+		// Attempt to parse the entity ID.
+		var entityID signature.PublicKey
+		if err := entityID.UnmarshalText([]byte(cfgEntityID)); err != nil {
+			return defaultPk, nil, fmt.Errorf("worker/registration: malformed entity ID: %w", err)
+		}
+
+		return entityID, identity.NodeSigner, nil
+	default:
 		// TODO: There are certain configurations (eg: the test client) that
 		// spin up workers, which require a registration worker, but don't
 		// need it, and do not have an owning entity.  The registration worker
 		// should not be initialized in this case.
 		return defaultPk, nil, nil
 	}
-
-	// Attempt to load the entity descriptor.
-	entity, err := entity.LoadDescriptor(f)
-	if err != nil {
-		return defaultPk, nil, fmt.Errorf("worker/registration: failed to load entity descriptor: %w", err)
-	}
-	if !entity.AllowEntitySignedNodes {
-		// If the entity does not allow any entity-signed nodes, then
-		// registrations will always be node-signed.
-		return entity.ID, identity.NodeSigner, nil
-	}
-	for _, v := range entity.Nodes {
-		if v.Equal(identity.NodeSigner.Public()) {
-			// If the node is in the entity's list of allowed nodes
-			// then registrations MUST be node-signed.
-			return entity.ID, identity.NodeSigner, nil
-		}
-	}
-
-	if !flags.DebugDontBlameOasis() {
-		return defaultPk, nil, fmt.Errorf("worker/registration: entity signed nodes disallowed by node config")
-	}
-
-	// At this point, the entity allows entity-signed registrations,
-	// and the node is not in the entity's list of allowed
-	// node-signed nodes.
-	//
-	// TODO: The only reason why an entity descriptor ever needs to
-	// be provided, is for this check.  It would be better for the common
-	// case to just query the entity descriptor from the registry,
-	// given a entity ID.
-
-	// The entity allows self-signed nodes, try to load the entity private key.
-	f = viper.GetString(CfgDebugRegistrationPrivateKey)
-	if f == "" {
-		// If the private key is not provided, try using a node-signed
-		// registration, the local copy of the entity descriptor may
-		// just be stale.
-		logger.Warn("no entity signing key provided, falling back to the node identity key")
-
-		return entity.ID, identity.NodeSigner, nil
-	}
-
-	logger.Warn("using the entity signing key for node registration")
-
-	factory, err := fileSigner.NewFactory(dataDir, signature.SignerEntity)
-	if err != nil {
-		return defaultPk, nil, fmt.Errorf("worker/registration: failed to create entity signer factory: %w", err)
-	}
-	fileFactory := factory.(*fileSigner.Factory)
-	entitySigner, err := fileFactory.ForceLoad(f)
-	if err != nil {
-		return defaultPk, nil, fmt.Errorf("worker/registration: failed to load entity signing key: %w", err)
-	}
-
-	return entity.ID, entitySigner, nil
 }
 
 // New constructs a new worker node registration service.
 func New(
-	dataDir string,
-	epochtime epochtime.Backend,
+	beacon beacon.Backend,
 	registry registry.Backend,
 	identity *identity.Identity,
 	consensus consensus.Backend,
-	p2p *p2p.P2P,
+	p2p p2p.Service,
 	workerCommonCfg *workerCommon.Config,
 	store *persistent.CommonStore,
 	delegate Delegate,
@@ -927,47 +1067,28 @@ func New(
 ) (*Worker, error) {
 	logger := logging.GetLogger("worker/registration")
 
-	serviceStore, err := store.GetServiceStore(workerRegistrationDBBucketName)
-	if err != nil {
-		logger.Error("can't get registration worker store bucket",
-			"err", err,
-		)
-		return nil, err
-	}
+	serviceStore := store.GetServiceStore(DBBucketName)
 
-	entityID, registrationSigner, err := GetRegistrationSigner(logger, dataDir, identity)
+	entityID, registrationSigner, err := GetRegistrationSigner(identity)
 	if err != nil {
 		return nil, err
 	}
 
-	storedDeregister := false
+	var storedDeregister bool
 	err = serviceStore.GetCBOR(deregistrationRequestStoreKey, &storedDeregister)
 	if err != nil && err != persistent.ErrNotFound {
 		return nil, err
 	}
 
-	if viper.GetBool(CfgRegistrationForceRegister) {
-		storedDeregister = false
-		err = serviceStore.PutCBOR(deregistrationRequestStoreKey, &storedDeregister)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if viper.GetUint64(CfgRegistrationRotateCerts) != 0 && identity.DoNotRotateTLS {
-		return nil, fmt.Errorf("node TLS certificate rotation must not be enabled if using pre-generated TLS certificates")
-	}
-
 	w := &Worker{
 		workerCommonCfg:    workerCommonCfg,
 		store:              serviceStore,
-		storedDeregister:   storedDeregister,
 		delegate:           delegate,
 		entityID:           entityID,
 		sentryAddresses:    workerCommonCfg.SentryAddresses,
 		registrationSigner: registrationSigner,
 		runtimeRegistry:    runtimeRegistry,
-		epochtime:          epochtime,
+		beacon:             beacon,
 		registry:           registry,
 		identity:           identity,
 		stopCh:             make(chan struct{}),
@@ -978,10 +1099,12 @@ func New(
 		logger:             logger,
 		consensus:          consensus,
 		p2p:                p2p,
-		registerCh:         make(chan struct{}, 64),
+		registerCh:         make(chan struct{}, 1),
 	}
 
-	if flags.ConsensusValidator() {
+	w.storedDeregister = storedDeregister
+
+	if config.GlobalConfig.Consensus.Validator || config.GlobalConfig.Mode == config.ModeValidator {
 		rp, err := w.NewRoleProvider(node.RoleValidator)
 		if err != nil {
 			return nil, err
@@ -1004,17 +1127,25 @@ func (w *Worker) Start() error {
 	w.logger.Info("starting node registration service")
 
 	// HACK: This can be ok in certain configurations.
-	if !w.entityID.IsValid() || w.registrationSigner == nil {
+	if w.WillNeverRegister() {
 		w.logger.Warn("no entity/signer for this node, registration will NEVER succeed")
-		// Make sure the node is stopped on quit.
+		// Make sure the node is stopped on quit and that it can still respond to
+		// shutdown requests from the control api.
 		go func() {
-			<-w.stopCh
+			select {
+			case <-w.stopCh:
+			case <-w.stopRegCh:
+				w.registrationStopped()
+			}
 			close(w.quitCh)
 		}()
 		return nil
 	}
 
 	go w.doNodeRegistration()
+	if cmmetrics.Enabled() {
+		go w.metricsWorker()
+	}
 
 	return nil
 }
@@ -1040,12 +1171,8 @@ func init() {
 	metricsOnce.Do(func() {
 		prometheus.MustRegister(nodeCollectors...)
 	})
+}
 
-	Flags.String(CfgRegistrationEntity, "", "entity to use as the node owner in registrations")
-	Flags.String(CfgDebugRegistrationPrivateKey, "", "private key to use to sign node registrations")
-	Flags.Bool(CfgRegistrationForceRegister, false, "override a previously saved deregistration request")
-	Flags.Uint64(CfgRegistrationRotateCerts, 0, "rotate node TLS certificates every N epochs (0 to disable)")
-	_ = Flags.MarkHidden(CfgDebugRegistrationPrivateKey)
-
-	_ = viper.BindPFlags(Flags)
+func SetForcedDeregister(store *persistent.ServiceStore, deregister bool) error {
+	return store.PutCBOR(deregistrationRequestStoreKey, &deregister)
 }

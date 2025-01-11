@@ -9,8 +9,8 @@ import (
 	"sort"
 	"time"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
@@ -18,9 +18,9 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
-	"github.com/oasisprotocol/oasis-core/go/common/sgx/ias"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
+	"github.com/oasisprotocol/oasis-core/go/consensus/api/events"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
@@ -49,17 +49,6 @@ var (
 	// Note: This is identical to non-gensis registrations to support
 	// migrating existing registrations into a new genesis document.
 	RegisterGenesisNodeSignatureContext = RegisterNodeSignatureContext
-
-	// RegisterRuntimeSignatureContext is the context used for runtime
-	// registration.
-	RegisterRuntimeSignatureContext = signature.NewContext("oasis-core/registry: register runtime")
-
-	// RegisterGenesisRuntimeSignatureContext is the context used for
-	// runtime registation in the genesis document.
-	//
-	// Note: This is identical to non-gensis registrations to support
-	// migrating existing registrations into a new genesis document.
-	RegisterGenesisRuntimeSignatureContext = RegisterRuntimeSignatureContext
 
 	// ErrInvalidArgument is the error returned on malformed argument(s).
 	ErrInvalidArgument = errors.New(ModuleName, 1, "registry: invalid argument")
@@ -134,13 +123,15 @@ var (
 	// MethodRegisterEntity is the method name for entity registrations.
 	MethodRegisterEntity = transaction.NewMethodName(ModuleName, "RegisterEntity", entity.SignedEntity{})
 	// MethodDeregisterEntity is the method name for entity deregistrations.
-	MethodDeregisterEntity = transaction.NewMethodName(ModuleName, "DeregisterEntity", nil)
+	MethodDeregisterEntity = transaction.NewMethodName(ModuleName, "DeregisterEntity", DeregisterEntity{})
 	// MethodRegisterNode is the method name for node registrations.
 	MethodRegisterNode = transaction.NewMethodName(ModuleName, "RegisterNode", node.MultiSignedNode{})
 	// MethodUnfreezeNode is the method name for unfreezing nodes.
 	MethodUnfreezeNode = transaction.NewMethodName(ModuleName, "UnfreezeNode", UnfreezeNode{})
 	// MethodRegisterRuntime is the method name for registering runtimes.
-	MethodRegisterRuntime = transaction.NewMethodName(ModuleName, "RegisterRuntime", SignedRuntime{})
+	MethodRegisterRuntime = transaction.NewMethodName(ModuleName, "RegisterRuntime", Runtime{})
+	// MethodProveFreshness is the method name for freshness proofs.
+	MethodProveFreshness = transaction.NewMethodName(ModuleName, "ProveFreshness", [32]byte{})
 
 	// Methods is the list of all methods supported by the registry backend.
 	Methods = []transaction.MethodName{
@@ -149,16 +140,16 @@ var (
 		MethodRegisterNode,
 		MethodUnfreezeNode,
 		MethodRegisterRuntime,
+		MethodProveFreshness,
 	}
 
 	// RuntimesRequiredRoles are the Node roles that require runtimes.
 	RuntimesRequiredRoles = node.RoleComputeWorker |
-		node.RoleStorageWorker |
-		node.RoleKeyManager
+		node.RoleKeyManager |
+		node.RoleStorageRPC
 
 	// ComputeRuntimeAllowedRoles are the Node roles that allow compute runtimes.
-	ComputeRuntimeAllowedRoles = node.RoleComputeWorker |
-		node.RoleStorageWorker
+	ComputeRuntimeAllowedRoles = node.RoleComputeWorker | node.RoleObserver
 
 	// KeyManagerRuntimeAllowedRoles are the Node roles that allow key manager runtimes.
 	KeyManagerRuntimeAllowedRoles = node.RoleKeyManager
@@ -166,14 +157,11 @@ var (
 	// ConsensusAddressRequiredRoles are the Node roles that require Consensus Address.
 	ConsensusAddressRequiredRoles = node.RoleValidator
 
-	// TLSAddressRequiredRoles are the Node roles that require TLS Address.
-	TLSAddressRequiredRoles = node.RoleComputeWorker |
-		node.RoleStorageWorker |
-		node.RoleKeyManager |
-		node.RoleConsensusRPC
-
 	// P2PAddressRequiredRoles are the Node roles that require P2P Address.
-	P2PAddressRequiredRoles = node.RoleComputeWorker
+	P2PAddressRequiredRoles = node.RoleComputeWorker |
+		node.RoleKeyManager |
+		node.RoleValidator |
+		node.RoleStorageRPC
 )
 
 // Backend is a registry implementation.
@@ -215,7 +203,7 @@ type Backend interface {
 	WatchNodeList(context.Context) (<-chan *NodeList, pubsub.ClosableSubscription, error)
 
 	// GetRuntime gets a runtime by ID.
-	GetRuntime(context.Context, *NamespaceQuery) (*Runtime, error)
+	GetRuntime(context.Context, *GetRuntimeQuery) (*Runtime, error)
 
 	// GetRuntimes returns the registered Runtimes at the specified
 	// block height.
@@ -230,6 +218,12 @@ type Backend interface {
 
 	// GetEvents returns the events at specified block height.
 	GetEvents(ctx context.Context, height int64) ([]*Event, error)
+
+	// WatchEvents returns a channel that produces a stream of Events.
+	WatchEvents(ctx context.Context) (<-chan *Event, pubsub.ClosableSubscription, error)
+
+	// ConsensusParameters returns the registry consensus parameters.
+	ConsensusParameters(ctx context.Context, height int64) (*ConsensusParameters, error)
 
 	// Cleanup cleans up the registry backend.
 	Cleanup()
@@ -247,6 +241,13 @@ type NamespaceQuery struct {
 	ID     common.Namespace `json:"id"`
 }
 
+// GetRuntimeQuery is a registry query by namespace (Runtime ID).
+type GetRuntimeQuery struct {
+	Height           int64            `json:"height"`
+	ID               common.Namespace `json:"id"`
+	IncludeSuspended bool             `json:"include_suspended,omitempty"`
+}
+
 // GetRuntimesQuery is a registry get runtimes query.
 type GetRuntimesQuery struct {
 	Height           int64 `json:"height"`
@@ -260,6 +261,9 @@ type ConsensusAddressQuery struct {
 	Height  int64  `json:"height"`
 	Address []byte `json:"address"`
 }
+
+// DeregisterEntity is a request to deregister an entity.
+type DeregisterEntity struct{}
 
 // NewRegisterEntityTx creates a new register entity transaction.
 func NewRegisterEntityTx(nonce uint64, fee *transaction.Fee, sigEnt *entity.SignedEntity) *transaction.Transaction {
@@ -282,8 +286,13 @@ func NewUnfreezeNodeTx(nonce uint64, fee *transaction.Fee, unfreeze *UnfreezeNod
 }
 
 // NewRegisterRuntimeTx creates a new register runtime transaction.
-func NewRegisterRuntimeTx(nonce uint64, fee *transaction.Fee, sigRt *SignedRuntime) *transaction.Transaction {
-	return transaction.NewTransaction(nonce, fee, MethodRegisterRuntime, sigRt)
+func NewRegisterRuntimeTx(nonce uint64, fee *transaction.Fee, rt *Runtime) *transaction.Transaction {
+	return transaction.NewTransaction(nonce, fee, MethodRegisterRuntime, rt)
+}
+
+// NewProveFreshnessTx creates a new prove freshness transaction.
+func NewProveFreshnessTx(nonce uint64, fee *transaction.Fee, blob [32]byte) *transaction.Transaction {
+	return transaction.NewTransaction(nonce, fee, MethodProveFreshness, blob)
 }
 
 // EntityEvent is the event that is returned via WatchEntities to signify
@@ -293,6 +302,11 @@ type EntityEvent struct {
 	IsRegistration bool           `json:"is_registration"`
 }
 
+// EventKind returns a string representation of this event's kind.
+func (e *EntityEvent) EventKind() string {
+	return "entity"
+}
+
 // NodeEvent is the event that is returned via WatchNodes to signify node
 // registration changes and updates.
 type NodeEvent struct {
@@ -300,9 +314,31 @@ type NodeEvent struct {
 	IsRegistration bool       `json:"is_registration"`
 }
 
-// RuntimeEvent signifies new runtime registration.
-type RuntimeEvent struct {
+// EventKind returns a string representation of this event's kind.
+func (e *NodeEvent) EventKind() string {
+	return "node"
+}
+
+// RuntimeStartedEvent signifies a runtime started event.
+//
+// Emitted when a new runtime is started or a previously suspended runtime is resumed.
+type RuntimeStartedEvent struct {
 	Runtime *Runtime `json:"runtime"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *RuntimeStartedEvent) EventKind() string {
+	return "runtime_started"
+}
+
+// RuntimeSuspendedEvent signifies a runtime was suspended.
+type RuntimeSuspendedEvent struct {
+	RuntimeID common.Namespace `json:"runtime_id"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *RuntimeSuspendedEvent) EventKind() string {
+	return "runtime_suspended"
 }
 
 // NodeUnfrozenEvent signifies when node becomes unfrozen.
@@ -310,15 +346,42 @@ type NodeUnfrozenEvent struct {
 	NodeID signature.PublicKey `json:"node_id"`
 }
 
+// EventKind returns a string representation of this event's kind.
+func (e *NodeUnfrozenEvent) EventKind() string {
+	return "node_unfrozen"
+}
+
+var _ events.CustomTypedAttribute = (*NodeListEpochEvent)(nil)
+
+// NodeListEpochEvent is the per epoch node list event.
+type NodeListEpochEvent struct{}
+
+// EventKind returns a string representation of this event's kind.
+func (e *NodeListEpochEvent) EventKind() string {
+	return "node_list_epoch"
+}
+
+// EventValue returns a string representation of this event's kind.
+func (e *NodeListEpochEvent) EventValue() string {
+	// Dummy value, should be ignored.
+	return "1"
+}
+
+// DecodeValue decodes the attribute event value.
+func (e *NodeListEpochEvent) DecodeValue(string) error {
+	return nil
+}
+
 // Event is a registry event returned via GetEvents.
 type Event struct {
 	Height int64     `json:"height,omitempty"`
 	TxHash hash.Hash `json:"tx_hash,omitempty"`
 
-	RuntimeEvent      *RuntimeEvent      `json:"runtime,omitempty"`
-	EntityEvent       *EntityEvent       `json:"entity,omitempty"`
-	NodeEvent         *NodeEvent         `json:"node,omitempty"`
-	NodeUnfrozenEvent *NodeUnfrozenEvent `json:"node_unfrozen,omitempty"`
+	RuntimeStartedEvent   *RuntimeStartedEvent   `json:"runtime_started,omitempty"`
+	RuntimeSuspendedEvent *RuntimeSuspendedEvent `json:"runtime_suspended,omitempty"`
+	EntityEvent           *EntityEvent           `json:"entity,omitempty"`
+	NodeEvent             *NodeEvent             `json:"node,omitempty"`
+	NodeUnfrozenEvent     *NodeUnfrozenEvent     `json:"node_unfrozen,omitempty"`
 }
 
 // NodeList is a per-epoch immutable node list.
@@ -332,8 +395,12 @@ type NodeLookup interface {
 	// NodeBySubKey looks up a specific node by its consensus, P2P or TLS key.
 	NodeBySubKey(ctx context.Context, key signature.PublicKey) (*node.Node, error)
 
-	// Returns a list of all nodes.
+	// Nodes returns a list of all registered nodes.
 	Nodes(ctx context.Context) ([]*node.Node, error)
+
+	// GetEntityNodes returns nodes registered by given entity.
+	// Note that this returns both active and expired nodes.
+	GetEntityNodes(ctx context.Context, id signature.PublicKey) ([]*node.Node, error)
 }
 
 // RuntimeLookup interface implements various ways for the verification
@@ -353,6 +420,9 @@ type RuntimeLookup interface {
 
 	// AllRuntimes returns a list of all runtimes (including suspended ones).
 	AllRuntimes(ctx context.Context) ([]*Runtime, error)
+
+	// Runtimes returns active runtimes (not including suspended ones).
+	Runtimes(ctx context.Context) ([]*Runtime, error)
 }
 
 // VerifyRegisterEntityArgs verifies arguments for RegisterEntity.
@@ -424,9 +494,10 @@ func VerifyRegisterNodeArgs( // nolint: gocyclo
 	sigNode *node.MultiSignedNode,
 	entity *entity.Entity,
 	now time.Time,
+	height uint64,
 	isGenesis bool,
 	isSanityCheck bool,
-	epoch epochtime.EpochTime,
+	epoch beacon.EpochTime,
 	runtimeLookup RuntimeLookup,
 	nodeLookup NodeLookup,
 ) (*node.Node, []*Runtime, error) {
@@ -466,46 +537,22 @@ func VerifyRegisterNodeArgs( // nolint: gocyclo
 		return nil, nil, ErrInvalidArgument
 	}
 
-	// Determine which key should be expected to have signed the node descriptor.
-	var inEntityNodeList bool
-	for _, v := range entity.Nodes {
-		if n.ID.Equal(v) {
-			inEntityNodeList = true
-			break
-		}
-	}
-
 	// Descriptors will always be signed by the node identity key.
 	var expectedSigners []signature.PublicKey
 	if !sigNode.MultiSigned.IsSignedBy(n.ID) {
-		logger.Error("RegisterNode: registration not signed by node identity",
+		logger.Debug("RegisterNode: registration not signed by node identity",
 			"signed_node", sigNode,
 			"node", n,
 		)
 		return nil, nil, fmt.Errorf("%w: registration not signed by node identity", ErrInvalidArgument)
 	}
 	expectedSigners = append(expectedSigners, n.ID)
-	if !inEntityNodeList {
-		// Entity signing node registrations is feature-gated by a consensus
-		// parameter, and a per-entity configuration option.
-		if !params.DebugAllowEntitySignedNodeRegistration || !entity.AllowEntitySignedNodes {
-			logger.Error("RegisterNode: registration likely signed by entity",
-				"signed_node", sigNode,
-				"node", n,
-			)
-			return nil, nil, fmt.Errorf("%w: registration likely signed by entity", ErrInvalidArgument)
-		}
-
-		// If we are using entity signing, descriptors will also be signed
-		// by the entity signing key.
-		if !sigNode.MultiSigned.IsSignedBy(entity.ID) {
-			logger.Error("RegisterNode: registration not signed by entity",
-				"signed_node", sigNode,
-				"node", n,
-			)
-			return nil, nil, fmt.Errorf("%w: registration not signed by entity", ErrInvalidArgument)
-		}
-		expectedSigners = append(expectedSigners, entity.ID)
+	if !entity.HasNode(n.ID) && (!isSanityCheck || isGenesis) {
+		logger.Debug("RegisterNode: node public key not found in entity's node list",
+			"signed_node", sigNode,
+			"node", n,
+		)
+		return nil, nil, fmt.Errorf("%w: node public key not found in entity's node list", ErrInvalidArgument)
 	}
 
 	// Expired registrations are allowed here because this routine is abused
@@ -523,20 +570,6 @@ func VerifyRegisterNodeArgs( // nolint: gocyclo
 		return nil, nil, fmt.Errorf("%w: expiration period greater than allowed", ErrInvalidArgument)
 	}
 
-	// Make sure that a node has at least one valid role.
-	switch {
-	case n.Roles == 0:
-		logger.Error("RegisterNode: no roles specified",
-			"node", n,
-		)
-		return nil, nil, fmt.Errorf("%w: no roles specified", ErrInvalidArgument)
-	case n.HasRoles(node.RoleReserved):
-		logger.Error("RegisterNode: invalid role specified",
-			"node", n,
-		)
-		return nil, nil, fmt.Errorf("%w: invalid role specified", ErrInvalidArgument)
-	}
-
 	// TODO: Key manager nodes maybe should be restricted to only being a
 	// key manager at the expense of breaking some of our test configs.
 
@@ -550,16 +583,26 @@ func VerifyRegisterNodeArgs( // nolint: gocyclo
 			return nil, nil, fmt.Errorf("%w: missing runtimes", ErrInvalidArgument)
 		}
 	default:
-		rtMap := make(map[common.Namespace]bool)
+		rtMap := make(map[common.Namespace]*Runtime)
+		rtVersionMap := make(map[common.Namespace]map[version.Version]bool)
 
 		for _, rt := range n.Runtimes {
-			if rtMap[rt.ID] {
-				logger.Error("RegisterNode: duplicate runtime IDs",
-					"runtime_id", rt.ID,
-				)
-				return nil, nil, fmt.Errorf("%w: duplicate runtime IDs", ErrInvalidArgument)
+			// Ensure no nil runtime.
+			if rt == nil {
+				return nil, nil, ErrInvalidArgument
 			}
-			rtMap[rt.ID] = true
+			if rtVersionMap[rt.ID] == nil {
+				rtVersionMap[rt.ID] = make(map[version.Version]bool)
+			}
+			if rtVersionMap[rt.ID][rt.Version] {
+				logger.Error("RegisterNode: duplicate version for runtime",
+					"runtime_id", rt.ID,
+					"runtime_version", rt.Version,
+				)
+				return nil, nil, fmt.Errorf("%w: duplicate version for runtime", ErrInvalidArgument)
+
+			}
+			rtVersionMap[rt.ID][rt.Version] = true
 
 			// Make sure that the claimed runtime actually exists.
 			regRt, err := runtimeLookup.AnyRuntime(ctx, rt.ID)
@@ -571,9 +614,14 @@ func VerifyRegisterNodeArgs( // nolint: gocyclo
 				return nil, nil, fmt.Errorf("failed to lookup runtime: %w", err)
 			}
 
-			// If the node indicates TEE support for any of it's runtimes,
-			// validate the attestation evidence.
-			if err := VerifyNodeRuntimeEnclaveIDs(logger, rt, regRt, now); err != nil {
+			// If the node indicates TEE support for any of it's runtimes, validate the attestation
+			// evidence.
+			//
+			// These checks are skipped at time of genesis as there can be nodes present which are
+			// both validators and compute nodes and have out of date attestation evidence. Removing
+			// such nodes could lead to consensus not having the proper majority. This is safe as
+			// attestation evidence is independently verified before scheduling committees.
+			if err := VerifyNodeRuntimeEnclaveIDs(logger, n.ID, rt, regRt, params.TEEFeatures, now, height); err != nil && !isSanityCheck && !isGenesis {
 				return nil, nil, err
 			}
 
@@ -585,7 +633,11 @@ func VerifyRegisterNodeArgs( // nolint: gocyclo
 				return nil, nil, fmt.Errorf("%w: compute runtime not allowed", ErrInvalidArgument)
 			}
 
-			runtimes = append(runtimes, regRt)
+			// Append to the list of runtimes once and only once.
+			if rtMap[rt.ID] == nil {
+				rtMap[rt.ID] = regRt
+				runtimes = append(runtimes, regRt)
+			}
 		}
 	}
 
@@ -614,21 +666,28 @@ func VerifyRegisterNodeArgs( // nolint: gocyclo
 		return nil, nil, err
 	}
 
+	// Validate VRFInfo.
+	if !n.VRF.ID.IsValid() {
+		logger.Error("RegisterNode: invalid VRF ID",
+			"node", n,
+		)
+		return nil, nil, fmt.Errorf("%w: invalid VRF ID", ErrInvalidArgument)
+	}
+	if !sigNode.MultiSigned.IsSignedBy(n.VRF.ID) {
+		logger.Error("RegisterNode: not signed by VRF ID",
+			"signed_node", sigNode,
+			"node", n,
+		)
+		return nil, nil, fmt.Errorf("%w: registration not signed by VRF ID", ErrInvalidArgument)
+	}
+	expectedSigners = append(expectedSigners, n.VRF.ID)
+
 	// Validate TLSInfo.
 	if !n.TLS.PubKey.IsValid() {
 		logger.Error("RegisterNode: invalid TLS public key",
 			"node", n,
 		)
 		return nil, nil, fmt.Errorf("%w: invalid TLS public key", ErrInvalidArgument)
-	}
-	tlsAddressRequired := n.HasRoles(TLSAddressRequiredRoles)
-	if err := verifyAddresses(params, tlsAddressRequired, n.TLS.Addresses); err != nil {
-		addrs, _ := json.Marshal(n.TLS.Addresses)
-		logger.Error("RegisterNode: missing/invalid committee addresses",
-			"node", n,
-			"committee_addrs", addrs,
-		)
-		return nil, nil, err
 	}
 
 	if !sigNode.MultiSigned.IsSignedBy(n.TLS.PubKey) {
@@ -656,74 +715,71 @@ func VerifyRegisterNodeArgs( // nolint: gocyclo
 	}
 	expectedSigners = append(expectedSigners, n.P2P.ID)
 	p2pAddressRequired := n.HasRoles(P2PAddressRequiredRoles)
+	switch isGenesis || isSanityCheck {
+	case true:
+		// Allow legacy descriptor with optional p2p address for validator.
+		// XXX: Remove this after 23.0.x.
+		if n.HasRoles(node.RoleValidator) {
+			p2pAddressRequired = false
+		}
+	case false:
+		// All new (re)registrations will require a p2p address for all nodes,
+		// and will reject descriptors otherwise.
+	}
+
 	if err := verifyAddresses(params, p2pAddressRequired, n.P2P.Addresses); err != nil {
 		addrs, _ := json.Marshal(n.P2P.Addresses)
-		logger.Error("RegisterNode: missing/invald P2P addresses",
+		logger.Error("RegisterNode: missing/invalid P2P addresses",
 			"node", n,
 			"p2p_addrs", addrs,
 		)
 		return nil, nil, err
 	}
 
-	// Make sure that the consensus, TLS and P2P keys are unique (between
-	// themselves and compared to other nodes).
+	// Make sure that the consensus, TLS, P2P, and VRF keys are unique
+	// (between themselves and compared to other nodes).
 	//
 	// Note that if a key exists and belongs to the same node ID, this is not
 	// counted as an error, since it is possible that the node descriptor is
 	// just being updated (this check is called in both cases).
-	if n.Consensus.ID.Equal(n.P2P.ID) || n.Consensus.ID.Equal(n.TLS.PubKey) || n.P2P.ID.Equal(n.TLS.PubKey) {
-		logger.Error("RegisterNode: node consensus, P2P and TLS keys must differ",
+	type nodeSubKey struct {
+		descr string
+		id    signature.PublicKey
+	}
+
+	subKeyDedup := make(map[signature.PublicKey]bool)
+	subKeys := []nodeSubKey{
+		{"consensus ID", n.Consensus.ID},
+		{"P2P ID", n.P2P.ID},
+		{"TLS public key", n.TLS.PubKey},
+		{"VRF ID", n.VRF.ID},
+	}
+
+	for _, subKey := range subKeys {
+		subKeyDedup[subKey.id] = true
+
+		existingNode, err := nodeLookup.NodeBySubKey(ctx, subKey.id)
+		if err != nil && err != ErrNoSuchNode {
+			logger.Error(fmt.Sprintf("RegisterNode: failed to get node by %s", subKey.descr),
+				"err", err,
+				"subkey_id", subKey.id.String(),
+			)
+		}
+
+		if existingNode != nil && existingNode.ID != n.ID {
+			logger.Error(fmt.Sprintf("RegisterNode: duplicate node %s", subKey.descr),
+				"node_id", n.ID,
+				"existing_node_id", existingNode.ID,
+			)
+			return nil, nil, fmt.Errorf("%w: duplicate node %s", ErrInvalidArgument, subKey.descr)
+		}
+	}
+
+	if len(subKeyDedup) != len(subKeys) {
+		logger.Error("RegisterNode: node consensus, P2P, VRF and TLS keys must differ",
 			"node", n,
 		)
-		return nil, nil, fmt.Errorf("%w: P2P, consensus and TLS keys not unique", ErrInvalidArgument)
-	}
-
-	existingNode, err := nodeLookup.NodeBySubKey(ctx, n.Consensus.ID)
-	if err != nil && err != ErrNoSuchNode {
-		logger.Error("RegisterNode: failed to get node by consensus ID",
-			"err", err,
-			"consensus_id", n.Consensus.ID.String(),
-		)
-		return nil, nil, fmt.Errorf("failed to lookup node by subkey: %w", err)
-	}
-	if existingNode != nil && existingNode.ID != n.ID {
-		logger.Error("RegisterNode: duplicate node consensus ID",
-			"node_id", n.ID,
-			"existing_node_id", existingNode.ID,
-		)
-		return nil, nil, fmt.Errorf("%w: duplicate node consensus ID", ErrInvalidArgument)
-	}
-
-	existingNode, err = nodeLookup.NodeBySubKey(ctx, n.P2P.ID)
-	if err != nil && err != ErrNoSuchNode {
-		logger.Error("RegisterNode: failed to get node by P2P ID",
-			"err", err,
-			"p2p_id", n.P2P.ID.String(),
-		)
-		return nil, nil, fmt.Errorf("failed to lookup node by subkey: %w", err)
-	}
-	if existingNode != nil && existingNode.ID != n.ID {
-		logger.Error("RegisterNode: duplicate node P2P ID",
-			"node_id", n.ID,
-			"existing_node_id", existingNode.ID,
-		)
-		return nil, nil, fmt.Errorf("%w: duplicate node P2P ID", ErrInvalidArgument)
-	}
-
-	existingNode, err = nodeLookup.NodeBySubKey(ctx, n.TLS.PubKey)
-	if err != nil && err != ErrNoSuchNode {
-		logger.Error("RegisterNode: failed to get node by TLS public key",
-			"err", err,
-			"tls_pub_key", n.TLS.PubKey.String(),
-		)
-		return nil, nil, fmt.Errorf("failed to lookup node by subkey: %w", err)
-	}
-	if existingNode != nil && existingNode.ID != n.ID {
-		logger.Error("RegisterNode: duplicate node TLS public key",
-			"node_id", n.ID,
-			"existing_node_id", existingNode.ID,
-		)
-		return nil, nil, fmt.Errorf("%w: duplicate node TLS public key", ErrInvalidArgument)
+		return nil, nil, fmt.Errorf("%w: node consensus, P2P, VRF and TLS keys not unique", ErrInvalidArgument)
 	}
 
 	// Ensure that only the expected signatures are present, and nothing more.
@@ -739,80 +795,61 @@ func VerifyRegisterNodeArgs( // nolint: gocyclo
 }
 
 // VerifyNodeRuntimeEnclaveIDs verifies TEE-specific attributes of the node's runtime.
-func VerifyNodeRuntimeEnclaveIDs(logger *logging.Logger, rt *node.Runtime, regRt *Runtime, ts time.Time) error {
+func VerifyNodeRuntimeEnclaveIDs(
+	logger *logging.Logger,
+	nodeID signature.PublicKey,
+	rt *node.Runtime,
+	regRt *Runtime,
+	teeCfg *node.TEEFeatures,
+	ts time.Time,
+	height uint64,
+) error {
+	// Verify that the node is running on the same hardware as the runtime.
+	hw := node.TEEHardwareInvalid
+	if rt.Capabilities.TEE != nil {
+		hw = rt.Capabilities.TEE.Hardware
+	}
+	if hw != regRt.TEEHardware {
+		logger.Error("VerifyNodeRuntimeEnclaveIDs: runtime TEE.Hardware mismatch",
+			"runtime_id", rt.ID,
+			"required_tee_hardware", regRt.TEEHardware,
+			"tee_hardware", hw,
+			"ts", ts,
+		)
+		return ErrTEEHardwareMismatch
+	}
+
 	// If no TEE available, do nothing.
 	if rt.Capabilities.TEE == nil {
 		return nil
 	}
 
-	switch rt.Capabilities.TEE.Hardware {
-	case node.TEEHardwareInvalid:
-	case node.TEEHardwareIntelSGX:
-		// Check MRENCLAVE/MRSIGNER.
-		var avrBundle ias.AVRBundle
-		if err := cbor.Unmarshal(rt.Capabilities.TEE.Attestation, &avrBundle); err != nil {
-			return err
+	// Find the runtime in the descriptor corresponding to the version
+	// that is to be validated.
+	for _, rtVersionInfo := range regRt.Deployments {
+		if rtVersionInfo.Version != rt.Version {
+			continue
 		}
 
-		avr, err := avrBundle.Open(ias.IntelTrustRoots, ts)
-		if err != nil {
-			return err
-		}
-
-		// Extract the original ISV quote.
-		q, err := avr.Quote()
-		if err != nil {
-			return err
-		}
-
-		if regRt.TEEHardware != rt.Capabilities.TEE.Hardware {
-			logger.Error("VerifyNodeRuntimeEnclaveIDs: runtime TEE.Hardware mismatch",
-				"quote", q,
-				"node_runtime", rt,
-				"registry_runtime", regRt,
+		if err := rt.Capabilities.TEE.Verify(teeCfg, ts, height, rtVersionInfo.TEE, nodeID); err != nil {
+			logger.Error("VerifyNodeRuntimeEnclaveIDs: failed to validate attestation",
+				"node_id", nodeID,
+				"runtime_id", rt.ID,
 				"ts", ts,
+				"err", err,
 			)
-			return ErrTEEHardwareMismatch
-		}
-
-		var vi VersionInfoIntelSGX
-		if err := cbor.Unmarshal(regRt.Version.TEE, &vi); err != nil {
 			return err
 		}
-		var eidValid bool
-		for _, eid := range vi.Enclaves {
-			eidMrenclave := eid.MrEnclave
-			eidMrsigner := eid.MrSigner
-			// Compare MRENCLAVE/MRSIGNER to the one stored in the registry.
-			if bytes.Equal(eidMrenclave[:], q.Report.MRENCLAVE[:]) && bytes.Equal(eidMrsigner[:], q.Report.MRSIGNER[:]) {
-				eidValid = true
-				break
-			}
-		}
 
-		if !eidValid {
-			logger.Error("VerifyNodeRuntimeEnclaveIDs: bad enclave ID",
-				"quote", q,
-				"node_runtime", rt,
-				"registry_runtime", regRt,
-				"ts", ts,
-			)
-			return ErrBadEnclaveIdentity
-		}
-	default:
-		return ErrBadCapabilitiesTEEHardware
+		return nil
 	}
 
-	if err := rt.Capabilities.TEE.Verify(ts); err != nil {
-		logger.Error("VerifyNodeRuntimeEnclaveIDs: failed to validate attestation",
-			"runtime_id", rt.ID,
-			"ts", ts,
-			"err", err,
-		)
-		return err
-	}
-
-	return nil
+	logger.Error("VerifyNodeRuntimeEnclaveIDs: node running unknown enclave version",
+		"runtime_id", rt.ID,
+		"version", rt.Version,
+		"ts", ts,
+	)
+	return fmt.Errorf("%w: node running unknown runtime enclave version", ErrInvalidArgument)
 }
 
 // VerifyAddress verifies a node address.
@@ -845,18 +882,6 @@ func verifyAddresses(params *ConsensusParameters, addressRequired bool, addresse
 				return err
 			}
 		}
-	case []node.TLSAddress:
-		if len(addrs) == 0 && addressRequired {
-			return fmt.Errorf("%w: missing TLS address", ErrInvalidArgument)
-		}
-		for _, v := range addrs {
-			if !v.PubKey.IsValid() {
-				return fmt.Errorf("%w: TLS address public key invalid", ErrInvalidArgument)
-			}
-			if err := VerifyAddress(v.Address, params.DebugAllowUnroutableAddresses); err != nil {
-				return err
-			}
-		}
 	case []node.Address:
 		if len(addrs) == 0 && addressRequired {
 			return fmt.Errorf("%w: missing node address", ErrInvalidArgument)
@@ -873,38 +898,109 @@ func verifyAddresses(params *ConsensusParameters, addressRequired bool, addresse
 }
 
 // verifyNodeRuntimeChanges verifies node runtime changes.
-func verifyNodeRuntimeChanges(logger *logging.Logger, currentRuntimes, newRuntimes []*node.Runtime) bool {
-	if len(newRuntimes) < len(currentRuntimes) {
-		logger.Error("RegisterNode: trying to update runtimes, cannot remove existing runtimes",
+func verifyNodeRuntimeChanges(
+	ctx context.Context,
+	logger *logging.Logger,
+	currentRuntimes, newRuntimes []*node.Runtime,
+	runtimeLookup RuntimeLookup,
+	epoch beacon.EpochTime,
+) bool {
+	// Note: VerifyNodeRuntimeEnclaveIDs ensures that nothing outrageous
+	// is in newRuntimes, this routine only needs to validate changes.
+
+	toMap := func(vec []*node.Runtime) (map[common.Namespace]map[version.Version]*node.Runtime, error) {
+		m := make(map[common.Namespace]map[version.Version]*node.Runtime)
+		for i := range vec {
+			rt := vec[i]
+			if m[rt.ID] == nil {
+				m[rt.ID] = make(map[version.Version]*node.Runtime)
+			}
+			if m[rt.ID][rt.Version] != nil {
+				return nil, fmt.Errorf("registry: redundant versions for runtime: %s", rt.ID)
+			}
+			m[rt.ID][rt.Version] = rt
+		}
+		return m, nil
+	}
+
+	currentMap, err := toMap(currentRuntimes)
+	if err != nil {
+		// Invariant violation, corrupt state.
+		logger.Error("RegisterNode: trying to update runtimes, current runtime state corrupt",
+			"err", err,
 			"current_runtimes", currentRuntimes,
+		)
+		panic(fmt.Sprintf("RegisterNode: malformed node runtimes present in state: %v", err))
+	}
+
+	newMap, err := toMap(newRuntimes)
+	if err != nil {
+		logger.Error("RegisterNode: trying to update runtimes, new runtime state invalid",
+			"err", err,
 			"new_runtimes", newRuntimes,
 		)
 		return false
 	}
 
-	// Make an index that maps runtime ID -> runtime, so we can do checks
-	// faster.
-	nrtMap := make(map[common.Namespace]*node.Runtime)
-	for _, nrt := range newRuntimes {
-		nrtMap[nrt.ID] = nrt
-	}
-
-	for _, currentRuntime := range currentRuntimes {
-		newRuntime, exists := nrtMap[currentRuntime.ID]
-		if !exists {
+	for id, currentVersions := range currentMap {
+		// All runtimes in currentMap need to be present in newMap.
+		newVersions, ok := newMap[id]
+		if !ok {
 			logger.Error("RegisterNode: trying to update runtimes, current runtime is missing in new set",
-				"runtime_id", currentRuntime.ID,
+				"runtime_id", id,
 			)
 			return false
 		}
-		if !verifyRuntimeCapabilities(logger, &currentRuntime.Capabilities, &newRuntime.Capabilities) {
-			curRtJSON, _ := json.Marshal(currentRuntime)
-			newRtJSON, _ := json.Marshal(newRuntime)
-			logger.Error("RegisterNode: trying to update runtimes, runtime Capabilities changed",
-				"current_runtime", curRtJSON,
-				"new_runtime", newRtJSON,
+
+		rtDesc, err := runtimeLookup.AnyRuntime(ctx, id)
+		if err != nil {
+			logger.Error("RegisterNode: trying to update runtimes, unknown runtime",
+				"runtime_id", id,
 			)
 			return false
+		}
+		activeDeployment := rtDesc.ActiveDeployment(epoch)
+
+		// All versions present in currentMap for a runtime, that are
+		// also present in newMap, need to report identical capabilities.
+		for version, currentRuntime := range currentVersions {
+			newRuntime, ok := newVersions[version]
+			if !ok {
+				if activeDeployment == nil {
+					// If there is no active deployment, it is fine if the node
+					// does whatever they want.
+					continue
+				}
+				if version.ToU64() < activeDeployment.Version.ToU64() {
+					// If the missing runtime is NOT the active deployment
+					// and will not become active in the future, the node
+					// can chose not to include it in the registration.
+					continue
+				}
+				if vi := rtDesc.DeploymentForVersion(version); vi == nil {
+					// If the missing version is no longer scheduled, it is
+					// fine if the node does not include it.
+					continue
+				}
+
+				logger.Error("RegisterNode: trying to update runtimes, current version is missing in new set",
+					"runtime_id", id,
+					"version", version,
+				)
+				return false
+			}
+
+			if !verifyRuntimeCapabilities(logger, &currentRuntime.Capabilities, &newRuntime.Capabilities) { //nolint:gosec
+				curRtJSON, _ := json.Marshal(currentRuntime)
+				newRtJSON, _ := json.Marshal(newRuntime)
+				logger.Error("RegisterNode: trying to update runtimes, runtime Capabilities changed",
+					"runtime_id", id,
+					"version", version,
+					"current_runtime", curRtJSON,
+					"new_runtime", newRtJSON,
+				)
+				return false
+			}
 		}
 	}
 	return true
@@ -936,7 +1032,13 @@ func verifyRuntimeCapabilities(logger *logging.Logger, currentCaps, newCaps *nod
 }
 
 // VerifyNodeUpdate verifies changes while updating the node.
-func VerifyNodeUpdate(logger *logging.Logger, currentNode, newNode *node.Node) error {
+func VerifyNodeUpdate(
+	ctx context.Context,
+	logger *logging.Logger,
+	currentNode, newNode *node.Node,
+	runtimeLookup RuntimeLookup,
+	epoch beacon.EpochTime,
+) error {
 	// XXX: In future we might want to allow updating some of these fields as well. But these updates
 	//      should only happen after the epoch transition.
 	//      For now, node should un-register and re-register to update any of these fields.
@@ -954,7 +1056,21 @@ func VerifyNodeUpdate(logger *logging.Logger, currentNode, newNode *node.Node) e
 		)
 		return ErrNodeUpdateNotAllowed
 	}
-	if !verifyNodeRuntimeChanges(logger, currentNode.Runtimes, newNode.Runtimes) {
+	// Every node requires a Consensus.ID and it shouldn't be updated.
+	if !currentNode.Consensus.ID.Equal(newNode.Consensus.ID) {
+		logger.Error("RegisterNode: trying to update consensus ID",
+			"current_id", currentNode.Consensus.ID,
+			"new_id", newNode.Consensus.ID,
+		)
+		return ErrNodeUpdateNotAllowed
+	}
+
+	// Following checks are only done for active nodes.
+	if currentNode.IsExpired(uint64(epoch)) {
+		return nil
+	}
+
+	if !verifyNodeRuntimeChanges(ctx, logger, currentNode.Runtimes, newNode.Runtimes, runtimeLookup, epoch) {
 		curNodeRuntimes, _ := json.Marshal(currentNode.Runtimes)
 		newNodeRuntimes, _ := json.Marshal(newNode.Runtimes)
 		logger.Error("RegisterNode: trying to update node runtimes",
@@ -973,80 +1089,49 @@ func VerifyNodeUpdate(logger *logging.Logger, currentNode, newNode *node.Node) e
 		return ErrNodeUpdateNotAllowed
 	}
 
-	// Every node requires a Consensus.ID and it shouldn't be updated.
-	if !currentNode.Consensus.ID.Equal(newNode.Consensus.ID) {
-		logger.Error("RegisterNode: trying to update consensus ID",
-			"current_id", currentNode.Consensus.ID,
-			"new_id", newNode.Consensus.ID,
-		)
-		return ErrNodeUpdateNotAllowed
-	}
-
 	return nil
 }
 
-func exactlyOneTrue(conds ...bool) bool {
-	total := 0
-	for _, c := range conds {
-		if c {
-			total++
-		}
-	}
-	return total == 1
-}
-
-// VerifyRegisterRuntimeArgs verifies arguments for RegisterRuntime.
-func VerifyRegisterRuntimeArgs( // nolint: gocyclo
+// VerifyRuntime verifies the given runtime.
+func VerifyRuntime( // nolint: gocyclo
 	params *ConsensusParameters,
 	logger *logging.Logger,
-	sigRt *SignedRuntime,
+	rt *Runtime,
 	isGenesis bool,
 	isSanityCheck bool,
-) (*Runtime, error) {
-	var rt Runtime
-	if sigRt == nil {
-		return nil, ErrInvalidArgument
+	now beacon.EpochTime,
+) error {
+	if rt == nil {
+		return fmt.Errorf("%w: no runtime given", ErrInvalidArgument)
 	}
 
-	var ctx signature.Context
-	switch isGenesis {
-	case true:
-		ctx = RegisterGenesisRuntimeSignatureContext
-	case false:
-		ctx = RegisterRuntimeSignatureContext
-	}
-
-	if err := sigRt.Open(ctx, &rt); err != nil {
-		logger.Error("RegisterRuntime: invalid signature",
-			"signed_runtime", sigRt,
-		)
-		return nil, ErrInvalidSignature
-	}
-	if err := sigRt.Signed.Signature.SanityCheck(rt.EntityID); err != nil {
-		logger.Error("RegisterRuntime: invalid argument(s)",
-			"signed_runtime", sigRt,
-			"runtime", rt,
-			"err", err,
-		)
-		return nil, ErrInvalidArgument
-	}
 	if err := rt.ValidateBasic(!isGenesis && !isSanityCheck); err != nil {
 		logger.Error("RegisterRuntime: invalid runtime descriptor",
 			"runtime", rt,
 			"err", err,
 		)
-		return nil, fmt.Errorf("%w: %s", ErrInvalidArgument, err)
+		return fmt.Errorf("%w: %s", ErrInvalidArgument, err)
 	}
 
 	if rt.ID.IsTest() && !params.DebugAllowTestRuntimes {
 		logger.Error("RegisterRuntime: test runtime registration not allowed",
 			"id", rt.ID,
 		)
-		return nil, fmt.Errorf("%w: test runtime not allowed", ErrInvalidArgument)
+		return fmt.Errorf("%w: test runtime not allowed", ErrInvalidArgument)
 	}
 
 	if err := rt.Genesis.SanityCheck(isGenesis); err != nil {
-		return nil, err
+		return err
+	}
+
+	// Make sure the specified runtime governance model is allowed.
+	if len(params.EnableRuntimeGovernanceModels) == 0 {
+		// No runtime governance models are allowed.
+		return fmt.Errorf("%w: no runtime governance models are enabled", ErrForbidden)
+	}
+	if !params.EnableRuntimeGovernanceModels[rt.GovernanceModel] {
+		// Specified governance model is not allowed.
+		return fmt.Errorf("%w: runtime governance model is not enabled: %s", ErrForbidden, rt.GovernanceModel.String())
 	}
 
 	// Ensure a valid TEE hardware is specified.
@@ -1054,36 +1139,26 @@ func VerifyRegisterRuntimeArgs( // nolint: gocyclo
 		logger.Error("RegisterRuntime: invalid TEE hardware specified",
 			"runtime", rt,
 		)
-		return nil, fmt.Errorf("%w: invalid TEE hardware", ErrInvalidArgument)
+		return fmt.Errorf("%w: invalid TEE hardware", ErrInvalidArgument)
 	}
 
-	// If TEE is required, check if runtime provided at least one enclave ID.
-	if rt.TEEHardware != node.TEEHardwareInvalid {
-		switch rt.TEEHardware {
-		case node.TEEHardwareIntelSGX:
-			var vi VersionInfoIntelSGX
-			if err := cbor.Unmarshal(rt.Version.TEE, &vi); err != nil {
-				logger.Error("RegisterRuntime: invalid SGX TEE Version Info",
-					"version_info", vi,
-					"err", err,
-				)
-				return nil, fmt.Errorf("%w: invalid VersionInfo", ErrInvalidArgument)
-			}
-			if len(vi.Enclaves) == 0 {
-				return nil, fmt.Errorf("%w: invalid VersionInfo", ErrNoEnclaveForRuntime)
-			}
-		}
-	}
-
-	// Ensure there's a valid admission policy.
-	if !exactlyOneTrue(rt.AdmissionPolicy.AnyNode != nil, rt.AdmissionPolicy.EntityWhitelist != nil) {
-		logger.Error("RegisterRuntime: invalid admission policy. exactly one policy should be non-nil",
-			"admission_policy", rt.AdmissionPolicy,
+	// Validate the deployments.  This also handles validating that the
+	// appropriate TEE configuration is present in each deployment.
+	if err := rt.ValidateDeployments(now, params); err != nil {
+		logger.Error("RegisterRuntime: invalid deployments",
+			"runtime_id", rt.ID,
+			"err", err,
 		)
-		return nil, fmt.Errorf("%w: invalid admission policy", ErrInvalidArgument)
+		return err // ValidateDeployments handles wrapping, yay.
 	}
 
-	return &rt, nil
+	// Using runtime governance for non-compute runtimes is invalid.
+	if rt.GovernanceModel == GovernanceRuntime && rt.Kind != KindCompute {
+		logger.Error("RegisterRuntime: runtime governance can only be used with compute runtimes")
+		return fmt.Errorf("%w: runtime governance can only be used with compute runtimes", ErrInvalidArgument)
+	}
+
+	return nil
 }
 
 // VerifyRegisterComputeRuntimeArgs verifies compute runtime-specific arguments for RegisterRuntime.
@@ -1123,15 +1198,27 @@ func VerifyRegisterComputeRuntimeArgs(ctx context.Context, logger *logging.Logge
 	return nil
 }
 
-// VerifyRuntimeUpdate verifies changes while updating the runtime.
-func VerifyRuntimeUpdate(logger *logging.Logger, currentRt, newRt *Runtime) error {
-	if !currentRt.EntityID.Equal(newRt.EntityID) {
-		logger.Error("RegisterRuntime: trying to change runtime owner",
-			"current_owner", currentRt.EntityID,
-			"new_owner", newRt.EntityID,
-		)
-		return ErrRuntimeUpdateNotAllowed
+// VerifyRuntimeNew verifies a new runtime.
+func VerifyRuntimeNew(logger *logging.Logger, rt *Runtime, now beacon.EpochTime, params *ConsensusParameters, isGenesis bool) error {
+	if !(isGenesis || params.DebugDeployImmediately) {
+		// Unless isGenesis or debug option set, forbid immediate deployment.
+		if rt.ActiveDeployment(now) != nil {
+			logger.Error("RegisterRuntime: trying to deploy immediately",
+				"runtime_id", rt.ID,
+			)
+			return ErrRuntimeUpdateNotAllowed
+		}
 	}
+	return nil
+}
+
+// VerifyRuntimeUpdate verifies changes while updating the runtime.
+func VerifyRuntimeUpdate(
+	logger *logging.Logger,
+	currentRt, newRt *Runtime,
+	now beacon.EpochTime,
+	params *ConsensusParameters,
+) error {
 	if !currentRt.ID.Equal(&newRt.ID) {
 		logger.Error("RegisterRuntime: trying to update runtime ID",
 			"current_id", currentRt.ID.String(),
@@ -1150,14 +1237,15 @@ func VerifyRuntimeUpdate(logger *logging.Logger, currentRt, newRt *Runtime) erro
 		logger.Error("RegisterRuntime: trying to update genesis")
 		return ErrRuntimeUpdateNotAllowed
 	}
-	if (currentRt.KeyManager == nil) != (newRt.KeyManager == nil) {
-		logger.Error("RegisterRuntime: trying to change key manager",
+	// Going from having a key manager to no key manager is not allowed.
+	if currentRt.KeyManager != nil && newRt.KeyManager == nil {
+		logger.Error("RegisterRuntime: trying to remove key manager",
 			"current_km", currentRt.KeyManager,
 			"new_km", newRt.KeyManager,
 		)
 		return ErrRuntimeUpdateNotAllowed
 	}
-	// Both descriptors must either have the key manager set or not.
+	// If the key manager was set before it must not change.
 	if currentRt.KeyManager != nil && !currentRt.KeyManager.Equal(newRt.KeyManager) {
 		logger.Error("RegisterRuntime: trying to change key manager",
 			"current_km", currentRt.KeyManager,
@@ -1165,6 +1253,100 @@ func VerifyRuntimeUpdate(logger *logging.Logger, currentRt, newRt *Runtime) erro
 		)
 		return ErrRuntimeUpdateNotAllowed
 	}
+	// Check if governance model update is valid.
+	if currentRt.GovernanceModel != newRt.GovernanceModel {
+		// Transitioning from entity to runtime governance is allowed, but
+		// all other transitions are not.
+		if !(currentRt.GovernanceModel == GovernanceEntity && newRt.GovernanceModel == GovernanceRuntime) {
+			logger.Error("RegisterRuntime: invalid governance model transition",
+				"current_gm", currentRt.GovernanceModel.String(),
+				"new_gm", newRt.GovernanceModel.String(),
+			)
+			return ErrRuntimeUpdateNotAllowed
+		}
+	}
+	// Using runtime governance for non-compute runtimes is invalid.
+	if newRt.GovernanceModel == GovernanceRuntime && newRt.Kind != KindCompute {
+		logger.Error("RegisterRuntime: runtime governance can only be used with compute runtimes")
+		return ErrRuntimeUpdateNotAllowed
+	}
+
+	// Validate the deployments.
+	activeDeployment := currentRt.ActiveDeployment(now)
+	if err := currentRt.ValidateDeployments(now, params); err != nil {
+		// Invariant violation, this should NEVER happen.
+		logger.Error("RegisterRuntime: malformed deployments present in state",
+			"runtime_id", currentRt.ID,
+			"err", err,
+		)
+		panic(fmt.Sprintf("RegisterRuntime: malformed deployments present in state: %s: %v", currentRt.ID, err))
+	}
+	existingDeployments := make(map[version.Version]*VersionInfo)
+	for i, deployment := range currentRt.Deployments {
+		existingDeployments[deployment.Version] = currentRt.Deployments[i]
+	}
+
+	newActiveDeployment := newRt.ActiveDeployment(now)
+	if err := newRt.ValidateDeployments(now, params); err != nil {
+		logger.Error("RegisterRuntime: malformed deployments",
+			"runtime_id", currentRt.ID,
+			"err", err,
+		)
+		return ErrRuntimeUpdateNotAllowed
+	}
+	newDeployments := make(map[version.Version]*VersionInfo)
+	for i, deployment := range newRt.Deployments {
+		newDeployments[deployment.Version] = newRt.Deployments[i]
+	}
+
+	for newVersion, newInfo := range newDeployments {
+		oldInfo := existingDeployments[newVersion]
+
+		// If this is a version that is present in the old descriptor...
+		if oldInfo != nil {
+			// If nothing has changed just continue.
+			if newInfo.Equal(oldInfo) {
+				continue
+			}
+
+			// This is valid if it is altering an existing future deployment.
+		}
+
+		// This prevents altering existing deployments and updates that
+		// attempt to deploy retroactively (new deployments must have
+		// the validity window start at some point in the future).
+		if newInfo.ValidFrom <= now {
+			logger.Error("RegisterRuntime: trying to change an existing deployment",
+				"runtime_id", currentRt.ID,
+				"version", newVersion,
+			)
+			return ErrRuntimeUpdateNotAllowed
+		}
+	}
+
+	if activeDeployment != nil {
+		if newActiveDeployment == nil {
+			logger.Error("RegisterRuntime: trying to remove an existing deployment",
+				"runtime_id", currentRt.ID,
+			)
+			return ErrRuntimeUpdateNotAllowed
+		}
+
+		// Double check this just to be sure.
+		if !activeDeployment.Equal(newActiveDeployment) {
+			logger.Error("RegisterRuntime: trying to change the active deployment",
+				"runtime_id", currentRt.ID,
+			)
+			return ErrRuntimeUpdateNotAllowed
+		}
+	} else if newActiveDeployment != nil {
+		// Fail.  Immediate deployment not allowed.
+		logger.Error("RegisterRuntime: trying to deploy immediately",
+			"runtime_id", currentRt.ID,
+		)
+		return ErrRuntimeUpdateNotAllowed
+	}
+
 	return nil
 }
 
@@ -1184,9 +1366,9 @@ type Genesis struct {
 	Entities []*entity.SignedEntity `json:"entities,omitempty"`
 
 	// Runtimes is the initial list of runtimes.
-	Runtimes []*SignedRuntime `json:"runtimes,omitempty"`
+	Runtimes []*Runtime `json:"runtimes,omitempty"`
 	// SuspendedRuntimes is the list of suspended runtimes.
-	SuspendedRuntimes []*SignedRuntime `json:"suspended_runtimes,omitempty"`
+	SuspendedRuntimes []*Runtime `json:"suspended_runtimes,omitempty"`
 
 	// Nodes is the initial list of nodes.
 	Nodes []*node.MultiSignedNode `json:"nodes,omitempty"`
@@ -1198,28 +1380,29 @@ type Genesis struct {
 // ConsensusParameters are the registry consensus parameters.
 type ConsensusParameters struct {
 	// DebugAllowUnroutableAddresses is true iff node registration should
-	// allow unroutable addreses.
+	// allow unroutable addresses.
 	DebugAllowUnroutableAddresses bool `json:"debug_allow_unroutable_addresses,omitempty"`
 
 	// DebugAllowTestRuntimes is true iff test runtimes should be allowed to
 	// be registered.
 	DebugAllowTestRuntimes bool `json:"debug_allow_test_runtimes,omitempty"`
 
-	// DebugAllowEntitySignedNodeRegistration is true iff node registration
-	// signed by entity signing keys should be allowed.
-	DebugAllowEntitySignedNodeRegistration bool `json:"debug_allow_entity_signed_node_registration,omitempty"`
-
-	// DebugBypassStake is true iff the registry should bypass all of the staking
-	// related checks and operations.
-	DebugBypassStake bool `json:"debug_bypass_stake,omitempty"`
+	// DebugDeployImmediately is true iff runtime registrations should
+	// allow immediate deployment.
+	DebugDeployImmediately bool `json:"debug_deploy_immediately,omitempty"`
 
 	// DisableRuntimeRegistration is true iff runtime registration should be
 	// disabled outside of the genesis block.
 	DisableRuntimeRegistration bool `json:"disable_runtime_registration,omitempty"`
 
-	// DisableRuntimeRegistration is true iff key manager runtime registration should be
+	// DisableKeyManagerRuntimeRegistration is true iff key manager runtime registration should be
 	// disabled outside of the genesis block.
 	DisableKeyManagerRuntimeRegistration bool `json:"disable_km_runtime_registration,omitempty"`
+
+	// DeprecatedEnableKeyManagerCHURP is true iff the CHURP extension for the key manager is enabled.
+	//
+	// Deprecated: CHURP extension is enabled by default since version 24.0.
+	DeprecatedEnableKeyManagerCHURP bool `json:"enable_km_churp,omitempty"`
 
 	// GasCosts are the registry transaction gas costs.
 	GasCosts transaction.Costs `json:"gas_costs,omitempty"`
@@ -1227,6 +1410,65 @@ type ConsensusParameters struct {
 	// MaxNodeExpiration is the maximum number of epochs relative to the epoch
 	// at registration time that a single node registration is valid for.
 	MaxNodeExpiration uint64 `json:"max_node_expiration,omitempty"`
+
+	// EnableRuntimeGovernanceModels is a set of enabled runtime governance models.
+	EnableRuntimeGovernanceModels map[RuntimeGovernanceModel]bool `json:"enable_runtime_governance_models,omitempty"`
+
+	// TEEFeatures contains the configuration of supported TEE features.
+	TEEFeatures *node.TEEFeatures `json:"tee_features,omitempty"`
+
+	// MaxRuntimeDeployments is the maximum number of runtime deployments.
+	MaxRuntimeDeployments uint8 `json:"max_runtime_deployments,omitempty"`
+}
+
+// ConsensusParameterChanges are allowed registry consensus parameter changes.
+type ConsensusParameterChanges struct {
+	// DisableRuntimeRegistration is the new disable runtime registration flag.
+	DisableRuntimeRegistration *bool `json:"disable_runtime_registration,omitempty"`
+
+	// DisableKeyManagerRuntimeRegistration the new disable key manager runtime registration flag.
+	DisableKeyManagerRuntimeRegistration *bool `json:"disable_km_runtime_registration,omitempty"`
+
+	// GasCosts are the new gas costs.
+	GasCosts transaction.Costs `json:"gas_costs,omitempty"`
+
+	// MaxNodeExpiration is the maximum node expiration.
+	MaxNodeExpiration *uint64 `json:"max_node_expiration,omitempty"`
+
+	// EnableRuntimeGovernanceModels are the new enabled runtime governance models.
+	EnableRuntimeGovernanceModels map[RuntimeGovernanceModel]bool `json:"enable_runtime_governance_models,omitempty"`
+
+	// TEEFeatures are the new TEE features.
+	TEEFeatures **node.TEEFeatures `json:"tee_features,omitempty"`
+
+	// MaxRuntimeDeployments is the new maximum number of runtime deployments.
+	MaxRuntimeDeployments *uint8 `json:"max_runtime_deployments,omitempty"`
+}
+
+// Apply applies changes to the given consensus parameters.
+func (c *ConsensusParameterChanges) Apply(params *ConsensusParameters) error {
+	if c.DisableRuntimeRegistration != nil {
+		params.DisableRuntimeRegistration = *c.DisableRuntimeRegistration
+	}
+	if c.DisableKeyManagerRuntimeRegistration != nil {
+		params.DisableKeyManagerRuntimeRegistration = *c.DisableKeyManagerRuntimeRegistration
+	}
+	if c.GasCosts != nil {
+		params.GasCosts = c.GasCosts
+	}
+	if c.MaxNodeExpiration != nil {
+		params.MaxNodeExpiration = *c.MaxNodeExpiration
+	}
+	if c.EnableRuntimeGovernanceModels != nil {
+		params.EnableRuntimeGovernanceModels = c.EnableRuntimeGovernanceModels
+	}
+	if c.TEEFeatures != nil {
+		params.TEEFeatures = *c.TEEFeatures
+	}
+	if c.MaxRuntimeDeployments != nil {
+		params.MaxRuntimeDeployments = *c.MaxRuntimeDeployments
+	}
+	return nil
 }
 
 const (
@@ -1243,9 +1485,8 @@ const (
 	// GasOpRuntimeEpochMaintenance is the gas operation identifier for per-epoch
 	// runtime maintenance costs.
 	GasOpRuntimeEpochMaintenance transaction.Op = "runtime_epoch_maintenance"
-	// GasOpUpdateKeyManager is the gas operation identifier for key manager
-	// policy updates costs.
-	GasOpUpdateKeyManager transaction.Op = "update_keymanager"
+	// GasOpProveFreshness is the gas operation identifier for freshness proofs.
+	GasOpProveFreshness transaction.Op = "prove_freshness"
 )
 
 // XXX: Define reasonable default gas costs.
@@ -1258,7 +1499,7 @@ var DefaultGasCosts = transaction.Costs{
 	GasOpUnfreezeNode:            1000,
 	GasOpRegisterRuntime:         1000,
 	GasOpRuntimeEpochMaintenance: 1000,
-	GasOpUpdateKeyManager:        1000,
+	GasOpProveFreshness:          1000,
 }
 
 const (
@@ -1277,24 +1518,37 @@ func StakeClaimForNode(id signature.PublicKey) staking.StakeClaim {
 
 // StakeClaimForRuntime generates a new stake claim for a specific runtime registration.
 func StakeClaimForRuntime(id common.Namespace) staking.StakeClaim {
-	return staking.StakeClaim(fmt.Sprintf(StakeClaimRegisterRuntime, id))
+	return staking.StakeClaim(fmt.Sprintf(StakeClaimRegisterRuntime, id.Hex()))
 }
 
 // StakeThresholdsForNode returns the staking thresholds for the given node.
 //
-// The passed list of runtimes must be runtime descriptors for all runtimes that the node is
-// registered for in the same order as they appear in the node descriptor (for example as returned
-// by the VerifyRegisterNodeArgs function).
+// The passed list of runtimes must be unique runtime descriptors for all runtimes that the node is
+// registered for.
 func StakeThresholdsForNode(n *node.Node, rts []*Runtime) (thresholds []staking.StakeThreshold) {
 	// Validator nodes are global.
 	if n.HasRoles(node.RoleValidator) {
 		thresholds = append(thresholds, staking.GlobalStakeThreshold(staking.KindNodeValidator))
 	}
 
+	runtimes := make(map[common.Namespace]*Runtime)
+	for _, rt := range rts {
+		runtimes[rt.ID] = rt
+	}
+
 	// Add runtime-specific role thresholds for each registered runtime.
-	for i, rt := range rts {
-		if !n.Runtimes[i].ID.Equal(&rt.ID) {
-			panic(fmt.Errorf("registry: mismatched runtime order"))
+	seen := make(map[common.Namespace]struct{})
+	for _, nodeRt := range n.Runtimes {
+		// A runtime can be included multiple times due to multiple deployments/versions.
+		if _, ok := seen[nodeRt.ID]; ok {
+			continue
+		}
+		seen[nodeRt.ID] = struct{}{}
+
+		// Grab the runtime descriptor.
+		rt, exists := runtimes[nodeRt.ID]
+		if !exists {
+			panic(fmt.Errorf("registry: runtime %s not provided for computing thresholds", nodeRt.ID))
 		}
 
 		var roleThresholds []staking.ThresholdKind
@@ -1304,8 +1558,8 @@ func StakeThresholdsForNode(n *node.Node, rts []*Runtime) (thresholds []staking.
 		if n.HasRoles(node.RoleComputeWorker) {
 			roleThresholds = append(roleThresholds, staking.KindNodeCompute)
 		}
-		if n.HasRoles(node.RoleStorageWorker) {
-			roleThresholds = append(roleThresholds, staking.KindNodeStorage)
+		if n.HasRoles(node.RoleObserver) {
+			roleThresholds = append(roleThresholds, staking.KindNodeObserver)
 		}
 
 		rtThresholds := rt.Staking.Thresholds

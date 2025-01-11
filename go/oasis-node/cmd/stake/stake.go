@@ -3,7 +3,6 @@ package stake
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 
@@ -29,26 +28,30 @@ const CfgPublicKey = "public_key"
 
 var (
 	stakeCmd = &cobra.Command{
-		Use:   "stake",
-		Short: "staking backend utilities",
+		Use:        "stake",
+		Short:      "staking backend utilities",
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	infoCmd = &cobra.Command{
-		Use:   "info",
-		Short: "query the common staking info",
-		Run:   doInfo,
+		Use:        "info",
+		Short:      "query the common staking info",
+		Run:        doInfo,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	listCmd = &cobra.Command{
-		Use:   "list",
-		Short: "list accounts",
-		Run:   doList,
+		Use:        "list",
+		Short:      "list accounts",
+		Run:        doList,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	pubkey2AddressCmd = &cobra.Command{
-		Use:   "pubkey2address",
-		Short: "convert a public key (e.g. entity's ID) to an account address",
-		Run:   doPubkey2Address,
+		Use:        "pubkey2address",
+		Short:      "convert a public key (e.g. entity's ID) to an account address",
+		Run:        doPubkey2Address,
+		Deprecated: "use the `oasis` CLI instead.",
 	}
 
 	logger = logging.GetLogger("cmd/stake")
@@ -71,8 +74,8 @@ func doConnect(cmd *cobra.Command) (*grpc.ClientConn, api.Backend) {
 	return conn, client
 }
 
-func getTokenSymbol(ctx context.Context, cmd *cobra.Command, client api.Backend) string {
-	symbol, err := client.TokenSymbol(ctx)
+func getTokenSymbol(ctx context.Context, client api.Backend) string {
+	symbol, err := client.TokenSymbol(ctx, consensus.HeightLatest)
 	if err != nil {
 		logger.Error("failed to query token's symbol",
 			"err", err,
@@ -82,8 +85,8 @@ func getTokenSymbol(ctx context.Context, cmd *cobra.Command, client api.Backend)
 	return symbol
 }
 
-func getTokenValueExponent(ctx context.Context, cmd *cobra.Command, client api.Backend) uint8 {
-	exp, err := client.TokenValueExponent(ctx)
+func getTokenValueExponent(ctx context.Context, client api.Backend) uint8 {
+	exp, err := client.TokenValueExponent(ctx, consensus.HeightLatest)
 	if err != nil {
 		logger.Error("failed to query token's value exponent",
 			"err", err,
@@ -93,8 +96,8 @@ func getTokenValueExponent(ctx context.Context, cmd *cobra.Command, client api.B
 	return exp
 }
 
-func getAccount(ctx context.Context, cmd *cobra.Command, addr api.Address, client api.Backend) *api.Account {
-	acct, err := client.Account(ctx, &api.OwnerQuery{Owner: addr, Height: consensus.HeightLatest})
+func getAccount(ctx context.Context, addr api.Address, height int64, client api.Backend) *api.Account {
+	acct, err := client.Account(ctx, &api.OwnerQuery{Owner: addr, Height: height})
 	if err != nil {
 		logger.Error("failed to query account",
 			"address", addr,
@@ -105,7 +108,75 @@ func getAccount(ctx context.Context, cmd *cobra.Command, addr api.Address, clien
 	return acct
 }
 
-func doInfo(cmd *cobra.Command, args []string) {
+func getDelegationInfosFor(
+	ctx context.Context,
+	addr api.Address,
+	height int64,
+	client api.Backend,
+) map[api.Address]*api.DelegationInfo {
+	delInfos, err := client.DelegationInfosFor(ctx, &api.OwnerQuery{Owner: addr, Height: height})
+	if err != nil {
+		logger.Error("failed to query (outgoing) delegation infos for account",
+			"address", addr,
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	return delInfos
+}
+
+func getDelegationsTo(
+	ctx context.Context,
+	addr api.Address,
+	height int64,
+	client api.Backend,
+) map[api.Address]*api.Delegation {
+	delegations, err := client.DelegationsTo(ctx, &api.OwnerQuery{Owner: addr, Height: height})
+	if err != nil {
+		logger.Error("failed to query (incoming) delegations to account",
+			"address", addr,
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	return delegations
+}
+
+func getDebondingDelegationInfosFor(
+	ctx context.Context,
+	addr api.Address,
+	height int64,
+	client api.Backend,
+) map[api.Address][]*api.DebondingDelegationInfo {
+	delInfoLists, err := client.DebondingDelegationInfosFor(ctx, &api.OwnerQuery{Owner: addr, Height: height})
+	if err != nil {
+		logger.Error("failed to query (outgoing) debonding delegation infos for account",
+			"address", addr,
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	return delInfoLists
+}
+
+func getDebondingDelegationsTo(
+	ctx context.Context,
+	addr api.Address,
+	height int64,
+	client api.Backend,
+) map[api.Address][]*api.DebondingDelegation {
+	delegations, err := client.DebondingDelegationsTo(ctx, &api.OwnerQuery{Owner: addr, Height: height})
+	if err != nil {
+		logger.Error("failed to query (incoming) debonding delegations to account",
+			"address", addr,
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	return delegations
+}
+
+func doInfo(cmd *cobra.Command, _ []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -113,18 +184,17 @@ func doInfo(cmd *cobra.Command, args []string) {
 	conn, client := doConnect(cmd)
 	defer conn.Close()
 
+	height := consensus.HeightLatest
+
 	ctx := context.Background()
-
-	symbol := getTokenSymbol(ctx, cmd, client)
+	symbol := getTokenSymbol(ctx, client)
 	fmt.Printf("Token's ticker symbol: %s\n", symbol)
-
-	exp := getTokenValueExponent(ctx, cmd, client)
+	exp := getTokenValueExponent(ctx, client)
 	fmt.Printf("Token's value base-10 exponent: %d\n", exp)
-
 	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenSymbol, symbol)
 	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenValueExponent, exp)
 
-	totalSupply, err := client.TotalSupply(ctx, consensus.HeightLatest)
+	totalSupply, err := client.TotalSupply(ctx, height)
 	if err != nil {
 		logger.Error("failed to query total supply",
 			"err", err,
@@ -135,7 +205,7 @@ func doInfo(cmd *cobra.Command, args []string) {
 	token.PrettyPrintAmount(ctx, *totalSupply, os.Stdout)
 	fmt.Println()
 
-	commonPool, err := client.CommonPool(ctx, consensus.HeightLatest)
+	commonPool, err := client.CommonPool(ctx, height)
 	if err != nil {
 		logger.Error("failed to query common pool",
 			"err", err,
@@ -146,7 +216,7 @@ func doInfo(cmd *cobra.Command, args []string) {
 	token.PrettyPrintAmount(ctx, *commonPool, os.Stdout)
 	fmt.Println()
 
-	lastBlockFees, err := client.LastBlockFees(ctx, consensus.HeightLatest)
+	lastBlockFees, err := client.LastBlockFees(ctx, height)
 	if err != nil {
 		logger.Error("failed to query last block fees",
 			"err", err,
@@ -157,17 +227,28 @@ func doInfo(cmd *cobra.Command, args []string) {
 	token.PrettyPrintAmount(ctx, *lastBlockFees, os.Stdout)
 	fmt.Println()
 
+	governanceDeposits, err := client.GovernanceDeposits(ctx, height)
+	if err != nil {
+		logger.Error("failed to query governance deposits",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	fmt.Print("Governance deposits: ")
+	token.PrettyPrintAmount(ctx, *governanceDeposits, os.Stdout)
+	fmt.Println()
+
 	thresholdsToQuery := []api.ThresholdKind{
 		api.KindEntity,
 		api.KindNodeValidator,
 		api.KindNodeCompute,
-		api.KindNodeStorage,
 		api.KindNodeKeyManager,
 		api.KindRuntimeCompute,
 		api.KindRuntimeKeyManager,
+		api.KindKeyManagerChurp,
 	}
 	for _, kind := range thresholdsToQuery {
-		thres, err := client.Threshold(ctx, &api.ThresholdQuery{Kind: kind, Height: consensus.HeightLatest})
+		thres, err := client.Threshold(ctx, &api.ThresholdQuery{Kind: kind, Height: height})
 		if err != nil {
 			if errors.Is(err, api.ErrInvalidThreshold) {
 				logger.Warn(fmt.Sprintf("invalid staking threshold kind: %s", kind))
@@ -184,7 +265,7 @@ func doInfo(cmd *cobra.Command, args []string) {
 	}
 }
 
-func doList(cmd *cobra.Command, args []string) {
+func doList(cmd *cobra.Command, _ []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -192,9 +273,11 @@ func doList(cmd *cobra.Command, args []string) {
 	conn, client := doConnect(cmd)
 	defer conn.Close()
 
+	height := consensus.HeightLatest
+
 	ctx := context.Background()
 
-	addresses, err := client.Addresses(ctx, consensus.HeightLatest)
+	addresses, err := client.Addresses(ctx, height)
 	if err != nil {
 		logger.Error("failed to query addresses",
 			"err", err,
@@ -203,24 +286,32 @@ func doList(cmd *cobra.Command, args []string) {
 	}
 
 	for _, addr := range addresses {
-		var s string
+		var acctString string
 		switch cmdFlags.Verbose() {
 		case true:
 			// NOTE: getAccount()'s output doesn't contain an account's address,
 			// so we need to add it manually.
-			acctMap := make(map[api.Address]*api.Account)
-			acctMap[addr] = getAccount(ctx, cmd, addr, client)
-			b, _ := json.Marshal(acctMap)
-			s = string(b)
+			acctWithAddr := make(map[api.Address]*api.Account)
+			acctWithAddr[addr] = getAccount(ctx, addr, height, client)
+			prettyAcct, err := cmdCommon.PrettyJSONMarshal(acctWithAddr)
+			if err != nil {
+				logger.Error("failed to get pretty JSON of account",
+					"err", err,
+					"address", addr,
+				)
+				acctString = fmt.Sprintf("[invalid pretty JSON for account %s]", addr)
+			} else {
+				acctString = string(prettyAcct)
+			}
 		default:
-			s = addr.String()
+			acctString = addr.String()
 		}
 
-		fmt.Printf("%v\n", s)
+		fmt.Println(acctString)
 	}
 }
 
-func doPubkey2Address(cmd *cobra.Command, args []string) {
+func doPubkey2Address(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}

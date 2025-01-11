@@ -1,8 +1,8 @@
 //! Helpers for testing MKVS trees.
 use std::fmt;
 
-use base64;
-use serde::{self, Deserialize};
+use base64::prelude::*;
+use serde::Deserialize;
 
 /// Tree operation kind.
 #[derive(Clone, Debug, Deserialize)]
@@ -49,7 +49,8 @@ where
         where
             E: serde::de::Error,
         {
-            base64::decode(v)
+            BASE64_STANDARD
+                .decode(v)
                 .map_err(serde::de::Error::custom)
                 .map(Some)
         }

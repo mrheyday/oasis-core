@@ -5,6 +5,11 @@ ifneq ($(GOLDFLAGS),)
 	GO_EXTRA_FLAGS += -ldflags $(GOLDFLAGS)
 endif
 
+# Build code with jemalloc tag unless explicitly disabled (used by badgerdb).
+ifneq ($(OASIS_BADGER_NO_JEMALLOC), 1)
+	GO_EXTRA_FLAGS += -tags jemalloc
+endif
+
 # Set all target as the default target.
 all: build
 
@@ -42,22 +47,34 @@ build-helpers: $(test-helpers)
 
 # List of test vectors to generate.
 test-vectors-targets := staking/gen_vectors \
-	registry/gen_vectors
+	staking/gen_account_vectors \
+	registry/gen_vectors \
+	governance/gen_vectors
 
 $(test-vectors-targets):
 	@$(ECHO) "$(MAGENTA)*** Generating test vectors ($@)...$(OFF)"
 	@$(GO) run ./$@
 
+# Extended set of staking/gen_account_vectors test vectors.
+staking/gen_account_vectors_extended:
+	@$(ECHO) "$(MAGENTA)*** Generating test vectors ($@)...$(OFF)"
+	@$(GO) run ./staking/gen_account_vectors -extended
+
 # Format code.
 fmt:
 	@$(ECHO) "$(CYAN)*** Running Go formatters...$(OFF)"
-	@gofumpt -s -w .
-	@gofumports -w -local github.com/oasisprotocol/oasis-core .
+	@gofumpt -w .
+	@goimports -w -local github.com/oasisprotocol/oasis-core .
 
 # Lint.
 lint:
 	@$(ECHO) "$(CYAN)*** Running Go linters...$(OFF)"
-	@env -u GOPATH golangci-lint run --timeout 4m
+	@$(GOLANGCI_LINT) run --timeout 4m
+
+lint-mod-tidy:
+	@$(ECHO) "$(CYAN)*** Checking go mod tidy...$(OFF)"
+	@$(ENSURE_GIT_CLEAN)
+	@$(CHECK_GO_MOD_TIDY)
 
 # Test.
 test-targets := test-unit test-node
@@ -78,56 +95,6 @@ force-test:
 	@$(ECHO) "$(CYAN)*** Running Go unit tests in force mode...$(OFF)"
 	@$(MAKE) test GO_TEST_FLAGS=-count=1
 
-# Fuzzing.
-fuzz-targets := fuzz-consensus \
-	fuzz-storage \
-	fuzz-mkvs/Tree \
-	fuzz-mkvs/Proof \
-	fuzz-mkvs/Node
-
-define canned-fuzz-run
-@TARGETDIR=$(shell pwd)/$<; \
-WORKDIR=/tmp/oasis-node-$@; \
-if [ "$(FUZZ_NO_BUILD)" != "1" ]; then \
-	mkdir -p "$$WORKDIR"; \
-	pushd $$TARGETDIR >/dev/null; \
-		$(ECHO) "$(CYAN)*** Building fuzzer for $@...$(OFF)"; \
-		go-fuzz-build -o $$WORKDIR/fuzz.zip || exit 1; \
-	popd >/dev/null; \
-fi; \
-if [ "$(FUZZ_BUILD_ONLY)" != "1" ]; then \
-	mkdir -p "$$WORKDIR"; \
-	cd "$$WORKDIR"; \
-	$(ECHO) "$(CYAN)*** Running fuzzer for $@...$(OFF)"; \
-	if [ "$(@D)" == "." ]; then \
-		go-fuzz -bin=$$WORKDIR/fuzz.zip -workdir=$$WORKDIR || exit 1; \
-	else \
-		go-fuzz -bin=$$WORKDIR/fuzz.zip -workdir=$$WORKDIR -func Fuzz$(@F) || exit 1; \
-	fi; \
-fi;
-endef
-
-# Fuzz consensus transactions.
-fuzz-consensus: consensus/tendermint/fuzz/
-	$(canned-fuzz-run)
-# Fuzz general storage interface.
-fuzz-storage: storage/fuzz/ oasis-node
-	@mkdir -p /tmp/oasis-node-fuzz-storage/identity
-	@chmod 0700 /tmp/oasis-node-fuzz-storage/identity
-	@oasis-node/oasis-node identity init --datadir /tmp/oasis-node-fuzz-storage/identity
-	$(canned-fuzz-run)
-# Fuzz MKVS data structures.
-fuzz-mkvs/Tree: storage/mkvs/fuzz
-	$(canned-fuzz-run)
-fuzz-mkvs/Proof: storage/mkvs/fuzz
-	$(canned-fuzz-run)
-fuzz-mkvs/Node: storage/mkvs/fuzz
-	$(canned-fuzz-run)
-
-# Target that only builds all fuzzing infrastructure.
-build-fuzz: FUZZ_BUILD_ONLY=1
-build-fuzz: $(fuzz-targets)
-
 # Clean.
 clean:
 	@$(ECHO) "$(CYAN)*** Cleaning up Go...$(OFF)"
@@ -138,9 +105,8 @@ clean:
 	generate $(go-binaries) $(go-plugins) build \
 	$(test-helpers) build-helpers \
 	$(test-vectors-targets) \
-	fmt lint \
+	fmt lint lint-mod-tidy \
 	$(test-targets) test force-test \
-	$(fuzz-targets) build-fuzz \
 	clean all
 
 .FORCE:

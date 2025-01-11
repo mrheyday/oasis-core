@@ -15,51 +15,47 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	cmnGrpc "github.com/oasisprotocol/oasis-core/go/common/grpc"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
-	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/crypto"
+	"github.com/oasisprotocol/oasis-core/go/consensus/cometbft/crypto"
 	control "github.com/oasisprotocol/oasis-core/go/control/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/log"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
 	"github.com/oasisprotocol/oasis-core/go/sentry/api"
-	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
-	"github.com/oasisprotocol/oasis-core/go/storage/database"
-	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 )
 
 var (
 	// Sentry is the Sentry node basic scenario.
-	Sentry scenario.Scenario = newSentryImpl("sentry", "simple-keyvalue-client", nil)
-	// SentryEncryption is the Sentry node basic encryption scenario.
-	SentryEncryption scenario.Scenario = newSentryImpl("sentry-encryption", "simple-keyvalue-enc-client", nil)
+	Sentry scenario.Scenario = newSentryImpl()
 
 	validatorExtraLogWatcherHandlerFactories = []log.WatcherHandlerFactory{
 		oasis.LogAssertPeerExchangeDisabled(),
 	}
-
-	emptyGetCheckpointsReq = &checkpoint.GetCheckpointsRequest{Namespace: runtimeID}
 )
 
 const sentryChecksContextTimeout = 30 * time.Second
 
 type sentryImpl struct {
-	runtimeImpl
+	Scenario
 }
 
-func newSentryImpl(name, clientBinary string, clientArgs []string) scenario.Scenario {
+func newSentryImpl() scenario.Scenario {
 	return &sentryImpl{
-		runtimeImpl: *newRuntimeImpl(name, clientBinary, clientArgs),
+		Scenario: *NewScenario(
+			"sentry",
+			NewTestClient().WithScenario(SimpleScenario),
+		),
 	}
 }
 
 func (s *sentryImpl) Clone() scenario.Scenario {
 	return &sentryImpl{
-		runtimeImpl: *s.runtimeImpl.Clone().(*runtimeImpl),
+		Scenario: *s.Scenario.Clone().(*Scenario),
 	}
 }
 
 func (s *sentryImpl) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := s.runtimeImpl.Fixture()
+	f, err := s.Scenario.Fixture()
 	if err != nil {
 		return nil, err
 	}
@@ -81,17 +77,12 @@ func (s *sentryImpl) Fixture() (*oasis.NetworkFixture, error) {
 	// +-------------+          +----------+
 	//
 	// +-----------+            +----------+
-	// | Storage 0 +<---------->+ Sentry 3 |
+	// | Compute 0 +<---------->+ Sentry 3 |
 	// +-----------+            +----------+
 	//
 	// +-----------+            +----------+
-	// | Storage 1 +<---------->+ Sentry 4 |
+	// | Compute 1 +<---------->+ Sentry 4 |
 	// +-----------+            +----------+
-	//
-	// +------------+           +----------+
-	// | Keymanager |<--------->| Sentry 5 |
-	// +------------+           +----------+
-	//
 	f.Sentries = []oasis.SentryFixture{
 		{
 			Validators: []int{0},
@@ -103,13 +94,10 @@ func (s *sentryImpl) Fixture() (*oasis.NetworkFixture, error) {
 			Validators: []int{1, 2},
 		},
 		{
-			StorageWorkers: []int{0},
+			ComputeWorkers: []int{0},
 		},
 		{
-			StorageWorkers: []int{1},
-		},
-		{
-			KeymanagerWorkers: []int{0},
+			ComputeWorkers: []int{1},
 		},
 	}
 
@@ -118,6 +106,7 @@ func (s *sentryImpl) Fixture() (*oasis.NetworkFixture, error) {
 			Entity:                     1,
 			LogWatcherHandlerFactories: validatorExtraLogWatcherHandlerFactories,
 			Sentries:                   []int{0, 1},
+			Consensus:                  oasis.ConsensusFixture{SupplementarySanityInterval: 1},
 		},
 		{
 			Entity:                     1,
@@ -131,27 +120,18 @@ func (s *sentryImpl) Fixture() (*oasis.NetworkFixture, error) {
 		},
 	}
 
-	f.StorageWorkers = []oasis.StorageWorkerFixture{
+	f.ComputeWorkers = []oasis.ComputeWorkerFixture{
 		{
-			Backend:  database.BackendNameBadgerDB,
 			Entity:   1,
 			Sentries: []int{3},
-			// Disable cert rotation on one of the storage nodes so we can use
-			// its TLS certificates in the access control sanity checks.
-			DisableCertRotation: true,
+			// Also disable public RPC on one, so we can check access control.
+			DisablePublicRPC: true,
+			Runtimes:         []int{1},
 		},
 		{
-			Backend:  database.BackendNameBadgerDB,
 			Entity:   1,
 			Sentries: []int{4},
-		},
-	}
-
-	f.Keymanagers = []oasis.KeymanagerFixture{
-		{
-			Runtime:  0,
-			Entity:   1,
-			Sentries: []int{5},
+			Runtimes: []int{1},
 		},
 	}
 
@@ -171,46 +151,19 @@ func (s *sentryImpl) dial(address string, clientOpts *cmnGrpc.ClientOptions) (*g
 	return conn, nil
 }
 
-func (s *sentryImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
+func (s *sentryImpl) Run(ctx context.Context, childEnv *env.Env) error { // nolint: gocyclo
 	// Run the basic runtime test.
-	if err := s.runtimeImpl.Run(childEnv); err != nil {
+	if err := s.Scenario.Run(ctx, childEnv); err != nil {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), sentryChecksContextTimeout)
+	ctx, cancel := context.WithTimeout(ctx, sentryChecksContextTimeout)
 	defer cancel()
 
 	// Load identities and addresses used in the sanity checks.
 	sentry0, _, sentry0CtrlAddress, sentry0P2PPubkey := loadSentryNodeInfo(s.Net.Sentries()[0])
 	_, _, _, sentry1P2PPubkey := loadSentryNodeInfo(s.Net.Sentries()[1])
 	_, _, _, sentry2P2PPubkey := loadSentryNodeInfo(s.Net.Sentries()[2])
-	sentry4, sentry4Address, _, _ := loadSentryNodeInfo(s.Net.Sentries()[4])
-
-	storage0 := s.Net.StorageWorkers()[0]
-	storage0Identity, err := storage0.LoadIdentity()
-	if err != nil {
-		return fmt.Errorf("sentry: error loading storage node identity: %w", err)
-	}
-	// Make sure storage0 has disabled certificate rotation.
-	if !storage0Identity.DoNotRotateTLS {
-		return fmt.Errorf("sentry: storage-0 does not have disabled certificate rotation")
-	}
-
-	storage1 := s.Net.StorageWorkers()[1]
-	storage1Address := storage1.GetClientAddress()
-	// Query for storage 1 TLS public keys.
-	storage1Ctrl, err := oasis.NewController(storage1.SocketPath())
-	if err != nil {
-		return err
-	}
-	storage1Status, err := storage1Ctrl.GetStatus(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get status for storage1: %w", err)
-	}
-	storage1ServerPublicKeys := make(map[signature.PublicKey]bool)
-	for _, key := range storage1Status.Identity.TLS {
-		storage1ServerPublicKeys[key] = true
-	}
 
 	validator0 := s.Net.Validators()[0]
 	validator0Identity, err := validator0.LoadIdentity()
@@ -233,9 +186,6 @@ func (s *sentryImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 	}
 
 	validator2 := s.Net.Validators()[2]
-	if err != nil {
-		return fmt.Errorf("sentry: error loading validator node identity: %w", err)
-	}
 	validator2Ctrl, err := oasis.NewController(validator2.SocketPath())
 	if err != nil {
 		return err
@@ -304,111 +254,14 @@ func (s *sentryImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 		return errors.New("sentry0 control endpoint should allow connection with validator0 certificate")
 	}
 
-	// Sanity check storage endpoints. Only committee and configured upstream sentry nodes
-	// are allowed to access corresponding storage node write endpoints.
-
-	// Check Storage-1 endpoint with Validator-0 client certificates.
-	opts = &cmnGrpc.ClientOptions{
-		CommonName:    identity.CommonName,
-		ServerPubKeys: storage1ServerPublicKeys,
-		Certificates:  []tls.Certificate{*validator0Identity.TLSSentryClientCertificate},
-	}
-	conn, err = s.dial(storage1Address, opts)
-	if err != nil {
-		return fmt.Errorf("sentry: dial error: %w", err)
-	}
-	defer conn.Close()
-	storage1Client := storage.NewStorageClient(conn)
-	_, err = storage1Client.GetCheckpoints(ctx, emptyGetCheckpointsReq)
-	s.Logger.Debug("storage1.GetCheckpoints with validator0 cert", "err", err)
-	if status.Code(err) != codes.PermissionDenied {
-		return errors.New("storage1 checkpoint endpoint should deny connection with validator0 certificate")
-	}
-
-	// Check Storage-1 endpoint with Storage-0 client certificates.
-	opts = &cmnGrpc.ClientOptions{
-		CommonName:    identity.CommonName,
-		ServerPubKeys: storage1ServerPublicKeys,
-		Certificates:  []tls.Certificate{*storage0Identity.GetTLSCertificate()},
-	}
-	conn, err = s.dial(storage1Address, opts)
-	if err != nil {
-		return fmt.Errorf("sentry: dial error: %w", err)
-	}
-	defer conn.Close()
-	storage1Client = storage.NewStorageClient(conn)
-	_, err = storage1Client.GetCheckpoints(ctx, emptyGetCheckpointsReq)
-	s.Logger.Debug("storage1.GetCheckpoints with storage0 cert", "err", err)
-	if err != nil {
-		return errors.New("storage1 checkpoints endpoint should allow connection with storage0 certificate")
-	}
-
-	// Sanity check Sentry-4 storage endpoint. All nodes are allowed to access
-	// storage sentry read only endpoints. Only active storage committee nodes
-	// are allowed to access checkpoint endpoints.
-
-	// Check Sentry-4 storage endpoint with Validator-0 client certificates.
-	opts = &cmnGrpc.ClientOptions{
-		CommonName: identity.CommonName,
-		ServerPubKeys: map[signature.PublicKey]bool{
-			sentry4.GetTLSPubKey(): true,
-		},
-		Certificates: []tls.Certificate{*validator0Identity.TLSSentryClientCertificate},
-	}
-	conn, err = s.dial(sentry4Address, opts)
-	if err != nil {
-		return fmt.Errorf("sentry: dial error: %w", err)
-	}
-	defer conn.Close()
-	sentry4Client := storage.NewStorageClient(conn)
-	_, err = sentry4Client.SyncGet(ctx, &storage.GetRequest{})
-	s.Logger.Debug("sentry4.SyncGet with validator0 sentry cert", "err", err)
-	// XXX: since we make an invalid request the request does fail, but ensure
-	// it makes past access control.
-	if status.Code(err) == codes.PermissionDenied {
-		return errors.New("sentry4 storage read-only endpoint should allow connections with validator0 certificate")
-	}
-	_, err = sentry4Client.GetCheckpoints(ctx, emptyGetCheckpointsReq)
-	s.Logger.Debug("sentry4.GetCheckpoints with validator0 sentry cert", "err", err)
-	if status.Code(err) != codes.PermissionDenied {
-		return errors.New("sentry4 storage checkpoint endpoint should deny connection with validator0 sentry certificate")
-	}
-
-	// Check Sentry-4 storage endpoint with Storage-0 client certificates.
-	opts = &cmnGrpc.ClientOptions{
-		CommonName: identity.CommonName,
-		ServerPubKeys: map[signature.PublicKey]bool{
-			sentry4.GetTLSPubKey(): true,
-		},
-		Certificates: []tls.Certificate{*storage0Identity.GetTLSCertificate()},
-	}
-	conn, err = s.dial(sentry4Address, opts)
-	if err != nil {
-		return fmt.Errorf("sentry: dial error: %w", err)
-	}
-	defer conn.Close()
-	sentry4Client = storage.NewStorageClient(conn)
-	_, err = sentry4Client.SyncGet(ctx, &storage.GetRequest{})
-	s.Logger.Debug("sentry4.SyncGet with storage0 cert", "err", err)
-	// XXX: since we make an invalid request the request does fail, but ensure
-	// it makes past access control.
-	if status.Code(err) == codes.PermissionDenied {
-		return errors.New("sentry4 storage read-only endpoint should allow connections with validator0 certificate")
-	}
-	_, err = sentry4Client.GetCheckpoints(ctx, emptyGetCheckpointsReq)
-	s.Logger.Debug("sentry4.GetCheckpoints with storage0 cert", "err", err)
-	if err != nil {
-		return errors.New("sentry4 storage checkpoints endpoint should allow connection with storage0 certificate")
-	}
-
 	// Sanity check validator peers - only sentry nodes should be present.
 	// Expected consensus peers.
 	validator0ExpectedPeerKeys := []string{
-		strings.ToLower(crypto.PublicKeyToTendermint(&sentry0P2PPubkey).Address().String()),
-		strings.ToLower(crypto.PublicKeyToTendermint(&sentry1P2PPubkey).Address().String()),
+		strings.ToLower(crypto.PublicKeyToCometBFT(&sentry0P2PPubkey).Address().String()),
+		strings.ToLower(crypto.PublicKeyToCometBFT(&sentry1P2PPubkey).Address().String()),
 	}
 	validator12ExpectedPeerKeys := []string{
-		strings.ToLower(crypto.PublicKeyToTendermint(&sentry2P2PPubkey).Address().String()),
+		strings.ToLower(crypto.PublicKeyToCometBFT(&sentry2P2PPubkey).Address().String()),
 	}
 
 	// Sanity check validator0.
@@ -416,7 +269,7 @@ func (s *sentryImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 	if err != nil {
 		return fmt.Errorf("validator0.GetStatus: %w", err)
 	}
-	validator0ConsensusPeers := consensusTendermintAddrs(validator0Status)
+	validator0ConsensusPeers := consensusCometBFTAddrs(validator0Status)
 	if err = sanityCheckValidatorPeers(validator0ExpectedPeerKeys, validator0ConsensusPeers); err != nil {
 		s.Logger.Error("validator0 invalid consensus peers",
 			"expected", validator0ExpectedPeerKeys,
@@ -430,7 +283,7 @@ func (s *sentryImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 	if err != nil {
 		return fmt.Errorf("validator1.GetStatus: %w", err)
 	}
-	validator1ConsensusPeers := consensusTendermintAddrs(validator1Status)
+	validator1ConsensusPeers := consensusCometBFTAddrs(validator1Status)
 	if err = sanityCheckValidatorPeers(validator12ExpectedPeerKeys, validator1ConsensusPeers); err != nil {
 		s.Logger.Error("validator1 invalid consensus peers",
 			"expected", validator12ExpectedPeerKeys,
@@ -444,7 +297,7 @@ func (s *sentryImpl) Run(childEnv *env.Env) error { // nolint: gocyclo
 	if err != nil {
 		return fmt.Errorf("validator2.GetStatus: %w", err)
 	}
-	validator2ConsensusPeers := consensusTendermintAddrs(validator2Status)
+	validator2ConsensusPeers := consensusCometBFTAddrs(validator2Status)
 	if err = sanityCheckValidatorPeers(validator12ExpectedPeerKeys, validator2ConsensusPeers); err != nil {
 		s.Logger.Error("validator2 invalid consensus peers",
 			"expected", validator12ExpectedPeerKeys,
@@ -463,8 +316,8 @@ func loadSentryNodeInfo(s *oasis.Sentry) (*oasis.Sentry, string, string, signatu
 	return s, sentryAddress, sentryCtrlAddress, sentryP2PPubkey
 }
 
-func consensusTendermintAddrs(status *control.Status) (consensusPeers []string) {
-	for _, np := range status.Consensus.NodePeers {
+func consensusCometBFTAddrs(status *control.Status) (consensusPeers []string) {
+	for _, np := range status.Consensus.P2P.Peers {
 		consensusPeers = append(consensusPeers, strings.Split(np, "@")[0])
 	}
 	return

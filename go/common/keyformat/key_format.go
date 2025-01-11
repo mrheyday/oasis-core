@@ -4,6 +4,7 @@ import (
 	"encoding"
 	"encoding/binary"
 	"fmt"
+	"sync"
 )
 
 // CustomFormat specifies a custom encoding format for a key element.
@@ -31,6 +32,39 @@ func (m *elementMeta) checkSize(index, size int) {
 			m.size,
 		))
 	}
+}
+
+// Namespace is a tool for constructing unique key formats within a namespace.
+type Namespace struct {
+	namespace string
+
+	mu       sync.Mutex
+	prefixes map[byte]struct{}
+}
+
+// NewNamespace constructs a new key format namespace.
+func NewNamespace(namespace string) *Namespace {
+	return &Namespace{
+		namespace: namespace,
+		prefixes:  make(map[byte]struct{}),
+	}
+}
+
+// New constructs a new key format.
+//
+// The prefix must be unique; otherwise, this method will panic.
+func (f *Namespace) New(prefix byte, layout ...interface{}) *KeyFormat {
+	func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		if _, ok := f.prefixes[prefix]; ok {
+			panic(fmt.Errorf("key format: already registered: namespace %s, prefix 0x%x", f.namespace, prefix))
+		}
+		f.prefixes[prefix] = struct{}{}
+	}()
+
+	return New(prefix, layout...)
 }
 
 // KeyFormat is a key formatting helper to be used together with key-value
@@ -72,6 +106,11 @@ func New(prefix byte, layout ...interface{}) *KeyFormat {
 // Size returns the minimum size in bytes of the resulting key.
 func (k *KeyFormat) Size() int {
 	return 1 + k.size
+}
+
+// Prefix returns the key format's prefix byte.
+func (k *KeyFormat) Prefix() byte {
+	return k.prefix
 }
 
 // Encode encodes values into a key.
@@ -118,9 +157,15 @@ func (k *KeyFormat) Encode(values ...interface{}) []byte {
 		case *uint8:
 			meta.checkSize(i, 1)
 			buf[0] = *t
-		case uint32:
+		case uint16:
 			// Use big endian encoding so the keys sort correctly when doing
 			// range queries.
+			meta.checkSize(i, 2)
+			binary.BigEndian.PutUint16(buf, t)
+		case *uint16:
+			meta.checkSize(i, 2)
+			binary.BigEndian.PutUint16(buf, *t)
+		case uint32:
 			meta.checkSize(i, 4)
 			binary.BigEndian.PutUint32(buf, t)
 		case *uint32:
@@ -151,6 +196,9 @@ func (k *KeyFormat) Encode(values ...interface{}) []byte {
 			if err != nil {
 				panic(fmt.Sprintf("key format: failed to marshal element %d: %s", i, err))
 			}
+			if len(data) != meta.size {
+				panic(fmt.Sprintf("key format: unexpected marshalled size %d for element %d", len(data), i))
+			}
 
 			copy(buf[:], data)
 		case []byte:
@@ -174,6 +222,9 @@ func (k *KeyFormat) Encode(values ...interface{}) []byte {
 //
 // Returns false and doesn't modify the passed values if the key prefix
 // doesn't match.
+//
+// *NOTE:* If decoding fails for one of the values, previous values
+// will be modified.
 func (k *KeyFormat) Decode(data []byte, values ...interface{}) bool {
 	if data[0] != k.prefix {
 		return false
@@ -201,9 +252,12 @@ func (k *KeyFormat) Decode(data []byte, values ...interface{}) bool {
 		case *uint8:
 			meta.checkSize(i, 1)
 			*t = buf[0]
-		case *uint32:
+		case *uint16:
 			// Use big endian encoding so the keys sort correctly when doing
 			// range queries.
+			meta.checkSize(i, 2)
+			*t = binary.BigEndian.Uint16(buf)
+		case *uint32:
 			meta.checkSize(i, 4)
 			*t = binary.BigEndian.Uint32(buf)
 		case *uint64:
@@ -220,12 +274,12 @@ func (k *KeyFormat) Decode(data []byte, values ...interface{}) bool {
 				err = t.UnmarshalBinary(buf)
 			}
 			if err != nil {
-				panic(fmt.Sprintf("key format: failed to unmarshal: %s", err))
+				return false
 			}
 		case *[]byte:
 			if meta.custom != nil {
 				if err := meta.custom.UnmarshalBinary(t, buf); err != nil {
-					panic(fmt.Sprintf("key format: failed to unmarshal: %s", err))
+					return false
 				}
 			} else {
 				meta.checkSize(i, -1)
@@ -246,6 +300,10 @@ func (k *KeyFormat) getElementMeta(l interface{}) *elementMeta {
 		return &elementMeta{size: 1}
 	case *uint8:
 		return &elementMeta{size: 1}
+	case uint16:
+		return &elementMeta{size: 2}
+	case *uint16:
+		return &elementMeta{size: 2}
 	case uint32:
 		return &elementMeta{size: 4}
 	case *uint32:

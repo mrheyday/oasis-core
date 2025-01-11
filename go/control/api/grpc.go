@@ -72,7 +72,7 @@ var (
 	}
 )
 
-func handlerRequestShutdown( // nolint: golint
+func handlerRequestShutdown(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -95,10 +95,10 @@ func handlerRequestShutdown( // nolint: golint
 	return interceptor(ctx, wait, info, handler)
 }
 
-func handlerWaitSync( // nolint: golint
+func handlerWaitSync(
 	srv interface{},
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
 	if interceptor == nil {
@@ -108,16 +108,16 @@ func handlerWaitSync( // nolint: golint
 		Server:     srv,
 		FullMethod: methodWaitSync.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ interface{}) (interface{}, error) {
 		return nil, srv.(NodeController).WaitSync(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerIsSynced( // nolint: golint
+func handlerIsSynced(
 	srv interface{},
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
 	if interceptor == nil {
@@ -127,16 +127,16 @@ func handlerIsSynced( // nolint: golint
 		Server:     srv,
 		FullMethod: methodIsSynced.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ interface{}) (interface{}, error) {
 		return srv.(NodeController).IsSynced(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerWaitReady( // nolint: golint
+func handlerWaitReady(
 	srv interface{},
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
 	if interceptor == nil {
@@ -146,16 +146,16 @@ func handlerWaitReady( // nolint: golint
 		Server:     srv,
 		FullMethod: methodWaitReady.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ interface{}) (interface{}, error) {
 		return nil, srv.(NodeController).WaitReady(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerIsReady( // nolint: golint
+func handlerIsReady(
 	srv interface{},
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
 	if interceptor == nil {
@@ -165,13 +165,13 @@ func handlerIsReady( // nolint: golint
 		Server:     srv,
 		FullMethod: methodIsSynced.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ interface{}) (interface{}, error) {
 		return srv.(NodeController).IsReady(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerUpgradeBinary( // nolint: golint
+func handlerUpgradeBinary(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -194,29 +194,33 @@ func handlerUpgradeBinary( // nolint: golint
 	return interceptor(ctx, &descriptor, info, handler)
 }
 
-func handlerCancelUpgrade( // nolint: golint
+func handlerCancelUpgrade(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
+	var descriptor upgradeApi.Descriptor
+	if err := dec(&descriptor); err != nil {
+		return nil, err
+	}
 	if interceptor == nil {
-		return nil, srv.(NodeController).CancelUpgrade(ctx)
+		return nil, srv.(NodeController).CancelUpgrade(ctx, &descriptor)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
 		FullMethod: methodCancelUpgrade.FullName(),
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return nil, srv.(NodeController).CancelUpgrade(ctx)
+		return nil, srv.(NodeController).CancelUpgrade(ctx, req.(*upgradeApi.Descriptor))
 	}
-	return interceptor(ctx, nil, info, handler)
+	return interceptor(ctx, &descriptor, info, handler)
 }
 
-func handlerGetStatus( // nolint: golint
+func handlerGetStatus(
 	srv interface{},
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
 	if interceptor == nil {
@@ -226,7 +230,7 @@ func handlerGetStatus( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetStatus.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ interface{}) (interface{}, error) {
 		return srv.(NodeController).GetStatus(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
@@ -273,8 +277,8 @@ func (c *nodeControllerClient) UpgradeBinary(ctx context.Context, descriptor *up
 	return c.conn.Invoke(ctx, methodUpgradeBinary.FullName(), descriptor, nil)
 }
 
-func (c *nodeControllerClient) CancelUpgrade(ctx context.Context) error {
-	return c.conn.Invoke(ctx, methodCancelUpgrade.FullName(), nil, nil)
+func (c *nodeControllerClient) CancelUpgrade(ctx context.Context, descriptor *upgradeApi.Descriptor) error {
+	return c.conn.Invoke(ctx, methodCancelUpgrade.FullName(), descriptor, nil)
 }
 
 func (c *nodeControllerClient) GetStatus(ctx context.Context) (*Status, error) {

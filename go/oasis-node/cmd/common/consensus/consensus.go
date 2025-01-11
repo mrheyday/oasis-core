@@ -3,15 +3,14 @@ package consensus
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	signerFile "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/file"
 	signerPlugin "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/plugin"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
@@ -58,7 +57,7 @@ func AssertTxFileOK() {
 }
 
 func InitGenesis() *genesisAPI.Document {
-	genesis, err := genesisFile.DefaultFileProvider()
+	genesis, err := genesisFile.NewFileProvider(cmdFlags.GenesisFile())
 	if err != nil {
 		logger.Error("failed to load genesis file",
 			"err", err,
@@ -93,10 +92,10 @@ func GetTxNonceAndFee() (uint64, *transaction.Fee) {
 	return nonce, &fee
 }
 
-func SignAndSaveTx(ctx context.Context, tx *transaction.Transaction) {
+func SignAndSaveTx(ctx context.Context, tx *transaction.Transaction, signer signature.Signer) {
 	if viper.GetBool(CfgTxUnsigned) {
 		rawUnsignedTx := cbor.Marshal(tx)
-		if err := ioutil.WriteFile(viper.GetString(CfgTxFile), rawUnsignedTx, 0o600); err != nil {
+		if err := os.WriteFile(viper.GetString(CfgTxFile), rawUnsignedTx, 0o600); err != nil {
 			logger.Error("failed to save unsigned transaction",
 				"err", err,
 			)
@@ -105,21 +104,17 @@ func SignAndSaveTx(ctx context.Context, tx *transaction.Transaction) {
 		return
 	}
 
-	entityDir, err := cmdSigner.CLIDirOrPwd()
-	if err != nil {
-		logger.Error("failed to retrieve signer dir",
-			"err", err,
-		)
-		os.Exit(1)
+	if signer == nil {
+		var err error
+		_, signer, err = cmdCommon.LoadEntitySigner()
+		if err != nil {
+			logger.Error("failed to load signer",
+				"err", err,
+			)
+			os.Exit(1)
+		}
+		defer signer.Reset()
 	}
-	_, signer, err := cmdCommon.LoadEntity(cmdSigner.Backend(), entityDir)
-	if err != nil {
-		logger.Error("failed to load account entity",
-			"err", err,
-		)
-		os.Exit(1)
-	}
-	defer signer.Reset()
 
 	fmt.Printf("You are about to sign the following transaction:\n")
 	tx.PrettyPrint(ctx, "  ", os.Stdout)
@@ -145,15 +140,15 @@ func SignAndSaveTx(ctx context.Context, tx *transaction.Transaction) {
 		os.Exit(1)
 	}
 
-	rawTx, err := json.Marshal(sigTx)
+	prettySigTx, err := cmdCommon.PrettyJSONMarshal(sigTx)
 	if err != nil {
-		logger.Error("failed to marshal transaction",
+		logger.Error("failed to get pretty JSON of signed transaction",
 			"err", err,
 		)
 		os.Exit(1)
 	}
-	if err = ioutil.WriteFile(viper.GetString(CfgTxFile), rawTx, 0o600); err != nil {
-		logger.Error("failed to save transaction",
+	if err = os.WriteFile(viper.GetString(CfgTxFile), prettySigTx, 0o600); err != nil {
+		logger.Error("failed to save signed transaction",
 			"err", err,
 		)
 		os.Exit(1)

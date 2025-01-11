@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 )
@@ -27,6 +28,9 @@ type Parameters struct { // nolint: maligned
 	MaxBlockGas     transaction.Gas `json:"max_block_gas"`
 	MaxEvidenceSize uint64          `json:"max_evidence_size"`
 
+	// MinGasPrice is the minimum gas price.
+	MinGasPrice uint64 `json:"min_gas_price,omitempty"`
+
 	// StateCheckpointInterval is the expected state checkpoint interval (in blocks).
 	StateCheckpointInterval uint64 `json:"state_checkpoint_interval"`
 	// StateCheckpointNumKept is the expected minimum number of state checkpoints to keep.
@@ -39,6 +43,20 @@ type Parameters struct { // nolint: maligned
 
 	// PublicKeyBlacklist is the network-wide public key blacklist.
 	PublicKeyBlacklist []signature.PublicKey `json:"public_key_blacklist,omitempty"`
+
+	// FeatureVersion represents the latest consensus-breaking software version
+	// that follows calendar versioning (yy.minor[.micro]).
+	FeatureVersion *version.Version `json:"feature_version,omitempty"`
+}
+
+// IsFeatureVersion returns true iff the consensus feature version is high
+// enough for the feature to be enabled.
+func (p *Parameters) IsFeatureVersion(minVersion version.Version) bool {
+	if p.FeatureVersion == nil {
+		return false
+	}
+
+	return p.FeatureVersion.ToU64() >= minVersion.ToU64()
 }
 
 const (

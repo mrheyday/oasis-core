@@ -10,11 +10,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/sgx"
 	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
+	"github.com/oasisprotocol/oasis-core/go/keymanager/secrets"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host"
 	"github.com/oasisprotocol/oasis-core/go/runtime/host/protocol"
 )
@@ -31,8 +34,18 @@ const (
 // mockMessageHandler is a mock message handler which only implements a small subset of methods.
 type mockMessageHandler struct{}
 
-// Implements host.Handler.
-func (h *mockMessageHandler) Handle(ctx context.Context, body *protocol.Body) (*protocol.Body, error) {
+// Implements host.RuntimeHandler.
+func (h *mockMessageHandler) NewSubHandler(host.CompositeRuntime, *bundle.Component) (host.RuntimeHandler, error) {
+	return nil, fmt.Errorf("method not supported")
+}
+
+// Implements host.RuntimeHandler.
+func (h *mockMessageHandler) AttachRuntime(host.Runtime) error {
+	return nil
+}
+
+// Implements host.RuntimeHandler.
+func (h *mockMessageHandler) Handle(context.Context, *protocol.Body) (*protocol.Body, error) {
 	return nil, fmt.Errorf("method not supported")
 }
 
@@ -78,17 +91,22 @@ func TestProvisioner(
 	}
 }
 
-func mockKeyManagerPolicyRequest() (*protocol.Body, error) {
-	// Generate a dummy key manager policy for tests.
-	policy := keymanager.PolicySGX{
-		Serial:   1,
-		Enclaves: map[sgx.EnclaveIdentity]*keymanager.EnclavePolicySGX{},
+func mockRuntimeKeyManagerStatusUpdateRequest() (*protocol.Body, error) {
+	// Generate a dummy key manager status for tests.
+	var keymanagerID common.Namespace
+	if err := keymanagerID.UnmarshalHex("c000000000000000fffffffffffffffffffffffffffffffffffffffffffffffe"); err != nil {
+		return nil, err
 	}
-	sigPolicy := keymanager.SignedPolicySGX{
+
+	policy := secrets.PolicySGX{
+		Serial:   1,
+		Enclaves: map[sgx.EnclaveIdentity]*secrets.EnclavePolicySGX{},
+	}
+	sigPolicy := secrets.SignedPolicySGX{
 		Policy: policy,
 	}
 	for _, signer := range keymanager.TestSigners[1:] {
-		sig, err := signature.Sign(signer, keymanager.PolicySGXSignatureContext, cbor.Marshal(policy))
+		sig, err := signature.Sign(signer, secrets.PolicySGXSignatureContext, cbor.Marshal(policy))
 		if err != nil {
 			return nil, fmt.Errorf("failed to sign mock policy: %w", err)
 		}
@@ -96,21 +114,31 @@ func mockKeyManagerPolicyRequest() (*protocol.Body, error) {
 		sigPolicy.Signatures = append(sigPolicy.Signatures, *sig)
 	}
 
-	return &protocol.Body{RuntimeKeyManagerPolicyUpdateRequest: &protocol.RuntimeKeyManagerPolicyUpdateRequest{
-		SignedPolicyRaw: cbor.Marshal(sigPolicy),
+	status := secrets.Status{
+		ID:            keymanagerID,
+		IsInitialized: true,
+		IsSecure:      true,
+		Generation:    1,
+		RotationEpoch: 0,
+		Checksum:      []byte{1, 2, 3},
+		Nodes:         nil,
+		Policy:        &sigPolicy,
+		RSK:           nil,
+	}
+
+	return &protocol.Body{RuntimeKeyManagerStatusUpdateRequest: &protocol.RuntimeKeyManagerStatusUpdateRequest{
+		Status: status,
 	}}, nil
 }
 
 func testBasic(t *testing.T, cfg host.Config, p host.Provisioner) {
 	require := require.New(t)
 
-	r, err := p.NewRuntime(context.Background(), cfg)
+	r, err := p.NewRuntime(cfg)
 	require.NoError(err, "NewRuntime")
-	err = r.Start()
-	require.NoError(err, "Start")
+	r.Start()
 
-	evCh, sub, err := r.WatchEvents(context.Background())
-	require.NoError(err, "WatchEvents")
+	evCh, sub := r.WatchEvents()
 	defer sub.Close()
 
 	// Wait for a successful start event.
@@ -129,12 +157,14 @@ func testBasic(t *testing.T, cfg host.Config, p host.Provisioner) {
 	require.NoError(err, "Call")
 	require.NotNil(rsp.Empty, "runtime response to RuntimePingRequest should return an Empty body")
 
-	req, err := mockKeyManagerPolicyRequest()
-	require.NoError(err, "mockKeyManagerPolicyRequest")
+	// FIXME: Remove or replace this call, as the mockMessageHandler cannot
+	//        handle HostFetchConsensusBlockRequest.
+	req, err := mockRuntimeKeyManagerStatusUpdateRequest()
+	require.NoError(err, "mockKeyManagerStatusRequest")
 
 	rsp, err = r.Call(ctx, req)
-	require.NoError(err, "KeyManagerPolicyRequest Call")
-	require.NotNil(rsp.RuntimeKeyManagerPolicyUpdateResponse, "runtime response to KeyManagerPolicyRequest should return an RuntimeKeyManagerPolicyUpdateResponse body")
+	require.NoError(err, "KeyManagerStatusRequest Call")
+	require.NotNil(rsp.RuntimeKeyManagerStatusUpdateResponse, "runtime response to RuntimeKeyManagerStatusUpdate should return a RuntimeKeyManagerStatusUpdateResponse body")
 
 	// Request the runtime to stop.
 	r.Stop()
@@ -151,14 +181,12 @@ func testBasic(t *testing.T, cfg host.Config, p host.Provisioner) {
 func testRestart(t *testing.T, cfg host.Config, p host.Provisioner) {
 	require := require.New(t)
 
-	r, err := p.NewRuntime(context.Background(), cfg)
+	r, err := p.NewRuntime(cfg)
 	require.NoError(err, "NewRuntime")
-	err = r.Start()
-	require.NoError(err, "Start")
+	r.Start()
 	defer r.Stop()
 
-	evCh, sub, err := r.WatchEvents(context.Background())
-	require.NoError(err, "WatchEvents")
+	evCh, sub := r.WatchEvents()
 	defer sub.Close()
 
 	// Wait for a successful start event.
@@ -170,6 +198,7 @@ func testRestart(t *testing.T, cfg host.Config, p host.Provisioner) {
 	}
 
 	// Trigger a force abort (should restart the runtime).
+	// FIXME: Runtimes do not support abort requests anymore.
 	err = r.Abort(context.Background(), true)
 	require.NoError(err, "Abort(force=true)")
 

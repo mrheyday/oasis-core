@@ -28,13 +28,15 @@ var (
 	// methodGetNodes is the GetNodes method.
 	methodGetNodes = serviceName.NewMethod("GetNodes", int64(0))
 	// methodGetRuntime is the GetRuntime method.
-	methodGetRuntime = serviceName.NewMethod("GetRuntime", NamespaceQuery{})
+	methodGetRuntime = serviceName.NewMethod("GetRuntime", GetRuntimeQuery{})
 	// methodGetRuntimes is the GetRuntimes method.
-	methodGetRuntimes = serviceName.NewMethod("GetRuntimes", int64(0))
+	methodGetRuntimes = serviceName.NewMethod("GetRuntimes", GetRuntimesQuery{})
 	// methodStateToGenesis is the StateToGenesis method.
 	methodStateToGenesis = serviceName.NewMethod("StateToGenesis", int64(0))
 	// methodGetEvents is the GetEvents method.
 	methodGetEvents = serviceName.NewMethod("GetEvents", int64(0))
+	// methodConsensusParameters is the ConsensusParameters method.
+	methodConsensusParameters = serviceName.NewMethod("ConsensusParameters", int64(0))
 
 	// methodWatchEntities is the WatchEntities method.
 	methodWatchEntities = serviceName.NewMethod("WatchEntities", nil)
@@ -44,6 +46,8 @@ var (
 	methodWatchNodeList = serviceName.NewMethod("WatchNodeList", nil)
 	// methodWatchRuntimes is the WatchRuntimes method.
 	methodWatchRuntimes = serviceName.NewMethod("WatchRuntimes", nil)
+	// methodWatchEvents is the WatchEvents method.
+	methodWatchEvents = serviceName.NewMethod("WatchEvents", nil)
 
 	// serviceDesc is the gRPC service descriptor.
 	serviceDesc = grpc.ServiceDesc{
@@ -90,6 +94,10 @@ var (
 				MethodName: methodGetEvents.ShortName(),
 				Handler:    handlerGetEvents,
 			},
+			{
+				MethodName: methodConsensusParameters.ShortName(),
+				Handler:    handlerConsensusParameters,
+			},
 		},
 		Streams: []grpc.StreamDesc{
 			{
@@ -112,11 +120,16 @@ var (
 				Handler:       handlerWatchRuntimes,
 				ServerStreams: true,
 			},
+			{
+				StreamName:    methodWatchEvents.ShortName(),
+				Handler:       handlerWatchEvents,
+				ServerStreams: true,
+			},
 		},
 	}
 )
 
-func handlerGetEntity( // nolint: golint
+func handlerGetEntity(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -139,7 +152,7 @@ func handlerGetEntity( // nolint: golint
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerGetEntities( // nolint: golint
+func handlerGetEntities(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -162,7 +175,7 @@ func handlerGetEntities( // nolint: golint
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerGetNode( // nolint: golint
+func handlerGetNode(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -185,7 +198,7 @@ func handlerGetNode( // nolint: golint
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerGetNodeByConsensusAddress( // nolint: golint
+func handlerGetNodeByConsensusAddress(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -208,7 +221,7 @@ func handlerGetNodeByConsensusAddress( // nolint: golint
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerGetNodeStatus( // nolint: golint
+func handlerGetNodeStatus(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -231,7 +244,7 @@ func handlerGetNodeStatus( // nolint: golint
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerGetNodes( // nolint: golint
+func handlerGetNodes(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -254,13 +267,13 @@ func handlerGetNodes( // nolint: golint
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerGetRuntime( // nolint: golint
+func handlerGetRuntime(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
-	var query NamespaceQuery
+	var query GetRuntimeQuery
 	if err := dec(&query); err != nil {
 		return nil, err
 	}
@@ -272,12 +285,12 @@ func handlerGetRuntime( // nolint: golint
 		FullMethod: methodGetRuntime.FullName(),
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(Backend).GetRuntime(ctx, req.(*NamespaceQuery))
+		return srv.(Backend).GetRuntime(ctx, req.(*GetRuntimeQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerGetRuntimes( // nolint: golint
+func handlerGetRuntimes(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -300,7 +313,7 @@ func handlerGetRuntimes( // nolint: golint
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerStateToGenesis( // nolint: golint
+func handlerStateToGenesis(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -323,7 +336,7 @@ func handlerStateToGenesis( // nolint: golint
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerGetEvents( // nolint: golint
+func handlerGetEvents(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -342,6 +355,29 @@ func handlerGetEvents( // nolint: golint
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(Backend).GetEvents(ctx, req.(int64))
+	}
+	return interceptor(ctx, height, info, handler)
+}
+
+func handlerConsensusParameters(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var height int64
+	if err := dec(&height); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).ConsensusParameters(ctx, height)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodConsensusParameters.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(Backend).ConsensusParameters(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
@@ -449,6 +485,33 @@ func handlerWatchRuntimes(srv interface{}, stream grpc.ServerStream) error {
 				return nil
 			}
 
+			if err := stream.SendMsg(ev); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func handlerWatchEvents(srv interface{}, stream grpc.ServerStream) error {
+	if err := stream.RecvMsg(nil); err != nil {
+		return err
+	}
+
+	ctx := stream.Context()
+	ch, sub, err := srv.(Backend).WatchEvents(ctx)
+	if err != nil {
+		return err
+	}
+	defer sub.Close()
+
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return nil
+			}
 			if err := stream.SendMsg(ev); err != nil {
 				return err
 			}
@@ -620,7 +683,7 @@ func (c *registryClient) WatchNodeList(ctx context.Context) (<-chan *NodeList, p
 	return ch, sub, nil
 }
 
-func (c *registryClient) GetRuntime(ctx context.Context, query *NamespaceQuery) (*Runtime, error) {
+func (c *registryClient) GetRuntime(ctx context.Context, query *GetRuntimeQuery) (*Runtime, error) {
 	var rsp Runtime
 	if err := c.conn.Invoke(ctx, methodGetRuntime.FullName(), query, &rsp); err != nil {
 		return nil, err
@@ -685,6 +748,49 @@ func (c *registryClient) GetEvents(ctx context.Context, height int64) ([]*Event,
 		return nil, err
 	}
 	return rsp, nil
+}
+
+func (c *registryClient) WatchEvents(ctx context.Context) (<-chan *Event, pubsub.ClosableSubscription, error) {
+	ctx, sub := pubsub.NewContextSubscription(ctx)
+
+	stream, err := c.conn.NewStream(ctx, &serviceDesc.Streams[0], methodWatchEvents.FullName())
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = stream.SendMsg(nil); err != nil {
+		return nil, nil, err
+	}
+	if err = stream.CloseSend(); err != nil {
+		return nil, nil, err
+	}
+
+	ch := make(chan *Event)
+	go func() {
+		defer close(ch)
+
+		for {
+			var ev Event
+			if serr := stream.RecvMsg(&ev); serr != nil {
+				return
+			}
+
+			select {
+			case ch <- &ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return ch, sub, nil
+}
+
+func (c *registryClient) ConsensusParameters(ctx context.Context, height int64) (*ConsensusParameters, error) {
+	var rsp ConsensusParameters
+	if err := c.conn.Invoke(ctx, methodConsensusParameters.FullName(), height, &rsp); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
 }
 
 func (c *registryClient) Cleanup() {

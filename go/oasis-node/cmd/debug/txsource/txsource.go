@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
@@ -13,9 +14,12 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/drbg"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/mathrand"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	fileSigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/file"
 	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
+	"github.com/oasisprotocol/oasis-core/go/consensus/pricediscovery"
 	"github.com/oasisprotocol/oasis-core/go/control/api"
 	genesisFile "github.com/oasisprotocol/oasis-core/go/genesis/file"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
@@ -25,9 +29,11 @@ import (
 )
 
 const (
-	CfgWorkload  = "workload"
-	CfgSeed      = "seed"
-	CfgTimeLimit = "time_limit"
+	CfgWorkload        = "workload"
+	CfgSeed            = "seed"
+	CfgTimeLimit       = "time_limit"
+	CfgGasPrice        = "gas_price"
+	CfgValidatorEntity = "validator_entity"
 )
 
 var (
@@ -39,8 +45,12 @@ var (
 	}
 )
 
-func doRun(cmd *cobra.Command, args []string) error {
+func doRun(cmd *cobra.Command, _ []string) error {
 	cmd.SilenceUsage = true
+
+	config.GlobalConfig.Common.Log.Level = make(map[string]string)
+	config.GlobalConfig.Common.Log.Level["default"] = "debug"
+	config.GlobalConfig.Common.Log.Format = "json"
 
 	if err := common.Init(); err != nil {
 		common.EarlyLogAndExit(err)
@@ -56,13 +66,13 @@ func doRun(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set up the genesis system for the signature system's chain context.
-	genesis, err := genesisFile.DefaultFileProvider()
+	genesis, err := genesisFile.NewFileProvider(cmdFlags.GenesisFile())
 	if err != nil {
-		return fmt.Errorf("genesisFile.DefaultFileProvider: %w", err)
+		return fmt.Errorf("genesis init failed: %w", err)
 	}
 	genesisDoc, err := genesis.GetGenesisDocument()
 	if err != nil {
-		return fmt.Errorf("genesis.GetGenesisDocument: %w", err)
+		return fmt.Errorf("genesis get document failed: %w", err)
 	}
 	logger.Debug("setting chain context", "chain_context", genesisDoc.ChainContext())
 	genesisDoc.SetChainContext()
@@ -91,8 +101,13 @@ func doRun(cmd *cobra.Command, args []string) error {
 	}
 	defer conn.Close()
 
-	// Set up the consensus client.
+	// Set up the consensus client and submission manager.
 	cnsc := consensus.NewConsensusClient(conn)
+	pd, err := pricediscovery.NewStatic(viper.GetUint64(CfgGasPrice))
+	if err != nil {
+		return fmt.Errorf("failed to create submission manager: %w", err)
+	}
+	sm := consensus.NewSubmissionManager(cnsc, pd, 0)
 
 	// Wait for sync before transferring control to the workload.
 	ncc := api.NewNodeControllerClient(conn)
@@ -112,13 +127,30 @@ func doRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("memory signer factory generate funding account %w", err)
 	}
 	if w.NeedsFunds() {
-		if err = workload.FundAccountFromTestEntity(ctx, logger, cnsc, fundingAccount); err != nil {
+		if err = workload.FundAccountFromTestEntity(ctx, cnsc, sm, fundingAccount); err != nil {
 			return fmt.Errorf("test entity account funding failure: %w", err)
 		}
 	}
 
+	// Load the validator entity paths if provided, some workloads need to make
+	// transactions as the validator entity.
+	var validatorEntities []signature.Signer
+	for _, p := range viper.GetStringSlice(CfgValidatorEntity) {
+		var fact signature.SignerFactory
+		fact, err = fileSigner.NewFactory(filepath.Dir(p), signature.SignerEntity)
+		if err != nil {
+			return fmt.Errorf("loading validator entity factory: %w", err)
+		}
+		var validatorEntity signature.Signer
+		validatorEntity, err = fact.Load(signature.SignerEntity)
+		if err != nil {
+			return fmt.Errorf("loading validator entity: %w", err)
+		}
+		validatorEntities = append(validatorEntities, validatorEntity)
+	}
+
 	logger.Debug("entering workload", "name", name)
-	if err = w.Run(ctx, rng, conn, cnsc, fundingAccount); err != nil {
+	if err = w.Run(ctx, rng, conn, cnsc, sm, fundingAccount, validatorEntities); err != nil {
 		logger.Error("workload error", "err", err)
 		return fmt.Errorf("workload %s: %w", name, err)
 	}
@@ -137,6 +169,8 @@ func init() {
 	fs.String(CfgWorkload, workload.NameTransfer, "Name of the workload to run (see source for listing)")
 	fs.String(CfgSeed, "seeeeeeeeeeeeeeeeeeeeeeeeeeeeeed", "Seed to use for randomized workloads")
 	fs.Duration(CfgTimeLimit, 0, "Exit successfully after this long, or 0 to run forever")
+	fs.Uint64(CfgGasPrice, 0, "Gas price to use for consensus transactions")
+	fs.StringSlice(CfgValidatorEntity, nil, "Paths to validator entities")
 	_ = viper.BindPFlags(fs)
 	txsourceCmd.Flags().AddFlagSet(fs)
 

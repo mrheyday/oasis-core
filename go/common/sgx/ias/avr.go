@@ -17,9 +17,6 @@ import (
 // NonceMaxLen is the maximum length of the AVR nonce.
 const NonceMaxLen = 32
 
-// requiredAVRVersion is the required AV report version.
-const requiredAVRVersion = 4
-
 var (
 	unsafeSkipVerify         bool
 	unsafeAllowDebugEnclaves bool
@@ -32,6 +29,12 @@ var (
 const TimestampFormat = "2006-01-02T15:04:05.999999999"
 
 var (
+	attestationTypeFwdMap = map[string]AttestationType{
+		"":     AttestationTypeFieldMissing,
+		"EPID": AttestationTypeEPID,
+	}
+	attestationTypeRevMap = make(map[AttestationType]string)
+
 	isvQuoteFwdMap = map[string]ISVEnclaveQuoteStatus{
 		"OK":                                    QuoteOK,
 		"SIGNATURE_INVALID":                     QuoteSignatureInvalid,
@@ -71,6 +74,57 @@ var (
 
 	mrSignerBlacklist = make(map[sgx.MrSigner]bool)
 )
+
+// QuotePolicy is the quote validity policy.
+type QuotePolicy struct {
+	// Disabled specifies whether IAS quotes are disabled and will always be rejected.
+	Disabled bool `json:"disabled,omitempty" yaml:"disabled,omitempty"`
+
+	// AllowedQuoteStatuses are the allowed quote statuses.
+	//
+	// Note: QuoteOK and QuoteSwHardeningNeeded are ALWAYS allowed, and do not need to be specified.
+	AllowedQuoteStatuses []ISVEnclaveQuoteStatus `json:"allowed_quote_statuses,omitempty" yaml:"allowed_quote_statuses,omitempty"`
+
+	// GIDBlackList is a list of blocked platform EPID group IDs.
+	GIDBlacklist []uint32 `json:"gid_blacklist,omitempty" yaml:"gid_blacklist,omitempty"`
+
+	// MinTCBEvaluationDataNumber is the minimum acceptable TCB Evaluation Data number,
+	// as used in the attestation verification report structure.
+	MinTCBEvaluationDataNumber uint32 `json:"min_tcb_evaluation_data_number,omitempty" yaml:"min_tcb_evaluation_data_number,omitempty"`
+}
+
+// AttestationType is the type of the SGX attestation.
+type AttestationType int
+
+// Predefined attestation types.
+const (
+	AttestationTypeFieldMissing AttestationType = iota
+	AttestationTypeEPID
+)
+
+// UnmarshalText implements the encoding.TextUnmarshaler interface.
+func (t *AttestationType) UnmarshalText(text []byte) error {
+	var ok bool
+
+	*t, ok = attestationTypeFwdMap[string(text)]
+	if !ok {
+		return fmt.Errorf("ias/avr: invalid attestation type: '%v'", string(text))
+	}
+	return nil
+}
+
+// MarshalText implements the encoding.TextMarshaler interface.
+func (t *AttestationType) MarshalText() ([]byte, error) {
+	str, ok := attestationTypeRevMap[*t]
+	if !ok {
+		return nil, fmt.Errorf("ias/avr: invalid attestation type: %v", int(*t))
+	}
+	return []byte(str), nil
+}
+
+func (t AttestationType) String() string {
+	return attestationTypeRevMap[t]
+}
 
 // ISVEnclaveQuoteStatus is the status of an enclave quote.
 type ISVEnclaveQuoteStatus int
@@ -190,26 +244,60 @@ type AVRBundle struct {
 
 // Open decodes and validates the AVR contained in the bundle, and returns
 // the Attestation Verification Report iff it is valid
-func (b *AVRBundle) Open(trustRoots *x509.CertPool, ts time.Time) (*AttestationVerificationReport, error) {
-	return DecodeAVR(b.Body, b.Signature, b.CertificateChain, trustRoots, ts)
+func (b *AVRBundle) Open(policy *QuotePolicy, trustRoots *x509.CertPool, ts time.Time) (*AttestationVerificationReport, error) {
+	if policy != nil && policy.Disabled {
+		return nil, fmt.Errorf("IAS quotes are disabled by policy")
+	}
+
+	avr, err := DecodeAVR(b.Body, b.Signature, b.CertificateChain, trustRoots, ts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify against policy.
+	if !avr.quoteStatusAllowed(policy) {
+		return nil, fmt.Errorf("quote status not allowed by policy")
+	}
+
+	// Check minimum TCB evaluation data number.
+	// If the report doesn't contain this number, it will be zeroed out in the structure.
+	if avr.TCBEvaluationDataNumber < policy.MinTCBEvaluationDataNumber {
+		return nil, fmt.Errorf("tcb evaluation data number not allowed by policy")
+	}
+
+	quote, err := avr.Quote()
+	if err != nil {
+		return nil, fmt.Errorf("quote open failure: %w", err)
+	}
+	// Validate EPID GID not blacklisted.
+	for _, blocked := range policy.GIDBlacklist {
+		if blocked == quote.Body.GID {
+			return nil, fmt.Errorf("blacklisted quote GID")
+		}
+	}
+
+	return avr, nil
 }
 
 // AttestationVerificationReport is a deserialized Attestation Verification
 // Report (AVR).
 type AttestationVerificationReport struct {
-	ID                    string                `json:"id"`
-	Timestamp             string                `json:"timestamp"`
-	Version               int                   `json:"version"`
-	ISVEnclaveQuoteStatus ISVEnclaveQuoteStatus `json:"isvEnclaveQuoteStatus"`
-	ISVEnclaveQuoteBody   []byte                `json:"isvEnclaveQuoteBody"`
-	RevocationReason      *CRLReason            `json:"revocationReason"`
-	PSEManifestStatus     *PSEManifestStatus    `json:"pseManifestStatus"`
-	PSEManifestHash       string                `json:"pseManifestHash"`
-	PlatformInfoBlob      string                `json:"platformInfoBlob"`
-	Nonce                 string                `json:"nonce"`
-	EPIDPseudonym         []byte                `json:"epidPseudonym"`
-	AdvisoryURL           string                `json:"advisoryURL"`
-	AdvisoryIDs           []string              `json:"advisoryIDs"`
+	ID                      string                `json:"id"`
+	Timestamp               string                `json:"timestamp"`
+	Version                 int                   `json:"version"`
+	AttestationType         AttestationType       `json:"attestationType,omitempty"`
+	ISVEnclaveQuoteStatus   ISVEnclaveQuoteStatus `json:"isvEnclaveQuoteStatus"`
+	ISVEnclaveQuoteBody     []byte                `json:"isvEnclaveQuoteBody"`
+	RevocationReason        *CRLReason            `json:"revocationReason"`
+	PSEManifestStatus       *PSEManifestStatus    `json:"pseManifestStatus"`
+	PSEManifestHash         string                `json:"pseManifestHash"`
+	PlatformInfoBlob        string                `json:"platformInfoBlob"`
+	Nonce                   string                `json:"nonce"`
+	EPIDPseudonym           []byte                `json:"epidPseudonym"`
+	AdvisoryURL             string                `json:"advisoryURL"`
+	AdvisoryIDs             []string              `json:"advisoryIDs"`
+	DocIDs                  []string              `json:"docIDs"`
+	TCBEvaluationDataNumber uint32                `json:"tcbEvaluationDataNumber,omitempty"`
 }
 
 // Quote decodes and returns the enclave quote component of an Attestation
@@ -222,6 +310,29 @@ func (a *AttestationVerificationReport) Quote() (*Quote, error) {
 	return &quote, nil
 }
 
+func (a *AttestationVerificationReport) quoteStatusAllowed(policy *QuotePolicy) bool {
+	status := a.ISVEnclaveQuoteStatus
+
+	// Always allow "OK" and "SW_HARDENING_NEEDED".
+	if status == QuoteOK || status == QuoteSwHardeningNeeded {
+		return true
+	}
+
+	if policy == nil {
+		return false
+	}
+
+	// Search through the constraints to see if the AVR quote status is
+	// explicitly allowed.
+	for _, v := range policy.AllowedQuoteStatuses {
+		if v == status {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (a *AttestationVerificationReport) validate() error { // nolint: gocyclo
 	const (
 		pseManifestHashLen = 32
@@ -232,8 +343,24 @@ func (a *AttestationVerificationReport) validate() error { // nolint: gocyclo
 		return fmt.Errorf("ias/avr: invalid timestamp: %w", err)
 	}
 
-	if a.Version != requiredAVRVersion {
-		return fmt.Errorf("ias/avr: invalid report version, got: %d, required: %d", a.Version, requiredAVRVersion)
+	switch a.Version {
+	case 4:
+		if a.AttestationType != AttestationTypeFieldMissing {
+			return fmt.Errorf(
+				"ias/avr: phantom attestation type %d (%s) in report version 4",
+				a.AttestationType, a.AttestationType.String(),
+			)
+		}
+	case 5:
+		// This field is mandatory according to the v5 spec, but in practice doesn't always show up in AVR jsons.
+		if a.AttestationType != AttestationTypeFieldMissing && a.AttestationType != AttestationTypeEPID {
+			return fmt.Errorf(
+				"ias/avr: unexpected attestation type %d in report version 5, expected %d (%s)",
+				a.AttestationType, AttestationTypeEPID, AttestationTypeEPID.String(),
+			)
+		}
+	default:
+		return fmt.Errorf("ias/avr: invalid report version, got: %d, required 4 or 5", a.Version)
 	}
 
 	if a.ISVEnclaveQuoteStatus == quoteFieldMissing {
@@ -330,9 +457,18 @@ func DecodeAVR(data, encodedSignature, encodedCertChain []byte, trustRoots *x509
 		}
 	}
 
+	return UnsafeDecodeAVR(data)
+}
+
+// UnsafeDecodeAVR decodes and validates an Attestation Verification Report,
+// but does not validate the signature.
+//
+// WARNING: This MUST only be used for diagnostic purposes.
+func UnsafeDecodeAVR(data []byte) (*AttestationVerificationReport, error) {
 	// Set the ISVEnclaveQuoteStatus to a sentinel value so that it is
 	// possible to detect it being missing from the JSON.
 	a := &AttestationVerificationReport{
+		AttestationType:       AttestationTypeFieldMissing,
 		ISVEnclaveQuoteStatus: quoteFieldMissing,
 	}
 
@@ -400,13 +536,13 @@ func SetSkipVerify() {
 	unsafeSkipVerify = true
 }
 
-// SetAllowDebugEnclave will enable running and communicating with enclaves
+// SetAllowDebugEnclaves will enable running and communicating with enclaves
 // with debug flag enabled in AVR for the remainder of the process' lifetime.
 func SetAllowDebugEnclaves() {
 	unsafeAllowDebugEnclaves = true
 }
 
-// UnsetAllowDebugEnclave will disable running and communicating with enclaves
+// UnsetAllowDebugEnclaves will disable running and communicating with enclaves
 // with debug flag enabled in AVR for the remainder of the process' lifetime.
 func UnsetAllowDebugEnclaves() {
 	unsafeAllowDebugEnclaves = false
@@ -428,6 +564,9 @@ func BuildMrSignerBlacklist(allowTestKeys bool) {
 }
 
 func init() {
+	for k, v := range attestationTypeFwdMap {
+		attestationTypeRevMap[v] = k
+	}
 	for k, v := range isvQuoteFwdMap {
 		isvQuoteRevMap[v] = k
 	}

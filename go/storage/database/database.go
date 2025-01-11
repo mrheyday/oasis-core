@@ -3,70 +3,61 @@ package database
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"slices"
+	"time"
 
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
-	nodedb "github.com/oasisprotocol/oasis-core/go/storage/mkvs/db/api"
-	badgerNodedb "github.com/oasisprotocol/oasis-core/go/storage/mkvs/db/badger"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/db"
+	dbApi "github.com/oasisprotocol/oasis-core/go/storage/mkvs/db/api"
 )
 
 const (
-	// BackendNameBadgerDB is the name of the BadgeDB backed database backend.
+	// BackendNameAuto is the name of the automatic backend detection "backend".
+	BackendNameAuto = "auto"
+	// BackendNameBadgerDB is the name of the BadgerDB backed database backend.
 	BackendNameBadgerDB = "badger"
+	// BackendNamePathBadger is the name of the PathBadger database backend.
+	BackendNamePathBadger = "pathbadger"
 
-	// DBFileBadgerDB is the default BadgerDB backing store filename.
-	DBFileBadgerDB = "mkvs_storage.badger.db"
+	// defaultBackendName is the default backend in case automatic backend detection is enabled and
+	// no previous backend exists.
+	defaultBackendName = BackendNamePathBadger
 
 	checkpointDir = "checkpoints"
 )
 
-// DefaultFileName returns the default database filename for the specified
-// backend.
+// DefaultFileName returns the default database filename for the specified backend.
 func DefaultFileName(backend string) string {
-	switch backend {
-	case BackendNameBadgerDB:
-		return DBFileBadgerDB
-	default:
-		panic("storage/database: can't get default filename for unknown backend")
-	}
+	return fmt.Sprintf("mkvs_storage.%s.db", backend)
 }
 
 type databaseBackend struct {
-	nodedb       nodedb.NodeDB
+	ndb          dbApi.NodeDB
 	checkpointer checkpoint.CreateRestorer
 	rootCache    *api.RootCache
 
-	signer signature.Signer
 	initCh chan struct{}
 
 	readOnly bool
 }
 
 // New constructs a new database backed storage Backend instance.
-func New(cfg *api.Config) (api.Backend, error) {
-	ndbCfg := cfg.ToNodeDB()
-
-	var (
-		ndb nodedb.NodeDB
-		err error
-	)
-	switch cfg.Backend {
-	case BackendNameBadgerDB:
-		ndb, err = badgerNodedb.New(ndbCfg)
-	default:
-		err = errors.New("storage/database: unsupported backend")
+func New(cfg *api.Config) (api.LocalBackend, error) {
+	if err := autoDetectBackend(cfg); err != nil {
+		return nil, err
 	}
+
+	ndb, err := db.New(cfg.Backend, cfg.ToNodeDB())
 	if err != nil {
 		return nil, fmt.Errorf("storage/database: failed to create node database: %w", err)
 	}
 
-	rootCache, err := api.NewRootCache(ndb, nil, cfg.ApplyLockLRUSlots, cfg.InsecureSkipChecks)
+	rootCache, err := api.NewRootCache(ndb)
 	if err != nil {
 		ndb.Close()
 		return nil, fmt.Errorf("storage/database: failed to create root cache: %w", err)
@@ -89,57 +80,16 @@ func New(cfg *api.Config) (api.Backend, error) {
 	}
 
 	return &databaseBackend{
-		nodedb:       ndb,
+		ndb:          ndb,
 		checkpointer: checkpoint.NewCreateRestorer(creator, restorer),
 		rootCache:    rootCache,
-		signer:       cfg.Signer,
 		initCh:       initCh,
 		readOnly:     cfg.ReadOnly,
 	}, nil
 }
 
-func (ba *databaseBackend) Apply(ctx context.Context, request *api.ApplyRequest) ([]*api.Receipt, error) {
-	if ba.readOnly {
-		return nil, fmt.Errorf("storage/database: failed to Apply: %w", api.ErrReadOnly)
-	}
-
-	newRoot, err := ba.rootCache.Apply(
-		ctx,
-		request.Namespace,
-		request.SrcRound,
-		request.SrcRoot,
-		request.DstRound,
-		request.DstRoot,
-		request.WriteLog,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("storage/database: failed to Apply: %w", err)
-	}
-
-	receipt, err := api.SignReceipt(ba.signer, request.Namespace, request.DstRound, []hash.Hash{*newRoot})
-	return []*api.Receipt{receipt}, err
-}
-
-func (ba *databaseBackend) ApplyBatch(ctx context.Context, request *api.ApplyBatchRequest) ([]*api.Receipt, error) {
-	if ba.readOnly {
-		return nil, fmt.Errorf("storage/database: failed to ApplyBatch: %w", api.ErrReadOnly)
-	}
-
-	newRoots := make([]hash.Hash, 0, len(request.Ops))
-	for _, op := range request.Ops {
-		newRoot, err := ba.rootCache.Apply(ctx, request.Namespace, op.SrcRound, op.SrcRoot, request.DstRound, op.DstRoot, op.WriteLog)
-		if err != nil {
-			return nil, fmt.Errorf("storage/database: failed to Apply, op: %w", err)
-		}
-		newRoots = append(newRoots, *newRoot)
-	}
-
-	receipt, err := api.SignReceipt(ba.signer, request.Namespace, request.DstRound, newRoots)
-	return []*api.Receipt{receipt}, err
-}
-
 func (ba *databaseBackend) Cleanup() {
-	ba.nodedb.Close()
+	ba.ndb.Close()
 }
 
 func (ba *databaseBackend) Initialized() <-chan struct{} {
@@ -147,7 +97,7 @@ func (ba *databaseBackend) Initialized() <-chan struct{} {
 }
 
 func (ba *databaseBackend) SyncGet(ctx context.Context, request *api.GetRequest) (*api.ProofResponse, error) {
-	tree, err := ba.rootCache.GetTree(ctx, request.Tree.Root)
+	tree, err := ba.rootCache.GetTree(request.Tree.Root)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +107,7 @@ func (ba *databaseBackend) SyncGet(ctx context.Context, request *api.GetRequest)
 }
 
 func (ba *databaseBackend) SyncGetPrefixes(ctx context.Context, request *api.GetPrefixesRequest) (*api.ProofResponse, error) {
-	tree, err := ba.rootCache.GetTree(ctx, request.Tree.Root)
+	tree, err := ba.rootCache.GetTree(request.Tree.Root)
 	if err != nil {
 		return nil, err
 	}
@@ -167,7 +117,7 @@ func (ba *databaseBackend) SyncGetPrefixes(ctx context.Context, request *api.Get
 }
 
 func (ba *databaseBackend) SyncIterate(ctx context.Context, request *api.IterateRequest) (*api.ProofResponse, error) {
-	tree, err := ba.rootCache.GetTree(ctx, request.Tree.Root)
+	tree, err := ba.rootCache.GetTree(request.Tree.Root)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +127,7 @@ func (ba *databaseBackend) SyncIterate(ctx context.Context, request *api.Iterate
 }
 
 func (ba *databaseBackend) GetDiff(ctx context.Context, request *api.GetDiffRequest) (api.WriteLogIterator, error) {
-	return ba.nodedb.GetWriteLog(ctx, request.StartRoot, request.EndRoot)
+	return ba.ndb.GetWriteLog(ctx, request.StartRoot, request.EndRoot)
 }
 
 func (ba *databaseBackend) GetCheckpoints(ctx context.Context, request *checkpoint.GetCheckpointsRequest) ([]*checkpoint.Metadata, error) {
@@ -188,10 +138,98 @@ func (ba *databaseBackend) GetCheckpointChunk(ctx context.Context, chunk *checkp
 	return ba.checkpointer.GetCheckpointChunk(ctx, chunk, w)
 }
 
+// Implements api.LocalBackend.
+func (ba *databaseBackend) Apply(ctx context.Context, request *api.ApplyRequest) error {
+	if ba.readOnly {
+		return fmt.Errorf("storage/database: failed to Apply: %w", api.ErrReadOnly)
+	}
+
+	oldRoot := api.Root{
+		Namespace: request.Namespace,
+		Version:   request.SrcRound,
+		Type:      request.RootType,
+		Hash:      request.SrcRoot,
+	}
+	expectedNewRoot := api.Root{
+		Namespace: request.Namespace,
+		Version:   request.DstRound,
+		Type:      request.RootType,
+		Hash:      request.DstRoot,
+	}
+	_, err := ba.rootCache.Apply(
+		ctx,
+		oldRoot,
+		expectedNewRoot,
+		request.WriteLog,
+	)
+	if err != nil {
+		return fmt.Errorf("storage/database: failed to Apply: %w", err)
+	}
+	return nil
+}
+
+// Implements api.LocalBackend.
 func (ba *databaseBackend) Checkpointer() checkpoint.CreateRestorer {
 	return ba.checkpointer
 }
 
-func (ba *databaseBackend) NodeDB() nodedb.NodeDB {
-	return ba.nodedb
+// Implements api.LocalBackend.
+func (ba *databaseBackend) NodeDB() dbApi.NodeDB {
+	return ba.ndb
+}
+
+// autoDetectBackend attempts automatic backend detection, modifying the configuration in place.
+func autoDetectBackend(cfg *api.Config) error {
+	if cfg.Backend != BackendNameAuto {
+		return nil
+	}
+
+	// Make sure that the DefaultFileName was used to derive the subdirectory. Otherwise automatic
+	// detection cannot be performed.
+	if filepath.Base(cfg.DB) != DefaultFileName(cfg.Backend) {
+		return fmt.Errorf("storage/database: 'auto' backend selected using a non-default path")
+	}
+
+	// Perform automatic database backend detection if selected. Detection will be based on existing
+	// database directories. If multiple directories are available, the most recently modified is
+	// selected.
+	type foundBackend struct {
+		path      string
+		timestamp time.Time
+		name      string
+	}
+	var backends []foundBackend
+
+	for _, b := range db.Backends {
+		// Generate expected filename for the given backend.
+		fn := DefaultFileName(b.Name())
+		maybeDb := filepath.Join(filepath.Dir(cfg.DB), fn)
+		fi, err := os.Stat(maybeDb)
+		if err != nil {
+			continue
+		}
+
+		backends = append(backends, foundBackend{
+			path:      maybeDb,
+			timestamp: fi.ModTime(),
+			name:      b.Name(),
+		})
+	}
+	slices.SortFunc(backends, func(a, b foundBackend) int {
+		return a.timestamp.Compare(b.timestamp)
+	})
+
+	// If no existing backends are available, use default.
+	if len(backends) == 0 {
+		cfg.Backend = defaultBackendName
+		cfg.DB = filepath.Join(filepath.Dir(cfg.DB), DefaultFileName(cfg.Backend))
+		return nil
+	}
+
+	// Otherwise, use the backend that has been updated most recently.
+	b := backends[len(backends)-1]
+	cfg.Backend = b.name
+	cfg.DB = b.path
+
+	return nil
 }

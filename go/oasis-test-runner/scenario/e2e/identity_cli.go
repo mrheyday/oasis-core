@@ -1,12 +1,12 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	fileSigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/file"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
-	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
+	cmdId "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/identity"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis/cli"
@@ -15,27 +15,27 @@ import (
 
 // IdentityCLI is the identity CLI scenario.
 var IdentityCLI scenario.Scenario = &identityCLIImpl{
-	E2E: *NewE2E("identity-cli"),
+	Scenario: *NewScenario("identity-cli"),
 }
 
 type identityCLIImpl struct {
-	E2E
+	Scenario
 
 	dataDir string
 }
 
 func (sc *identityCLIImpl) Clone() scenario.Scenario {
 	return &identityCLIImpl{
-		E2E:     sc.E2E.Clone(),
-		dataDir: sc.dataDir,
+		Scenario: *sc.Scenario.Clone().(*Scenario),
+		dataDir:  sc.dataDir,
 	}
 }
 
-func (sc *identityCLIImpl) PreInit(childEnv *env.Env) error {
+func (sc *identityCLIImpl) PreInit() error {
 	return nil
 }
 
-func (sc *identityCLIImpl) Init(childEnv *env.Env, net *oasis.Network) error {
+func (sc *identityCLIImpl) Init(childEnv *env.Env, _ *oasis.Network) error {
 	dataDir, err := childEnv.NewSubDir("test-identity")
 	if err != nil {
 		return fmt.Errorf("scenario/e2e/identity_cli: init failed to create subdir: %w", err)
@@ -49,11 +49,11 @@ func (sc *identityCLIImpl) Fixture() (*oasis.NetworkFixture, error) {
 	return nil, nil
 }
 
-func (sc *identityCLIImpl) Run(childEnv *env.Env) error {
+func (sc *identityCLIImpl) Run(_ context.Context, childEnv *env.Env) error {
 	// Provision node's identity.
 	args := []string{
 		"identity", "init",
-		"--" + common.CfgDataDir, sc.dataDir,
+		"--" + cmdId.CfgDataDir, sc.dataDir,
 	}
 	nodeBinary, _ := sc.Flags.GetString(cfgNodeBinary)
 	if err := cli.RunSubCommand(childEnv, sc.Logger, "identity-init", nodeBinary, args); err != nil {
@@ -69,10 +69,10 @@ func (sc *identityCLIImpl) Run(childEnv *env.Env) error {
 	if err := sc.showTLSPubkey(childEnv, true); err != nil {
 		return fmt.Errorf("scenario/e2e/identity_cli: %w", err)
 	}
-	if err := sc.tendermintShowAddress(childEnv, "node"); err != nil {
+	if err := sc.cmtShowAddress(childEnv, "node"); err != nil {
 		return fmt.Errorf("scenario/e2e/identity_cli: %w", err)
 	}
-	if err := sc.tendermintShowAddress(childEnv, "consensus"); err != nil {
+	if err := sc.cmtShowAddress(childEnv, "consensus"); err != nil {
 		return fmt.Errorf("scenario/e2e/identity_cli: %w", err)
 	}
 
@@ -82,7 +82,7 @@ func (sc *identityCLIImpl) Run(childEnv *env.Env) error {
 func (sc *identityCLIImpl) loadIdentity() error {
 	sc.Logger.Info("loading generated entity")
 
-	factory, err := fileSigner.NewFactory(sc.dataDir, signature.SignerNode, signature.SignerP2P, signature.SignerConsensus)
+	factory, err := fileSigner.NewFactory(sc.dataDir, identity.RequiredSignerRoles...)
 	if err != nil {
 		return fmt.Errorf("failed to create identity file signer: %w", err)
 	}
@@ -104,7 +104,7 @@ func (sc *identityCLIImpl) showTLSPubkey(childEnv *env.Env, sentry bool) error {
 
 	args := []string{
 		"identity", subCmd,
-		"--" + common.CfgDataDir, sc.dataDir,
+		"--" + cmdId.CfgDataDir, sc.dataDir,
 	}
 	nodeBinary, _ := sc.Flags.GetString(cfgNodeBinary)
 	if out, err := cli.RunSubCommandWithOutput(childEnv, sc.Logger, subCmd, nodeBinary, args); err != nil {
@@ -113,17 +113,17 @@ func (sc *identityCLIImpl) showTLSPubkey(childEnv *env.Env, sentry bool) error {
 	return nil
 }
 
-func (sc *identityCLIImpl) tendermintShowAddress(childEnv *env.Env, addrName string) error {
+func (sc *identityCLIImpl) cmtShowAddress(childEnv *env.Env, addrName string) error {
 	subCmd := fmt.Sprintf("show-%s-address", addrName)
-	sc.Logger.Info(fmt.Sprintf("running tendermint %s", subCmd))
+	sc.Logger.Info(fmt.Sprintf("running CometBFT %s", subCmd))
 
 	args := []string{
-		"identity", "tendermint", subCmd,
-		"--" + common.CfgDataDir, sc.dataDir,
+		"identity", "cometbft", subCmd,
+		"--" + cmdId.CfgDataDir, sc.dataDir,
 	}
 	nodeBinary, _ := sc.Flags.GetString(cfgNodeBinary)
 	if out, err := cli.RunSubCommandWithOutput(childEnv, sc.Logger, subCmd, nodeBinary, args); err != nil {
-		return fmt.Errorf("failed to get %s's tendermint address: error: %w output: %s", addrName, err, out.String())
+		return fmt.Errorf("failed to get %s's CometBFT address: error: %w output: %s", addrName, err, out.String())
 	}
 	return nil
 }

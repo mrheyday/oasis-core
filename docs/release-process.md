@@ -61,15 +61,20 @@ is being made to know which part of the project's version to bump.
 To customize the release process, one can set the following environment
 variables:
 
-- `OASIS_CORE_GIT_ORIGIN_REMOTE` (default: `origin`): Name of the git remote
-  pointing to the canonical upstream git repository.
+- `GIT_ORIGIN_REMOTE` (default: `origin`): Name of the git remote pointing to
+  the canonical upstream git repository.
 - `RELEASE_BRANCH` (default: `master`): Name of the branch where to tag the next
   release.
 
-[Make]: https://en.wikipedia.org/wiki/Make_\(software\)
-[Change Log]: ../CHANGELOG.md
-[Change Log Fragments]: ../.changelog/README.md
+<!-- markdownlint-disable line-length -->
+[Make]:
+  https://en.wikipedia.org/wiki/Make_\(software\)
+[Change Log]:
+  https://github.com/oasisprotocol/oasis-core/tree/master/CHANGELOG.md
+[Change Log Fragments]:
+  https://github.com/oasisprotocol/oasis-core/tree/master/.changelog/README.md
 [Versioning]: versioning.md
+<!-- markdownlint-enable line-length -->
 
 ## Preparing a Regular Release
 
@@ -79,51 +84,47 @@ Before a release, make sure that the proper protocol versions were bumped
 correctly (see [`go/common/version/version.go`]). If not, make a pull request
 that bumps the respective version(s) before proceeding with the release process.
 
-[`go/common/version/version.go`]: ../go/common/version/version.go
+<!-- markdownlint-disable line-length -->
+[`go/common/version/version.go`]:
+  https://github.com/oasisprotocol/oasis-core/tree/master/go/common/version/version.go
+<!-- markdownlint-enable line-length -->
 
 ### Prepare the Change Log
 
 Before a release, all [Change Log fragments] should be assembled into a new
 section of the [Change Log] using the `changelog` [Make] target.
 
-Create a new branch, e.g. `<GITHUB-NAME>/changelog`, and then
-run [Make]:
+Create a new branch, e.g. `changelog`, and then run [Make]:
 
 ```bash
-git checkout -b <GITHUB-NAME>/changelog
+git checkout -b changelog
 make changelog
 ```
 
 Review the staged changes and make appropriate adjustment to the Change Log
 (e.g. re-order entries, make formatting/spelling fixes, ...).
 
-Add a table with protocol versions just below the next version's heading:
-
-```
-| Protocol          | Version   |
-|:------------------|:---------:|
-| Consensus         | <VERSION> |
-| Runtime Host      | <VERSION> |
-| Runtime Committee | <VERSION> |
-```
-
-where `<VERSION>` strings are replaced with appropriate protocol versions as
-defined in [go/common/version/version.go][version-file] file.
+Replace the `<VERSION>` strings in the protocol versions table just below the
+next version's heading with appropriate protocol versions as defined in
+[go/common/version/version.go][version-file] file.
 
 For example:
 
 | Protocol          | Version   |
 |:------------------|:---------:|
-| Consensus         | 1.0.0     |
-| Runtime Host      | 1.0.0     |
-| Runtime Committee | 1.0.0     |
+| Consensus         | 4.0.0     |
+| Runtime Host      | 2.0.0     |
+| Runtime Committee | 2.0.0     |
 
 After you are content with the changes, commit them, push them to the origin
 and make a pull request.
 
 Once the pull request had been reviewed and merged, proceed to the next step.
 
-[version-file]: ../go/common/version/version.go
+<!-- markdownlint-disable line-length -->
+[version-file]:
+  https://github.com/oasisprotocol/oasis-core/tree/master/go/common/version/version.go
+<!-- markdownlint-enable line-length -->
 
 ### Tag Next Release
 
@@ -149,7 +150,7 @@ checksums, and publish a GitHub Release that accompanies the versioned git tag.
 Browse to [Oasis Core's releases page] and make sure the new release is properly
 published.
 
-### Create `stable/MAJOR.MINOR.x` Branch
+### Create `stable/YY.MINOR.x` Branch
 
 To prepare a new stable branch from the new release tag and push it to the
 origin remote, use:
@@ -162,11 +163,15 @@ This command will perform sanity checks to prevent common errors.
 
 After those checks have passed, it will ask for confirmation before proceeding.
 
-[canonical git repository]: https://github.com/oasisprotocol/oasis-core
-[Release manager workflow]: ../.github/workflows/release.yml
+<!-- markdownlint-disable line-length -->
+[canonical git repository]:
+  https://github.com/oasisprotocol/oasis-core
+[Release manager workflow]:
+  https://github.com/oasisprotocol/oasis-core/tree/master/.github/workflows/release.yml
 [GoReleaser]: https://goreleaser.com/
 [Oasis Core's releases page]:
   https://github.com/oasisprotocol/oasis-core/releases
+<!-- markdownlint-enable line-length -->
 
 ## Preparing a Bugfix/Stable Release
 
@@ -175,21 +180,21 @@ back-port some fixes (e.g. a security fix) and (backwards compatible) changes
 from an upcoming release and release them without also releasing all the other
 (potentially breaking) changes.
 
-To make the following steps easier, set the `RELEASE_BRANCH` environment
-variable to the name of the stable branch of the `YY.MINOR` release you want
-to back-port the changes to, e.g. `stable/20.11.x`:
+Set the `RELEASE_BRANCH` environment variable to the name of the stable branch
+of the `YY.MINOR` release you want to back-port the changes to, e.g.
+`stable/21.2.x`, and export it:
 
 ```bash
-RELEASE_BRANCH="stable/20.11.x"
+export RELEASE_BRANCH="stable/21.2.x"
 ```
 
 ### Back-port Changes
 
-Create a new branch, e.g. `<GITHUB-NAME>/${RELEASE_BRANCH}/backport-foo`, from
-the `${RELEASE_BRANCH}` branch:
+Create a new branch, e.g. `backport-foo-${RELEASE_BRANCH#stable/}`, from the
+`${RELEASE_BRANCH}` branch:
 
 ```bash
-git checkout -b <GITHUB-NAME>/${RELEASE_BRANCH}/backport-foo ${RELEASE_BRANCH}
+git checkout -b backport-foo-${RELEASE_BRANCH#stable/} ${RELEASE_BRANCH}
 ```
 
 After back-porting all the desired changes, push it to the origin and make a
@@ -201,11 +206,11 @@ As with a regular release, the back-ported changes should include the
 corresponding [Change Log Fragments] that need to be assembled into a new
 section of the [Change Log] using the `changelog` [Make] target.
 
-Create a new branch, e.g. `<GITHUB-NAME>/${RELEASE_BRANCH}/changelog`, from the
+Create a new branch, e.g. `changelog-${RELEASE_BRANCH#stable/}`, from the
 `${RELEASE_BRANCH}` branch:
 
 ```bash
-git checkout -b <GITHUB-NAME>/${RELEASE_BRANCH}/changelog ${RELEASE_BRANCH}
+git checkout -b changelog-${RELEASE_BRANCH#stable/} ${RELEASE_BRANCH}
 ```
 
 Then run [Make]'s `changelog` target:
@@ -216,6 +221,10 @@ make changelog
 
 *NOTE: The `changelog` Make target will bump the `MICRO` part of the version
 automatically.*
+
+Replace the `<VERSION>` strings in the protocol versions table just below the
+next version's heading with appropriate protocol versions as defined in
+[go/common/version/version.go][version-file] file.
 
 After reviewing the staged changes, commit them, push the changes to the origin
 and make a pull request against the `${RELEASE_BRANCH}` branch.

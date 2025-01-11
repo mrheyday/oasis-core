@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/oasisprotocol/ed25519"
+	"github.com/oasisprotocol/curve25519-voi/primitives/ed25519"
 )
 
 const (
@@ -37,9 +37,15 @@ var (
 	// ErrInvalidRole is the error returned when the signer role is invalid.
 	ErrInvalidRole = errors.New("signature: invalid signer role")
 
+	// ErrVRFNotSupported is the error returned when the signer is not capable
+	// of generating VRF proofs.
+	ErrVRFNotSupported = errors.New("signature: VRF proofs not supported")
+
 	errMalformedContext    = errors.New("signature: malformed context")
 	errUnregisteredContext = errors.New("signature: unregistered context")
 	errNoChainContext      = errors.New("signature: chain domain separation context not set")
+	errNoSuffixConfigured  = errors.New("signature: domain separation context suffix not configured")
+	errNoDynamicSuffix     = errors.New("signature: dynamic context suffix not set")
 
 	registeredContexts        sync.Map
 	allowUnregisteredContexts bool
@@ -53,6 +59,7 @@ var (
 		SignerNode,
 		SignerP2P,
 		SignerConsensus,
+		SignerVRF,
 	}
 
 	_ encoding.TextMarshaler   = (*SignerRole)(nil)
@@ -61,6 +68,9 @@ var (
 
 type contextOptions struct {
 	chainSeparation bool
+
+	dynamicSuffix       string
+	dynamicSuffixMaxLen int
 }
 
 // ContextOption is a context configuration option.
@@ -74,8 +84,44 @@ func WithChainSeparation() ContextOption {
 	}
 }
 
+// WithDynamicSuffix is a context option that configures the context to use
+// a dynamic suffix.
+func WithDynamicSuffix(str string, len int) ContextOption {
+	return func(o *contextOptions) {
+		o.dynamicSuffix = str
+		o.dynamicSuffixMaxLen = len
+	}
+}
+
 // Context is a domain separation context.
 type Context string
+
+// WithSuffix appends a suffix to the context.
+func (c Context) WithSuffix(str string) (Context, error) {
+	// Ensure that the context is registered for use and has dynamic suffix
+	// configured.
+	rawOpts, isRegistered := registeredContexts.Load(c)
+	if !isRegistered {
+		return c, errUnregisteredContext
+	}
+	opts := rawOpts.(*contextOptions)
+	if opts.dynamicSuffix == "" {
+		return c, errNoSuffixConfigured
+	}
+	if len(str) > opts.dynamicSuffixMaxLen {
+		return c, fmt.Errorf("suffix too long: %w (max suffix length: %v)", errMalformedContext, opts.dynamicSuffixMaxLen)
+	}
+
+	newCtx := c + Context(opts.dynamicSuffix+str)
+	// No dynamic suffix for the new context.
+	newOpts := contextOptions{
+		chainSeparation: opts.chainSeparation,
+	}
+	// Register the context so it can be looked up (same suffix can be used multiple times).
+	_, _ = registeredContexts.LoadOrStore(newCtx, &newOpts)
+
+	return newCtx, nil
+}
 
 // NewContext creates and registers a new context.  This routine will panic
 // if the context is malformed or is already registered.
@@ -97,6 +143,7 @@ func NewContext(rawContext string, opts ...ContextOption) Context {
 	if opt.chainSeparation {
 		l += len(chainContextSeparator) + chainContextMaxSize
 	}
+	l += len(opt.dynamicSuffix) + opt.dynamicSuffixMaxLen
 	if l > ed25519.ContextMaxSize {
 		panic(errMalformedContext)
 	}
@@ -108,10 +155,9 @@ func NewContext(rawContext string, opts ...ContextOption) Context {
 	}
 
 	ctx := Context(rawContext)
-	if _, isRegistered := registeredContexts.Load(ctx); isRegistered {
+	if _, isRegistered := registeredContexts.LoadOrStore(ctx, &opt); isRegistered {
 		panic("signature: context already registered: '" + ctx + "'")
 	}
-	registeredContexts.Store(ctx, &opt)
 
 	return ctx
 }
@@ -167,11 +213,13 @@ const (
 	SignerNode      SignerRole = 2
 	SignerP2P       SignerRole = 3
 	SignerConsensus SignerRole = 4
+	SignerVRF       SignerRole = 5
 
 	SignerEntityName    = "entity"
 	SignerNodeName      = "node"
 	SignerP2PName       = "p2p"
 	SignerConsensusName = "consensus"
+	SignerVRFName       = "vrf"
 )
 
 // String returns the string representation of a SignerRole.
@@ -185,6 +233,8 @@ func (role SignerRole) String() string {
 		return SignerP2PName
 	case SignerConsensus:
 		return SignerConsensusName
+	case SignerVRF:
+		return SignerVRFName
 	default:
 		return "[unknown signer role]"
 	}
@@ -206,6 +256,8 @@ func (role *SignerRole) UnmarshalText(text []byte) error {
 		*role = SignerP2P
 	case SignerConsensusName:
 		*role = SignerConsensus
+	case SignerVRFName:
+		*role = SignerVRF
 	default:
 		return fmt.Errorf("%w: %s", ErrInvalidRole, string(text))
 	}
@@ -226,7 +278,7 @@ type SignerFactory interface {
 	// implementations require an entropy source to be provided.
 	Generate(role SignerRole, rng io.Reader) (Signer, error)
 
-	// Load will load the private key corresonding to the provided role, and
+	// Load will load the private key corresponding to the provided role, and
 	// return a Signer ready for use.
 	Load(role SignerRole) (Signer, error)
 }
@@ -260,20 +312,20 @@ type UnsafeSigner interface {
 
 // PrepareSignerContext prepares a context for use during signing by a Signer.
 func PrepareSignerContext(context Context) ([]byte, error) {
-	// The remote signer implementation uses the raw context, and
-	// registration is dealt with client side.  Just check that the
-	// length is sensible, even though the client should be sending
-	// something sane.
-	if allowUnregisteredContexts {
-		if cLen := len(context); cLen == 0 || cLen > ed25519.ContextMaxSize {
-			return nil, errMalformedContext
-		}
-		return []byte(context), nil
-	}
-
-	// Ensure that the context is registered for use.
 	rawOpts, isRegistered := registeredContexts.Load(context)
 	if !isRegistered {
+		// The remote signer implementation uses the raw context, and
+		// registration is dealt with client side.  Just check that the
+		// length is sensible, even though the client should be sending
+		// something sane.
+		if allowUnregisteredContexts {
+			if cLen := len(context); cLen == 0 || cLen > ed25519.ContextMaxSize {
+				return nil, errMalformedContext
+			}
+			return []byte(context), nil
+		}
+
+		// Ensure that the context is registered for use.
 		return nil, errUnregisteredContext
 	}
 	opts := rawOpts.(*contextOptions)
@@ -287,6 +339,10 @@ func PrepareSignerContext(context Context) ([]byte, error) {
 			return nil, errNoChainContext
 		}
 		context = context + chainContextSeparator + chainContext
+	}
+
+	if opts.dynamicSuffix != "" {
+		return nil, errNoDynamicSuffix
 	}
 
 	return []byte(context), nil

@@ -4,11 +4,11 @@ package file
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	"github.com/oasisprotocol/oasis-core/go/genesis/api"
-	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 )
 
 // fileProvider provides the static gensis document that network was
@@ -21,18 +21,17 @@ func (p *fileProvider) GetGenesisDocument() (*api.Document, error) {
 	return p.document, nil
 }
 
-// DefaultFileProvider creates a new local file genesis provider for the genesis
-// specified by the genesis flag.
+// DefaultFileProvider creates a new local file genesis provider for the genesis file path
+// specified in the genesis config.
 func DefaultFileProvider() (api.Provider, error) {
-	filename := flags.GenesisFile()
-	return NewFileProvider(filename)
+	return NewFileProvider(config.GlobalConfig.Genesis.File)
 }
 
 // NewFileProvider creates a new local file genesis provider.
 func NewFileProvider(filename string) (api.Provider, error) {
 	logger := logging.GetLogger("genesis/file").With("filename", filename)
 
-	raw, err := ioutil.ReadFile(filename)
+	raw, err := os.ReadFile(filename)
 	if err != nil {
 		logger.Warn("failed to open genesis document",
 			"err", err,

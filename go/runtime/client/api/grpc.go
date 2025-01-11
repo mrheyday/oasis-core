@@ -13,7 +13,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
-	enclaverpc "github.com/oasisprotocol/oasis-core/go/runtime/enclaverpc/api"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/syncer"
 )
 
 var (
@@ -22,24 +22,34 @@ var (
 
 	// methodSubmitTx is the SubmitTx method.
 	methodSubmitTx = serviceName.NewMethod("SubmitTx", SubmitTxRequest{})
+	// methodSubmitTxMeta is the SubmitTxMeta method.
+	methodSubmitTxMeta = serviceName.NewMethod("SubmitTxMeta", SubmitTxRequest{})
+	// methodSubmitTxNoWait is the SubmitTxNoWait method.
+	methodSubmitTxNoWait = serviceName.NewMethod("SubmitTxNoWait", SubmitTxRequest{})
+	// methodCheckTx is the CheckTx method.
+	methodCheckTx = serviceName.NewMethod("CheckTx", CheckTxRequest{})
 	// methodGetGenesisBlock is the GetGenesisBlock method.
 	methodGetGenesisBlock = serviceName.NewMethod("GetGenesisBlock", common.Namespace{})
 	// methodGetBlock is the GetBlock method.
 	methodGetBlock = serviceName.NewMethod("GetBlock", GetBlockRequest{})
-	// methodGetBlockByHash is the GetBlockByHash method.
-	methodGetBlockByHash = serviceName.NewMethod("GetBlockByHash", GetBlockByHashRequest{})
-	// methodGetTx is the GetTx method.
-	methodGetTx = serviceName.NewMethod("GetTx", GetTxRequest{})
-	// methodGetTxByBlockHash is the GetTxByBlockHash method.
-	methodGetTxByBlockHash = serviceName.NewMethod("GetTxByBlockHash", GetTxByBlockHashRequest{})
-	// methodGetTxs is the GetTxs method.
-	methodGetTxs = serviceName.NewMethod("GetTxs", GetTxsRequest{})
-	// methodQueryTx is the QueryTx method.
-	methodQueryTx = serviceName.NewMethod("QueryTx", QueryTxRequest{})
-	// methodQueryTxs is the QueryTxs method.
-	methodQueryTxs = serviceName.NewMethod("QueryTxs", QueryTxsRequest{})
-	// methodWaitBlockIndexed is the WaitBlockIndexed method.
-	methodWaitBlockIndexed = serviceName.NewMethod("WaitBlockIndexed", WaitBlockIndexedRequest{})
+	// methodGetLastRetainedBlock is the GetLastRetainedBlock method.
+	methodGetLastRetainedBlock = serviceName.NewMethod("GetLastRetainedBlock", common.Namespace{})
+	// methodGetTransactions is the GetTransactions method.
+	methodGetTransactions = serviceName.NewMethod("GetTransactions", GetTransactionsRequest{})
+	// methodGetTransactionsWithResults is the GetTransactionsWithResults method.
+	methodGetTransactionsWithResults = serviceName.NewMethod("GetTransactionsWithResults", GetTransactionsRequest{})
+	// methodGetUnconfirmedTransactions is the GetUnconfirmedTransactions method.
+	methodGetUnconfirmedTransactions = serviceName.NewMethod("GetUnconfirmedTransactions", common.Namespace{})
+	// methodGetEvents is the GetEvents method.
+	methodGetEvents = serviceName.NewMethod("GetEvents", GetEventsRequest{})
+	// methodQuery is the Query method.
+	methodQuery = serviceName.NewMethod("Query", QueryRequest{})
+	// methodStateSyncGet is the StateSyncGet method.
+	methodStateSyncGet = serviceName.NewMethod("StateSyncGet", syncer.GetRequest{})
+	// methodStateSyncGetPrefixes is the StateSyncGetPrefixes method.
+	methodStateSyncGetPrefixes = serviceName.NewMethod("StateSyncGetPrefixes", syncer.GetPrefixesRequest{})
+	// methodStateSyncIterate is the StateSyncIterate method.
+	methodStateSyncIterate = serviceName.NewMethod("StateSyncIterate", syncer.IterateRequest{})
 
 	// methodWatchBlocks is the WatchBlocks method.
 	methodWatchBlocks = serviceName.NewMethod("WatchBlocks", common.Namespace{})
@@ -54,6 +64,18 @@ var (
 				Handler:    handlerSubmitTx,
 			},
 			{
+				MethodName: methodSubmitTxMeta.ShortName(),
+				Handler:    handlerSubmitTxMeta,
+			},
+			{
+				MethodName: methodSubmitTxNoWait.ShortName(),
+				Handler:    handlerSubmitTxNoWait,
+			},
+			{
+				MethodName: methodCheckTx.ShortName(),
+				Handler:    handlerCheckTx,
+			},
+			{
 				MethodName: methodGetGenesisBlock.ShortName(),
 				Handler:    handlerGetGenesisBlock,
 			},
@@ -62,32 +84,40 @@ var (
 				Handler:    handlerGetBlock,
 			},
 			{
-				MethodName: methodGetBlockByHash.ShortName(),
-				Handler:    handlerGetBlockByHash,
+				MethodName: methodGetLastRetainedBlock.ShortName(),
+				Handler:    handlerGetLastRetainedBlock,
 			},
 			{
-				MethodName: methodGetTx.ShortName(),
-				Handler:    handlerGetTx,
+				MethodName: methodGetTransactions.ShortName(),
+				Handler:    handlerGetTransactions,
 			},
 			{
-				MethodName: methodGetTxByBlockHash.ShortName(),
-				Handler:    handlerGetTxByBlockHash,
+				MethodName: methodGetTransactionsWithResults.ShortName(),
+				Handler:    handlerGetTransactionsWithResults,
 			},
 			{
-				MethodName: methodGetTxs.ShortName(),
-				Handler:    handlerGetTxs,
+				MethodName: methodGetUnconfirmedTransactions.ShortName(),
+				Handler:    handlerGetUnconfirmedTransactions,
 			},
 			{
-				MethodName: methodQueryTx.ShortName(),
-				Handler:    handlerQueryTx,
+				MethodName: methodGetEvents.ShortName(),
+				Handler:    handlerGetEvents,
 			},
 			{
-				MethodName: methodQueryTxs.ShortName(),
-				Handler:    handlerQueryTxs,
+				MethodName: methodQuery.ShortName(),
+				Handler:    handlerQuery,
 			},
 			{
-				MethodName: methodWaitBlockIndexed.ShortName(),
-				Handler:    handlerWaitBlockIndexed,
+				MethodName: methodStateSyncGet.ShortName(),
+				Handler:    handlerStateSyncGet,
+			},
+			{
+				MethodName: methodStateSyncGetPrefixes.ShortName(),
+				Handler:    handlerStateSyncGetPrefixes,
+			},
+			{
+				MethodName: methodStateSyncIterate.ShortName(),
+				Handler:    handlerStateSyncIterate,
 			},
 		},
 		Streams: []grpc.StreamDesc{
@@ -100,7 +130,7 @@ var (
 	}
 )
 
-func handlerSubmitTx( // nolint: golint
+func handlerSubmitTx(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -119,6 +149,75 @@ func handlerSubmitTx( // nolint: golint
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(RuntimeClient).SubmitTx(ctx, req.(*SubmitTxRequest))
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
+func handlerSubmitTxMeta(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq SubmitTxRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeClient).SubmitTxMeta(ctx, &rq)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodSubmitTxMeta.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeClient).SubmitTxMeta(ctx, req.(*SubmitTxRequest))
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
+func handlerSubmitTxNoWait(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq SubmitTxRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return nil, srv.(RuntimeClient).SubmitTxNoWait(ctx, &rq)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodSubmitTxNoWait.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return nil, srv.(RuntimeClient).SubmitTxNoWait(ctx, req.(*SubmitTxRequest))
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
+func handlerCheckTx(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq CheckTxRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return nil, srv.(RuntimeClient).CheckTx(ctx, &rq)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodCheckTx.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return nil, srv.(RuntimeClient).CheckTx(ctx, req.(*CheckTxRequest))
 	}
 	return interceptor(ctx, &rq, info, handler)
 }
@@ -150,7 +249,7 @@ func errorWrapNotFound(err error) error {
 	return wrappedErrNotFound{err}
 }
 
-func handlerGetGenesisBlock( // nolint: golint
+func handlerGetGenesisBlock(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -175,7 +274,7 @@ func handlerGetGenesisBlock( // nolint: golint
 	return interceptor(ctx, runtimeID, info, handler)
 }
 
-func handlerGetBlock( // nolint: golint
+func handlerGetBlock(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
@@ -200,173 +299,215 @@ func handlerGetBlock( // nolint: golint
 	return interceptor(ctx, &rq, info, handler)
 }
 
-func handlerGetBlockByHash( // nolint: golint
+func handlerGetLastRetainedBlock(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
-	var rq GetBlockByHashRequest
-	if err := dec(&rq); err != nil {
+	var runtimeID common.Namespace
+	if err := dec(&runtimeID); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		rsp, err := srv.(RuntimeClient).GetBlockByHash(ctx, &rq)
+		rsp, err := srv.(RuntimeClient).GetLastRetainedBlock(ctx, runtimeID)
 		return rsp, errorWrapNotFound(err)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: methodGetBlockByHash.FullName(),
+		FullMethod: methodGetLastRetainedBlock.FullName(),
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		rsp, err := srv.(RuntimeClient).GetBlockByHash(ctx, req.(*GetBlockByHashRequest))
+		rsp, err := srv.(RuntimeClient).GetLastRetainedBlock(ctx, req.(common.Namespace))
+		return rsp, errorWrapNotFound(err)
+	}
+	return interceptor(ctx, runtimeID, info, handler)
+}
+
+func handlerGetTransactions(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq GetTransactionsRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeClient).GetTransactions(ctx, &rq)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodGetTransactions.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeClient).GetTransactions(ctx, req.(*GetTransactionsRequest))
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
+func handlerGetTransactionsWithResults(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq GetTransactionsRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeClient).GetTransactionsWithResults(ctx, &rq)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodGetTransactionsWithResults.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeClient).GetTransactionsWithResults(ctx, req.(*GetTransactionsRequest))
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
+func handlerGetUnconfirmedTransactions(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var runtimeID common.Namespace
+	if err := dec(&runtimeID); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeClient).GetUnconfirmedTransactions(ctx, runtimeID)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodGetUnconfirmedTransactions.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeClient).GetUnconfirmedTransactions(ctx, req.(common.Namespace))
+	}
+	return interceptor(ctx, runtimeID, info, handler)
+}
+
+func handlerGetEvents(
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq GetEventsRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimeClient).GetEvents(ctx, &rq)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodGetEvents.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimeClient).GetEvents(ctx, req.(*GetEventsRequest))
+	}
+	return interceptor(ctx, &rq, info, handler)
+}
+
+func handlerQuery( // nolint: revive
+	srv interface{},
+	ctx context.Context,
+	dec func(interface{}) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (interface{}, error) {
+	var rq QueryRequest
+	if err := dec(&rq); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		rsp, err := srv.(RuntimeClient).Query(ctx, &rq)
+		return rsp, errorWrapNotFound(err)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodQuery.FullName(),
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		rsp, err := srv.(RuntimeClient).Query(ctx, req.(*QueryRequest))
 		return rsp, errorWrapNotFound(err)
 	}
 	return interceptor(ctx, &rq, info, handler)
 }
 
-func handlerGetTx( // nolint: golint
+func handlerStateSyncGet(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
-	var rq GetTxRequest
-	if err := dec(&rq); err != nil {
+	rq := new(syncer.GetRequest)
+	if err := dec(rq); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		rsp, err := srv.(RuntimeClient).GetTx(ctx, &rq)
-		return rsp, errorWrapNotFound(err)
+		return srv.(RuntimeClient).State().SyncGet(ctx, rq)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: methodGetTx.FullName(),
+		FullMethod: methodStateSyncGet.FullName(),
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		rsp, err := srv.(RuntimeClient).GetTx(ctx, req.(*GetTxRequest))
-		return rsp, errorWrapNotFound(err)
+		return srv.(RuntimeClient).State().SyncGet(ctx, req.(*syncer.GetRequest))
 	}
-	return interceptor(ctx, &rq, info, handler)
+	return interceptor(ctx, rq, info, handler)
 }
 
-func handlerGetTxByBlockHash( // nolint: golint
+func handlerStateSyncGetPrefixes(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
-	var rq GetTxByBlockHashRequest
-	if err := dec(&rq); err != nil {
+	rq := new(syncer.GetPrefixesRequest)
+	if err := dec(rq); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		rsp, err := srv.(RuntimeClient).GetTxByBlockHash(ctx, &rq)
-		return rsp, errorWrapNotFound(err)
+		return srv.(RuntimeClient).State().SyncGetPrefixes(ctx, rq)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: methodGetTxByBlockHash.FullName(),
+		FullMethod: methodStateSyncGetPrefixes.FullName(),
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		rsp, err := srv.(RuntimeClient).GetTxByBlockHash(ctx, req.(*GetTxByBlockHashRequest))
-		return rsp, errorWrapNotFound(err)
+		return srv.(RuntimeClient).State().SyncGetPrefixes(ctx, req.(*syncer.GetPrefixesRequest))
 	}
-	return interceptor(ctx, &rq, info, handler)
+	return interceptor(ctx, rq, info, handler)
 }
 
-func handlerGetTxs( // nolint: golint
+func handlerStateSyncIterate(
 	srv interface{},
 	ctx context.Context,
 	dec func(interface{}) error,
 	interceptor grpc.UnaryServerInterceptor,
 ) (interface{}, error) {
-	var rq GetTxsRequest
-	if err := dec(&rq); err != nil {
+	rq := new(syncer.IterateRequest)
+	if err := dec(rq); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(RuntimeClient).GetTxs(ctx, &rq)
+		return srv.(RuntimeClient).State().SyncIterate(ctx, rq)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: methodGetTxs.FullName(),
+		FullMethod: methodStateSyncIterate.FullName(),
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RuntimeClient).GetTxs(ctx, req.(*GetTxsRequest))
+		return srv.(RuntimeClient).State().SyncIterate(ctx, req.(*syncer.IterateRequest))
 	}
-	return interceptor(ctx, &rq, info, handler)
-}
-
-func handlerQueryTx( // nolint: golint
-	srv interface{},
-	ctx context.Context,
-	dec func(interface{}) error,
-	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
-	var rq QueryTxRequest
-	if err := dec(&rq); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		rsp, err := srv.(RuntimeClient).QueryTx(ctx, &rq)
-		return rsp, errorWrapNotFound(err)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: methodQueryTx.FullName(),
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		rsp, err := srv.(RuntimeClient).QueryTx(ctx, req.(*QueryTxRequest))
-		return rsp, errorWrapNotFound(err)
-	}
-	return interceptor(ctx, &rq, info, handler)
-}
-
-func handlerQueryTxs( // nolint: golint
-	srv interface{},
-	ctx context.Context,
-	dec func(interface{}) error,
-	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
-	var rq QueryTxsRequest
-	if err := dec(&rq); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RuntimeClient).QueryTxs(ctx, &rq)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: methodQueryTxs.FullName(),
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RuntimeClient).QueryTxs(ctx, req.(*QueryTxsRequest))
-	}
-	return interceptor(ctx, &rq, info, handler)
-}
-
-func handlerWaitBlockIndexed( // nolint: golint
-	srv interface{},
-	ctx context.Context,
-	dec func(interface{}) error,
-	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
-	var rq WaitBlockIndexedRequest
-	if err := dec(&rq); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return nil, srv.(RuntimeClient).WaitBlockIndexed(ctx, &rq)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: methodWaitBlockIndexed.FullName(),
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return nil, srv.(RuntimeClient).WaitBlockIndexed(ctx, req.(*WaitBlockIndexedRequest))
-	}
-	return interceptor(ctx, &rq, info, handler)
+	return interceptor(ctx, rq, info, handler)
 }
 
 func handlerWatchBlocks(srv interface{}, stream grpc.ServerStream) error {
@@ -404,8 +545,6 @@ func RegisterService(server *grpc.Server, service RuntimeClient) {
 }
 
 type runtimeClient struct {
-	enclaverpc.Transport
-
 	conn *grpc.ClientConn
 }
 
@@ -415,6 +554,22 @@ func (c *runtimeClient) SubmitTx(ctx context.Context, request *SubmitTxRequest) 
 		return nil, err
 	}
 	return rsp, nil
+}
+
+func (c *runtimeClient) SubmitTxMeta(ctx context.Context, request *SubmitTxRequest) (*SubmitTxMetaResponse, error) {
+	var rsp SubmitTxMetaResponse
+	if err := c.conn.Invoke(ctx, methodSubmitTxMeta.FullName(), request, &rsp); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+func (c *runtimeClient) SubmitTxNoWait(ctx context.Context, request *SubmitTxRequest) error {
+	return c.conn.Invoke(ctx, methodSubmitTxNoWait.FullName(), request, nil)
+}
+
+func (c *runtimeClient) CheckTx(ctx context.Context, request *CheckTxRequest) error {
+	return c.conn.Invoke(ctx, methodCheckTx.FullName(), request, nil)
 }
 
 func (c *runtimeClient) GetGenesisBlock(ctx context.Context, runtimeID common.Namespace) (*block.Block, error) {
@@ -433,56 +588,87 @@ func (c *runtimeClient) GetBlock(ctx context.Context, request *GetBlockRequest) 
 	return &rsp, nil
 }
 
-func (c *runtimeClient) GetBlockByHash(ctx context.Context, request *GetBlockByHashRequest) (*block.Block, error) {
+func (c *runtimeClient) GetLastRetainedBlock(ctx context.Context, runtimeID common.Namespace) (*block.Block, error) {
 	var rsp block.Block
-	if err := c.conn.Invoke(ctx, methodGetBlockByHash.FullName(), request, &rsp); err != nil {
+	if err := c.conn.Invoke(ctx, methodGetLastRetainedBlock.FullName(), runtimeID, &rsp); err != nil {
 		return nil, err
 	}
 	return &rsp, nil
 }
 
-func (c *runtimeClient) GetTx(ctx context.Context, request *GetTxRequest) (*TxResult, error) {
-	var rsp TxResult
-	if err := c.conn.Invoke(ctx, methodGetTx.FullName(), request, &rsp); err != nil {
-		return nil, err
-	}
-	return &rsp, nil
-}
-
-func (c *runtimeClient) GetTxByBlockHash(ctx context.Context, request *GetTxByBlockHashRequest) (*TxResult, error) {
-	var rsp TxResult
-	if err := c.conn.Invoke(ctx, methodGetTxByBlockHash.FullName(), request, &rsp); err != nil {
-		return nil, err
-	}
-	return &rsp, nil
-}
-
-func (c *runtimeClient) GetTxs(ctx context.Context, request *GetTxsRequest) ([][]byte, error) {
+func (c *runtimeClient) GetTransactions(ctx context.Context, request *GetTransactionsRequest) ([][]byte, error) {
 	var rsp [][]byte
-	if err := c.conn.Invoke(ctx, methodGetTxs.FullName(), request, &rsp); err != nil {
+	if err := c.conn.Invoke(ctx, methodGetTransactions.FullName(), request, &rsp); err != nil {
 		return nil, err
 	}
 	return rsp, nil
 }
 
-func (c *runtimeClient) QueryTx(ctx context.Context, request *QueryTxRequest) (*TxResult, error) {
-	var rsp TxResult
-	if err := c.conn.Invoke(ctx, methodQueryTx.FullName(), request, &rsp); err != nil {
+func (c *runtimeClient) GetTransactionsWithResults(ctx context.Context, request *GetTransactionsRequest) ([]*TransactionWithResults, error) {
+	var rsp []*TransactionWithResults
+	if err := c.conn.Invoke(ctx, methodGetTransactionsWithResults.FullName(), request, &rsp); err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *runtimeClient) GetUnconfirmedTransactions(ctx context.Context, runtimeID common.Namespace) ([][]byte, error) {
+	var rsp [][]byte
+	if err := c.conn.Invoke(ctx, methodGetUnconfirmedTransactions.FullName(), runtimeID, &rsp); err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *runtimeClient) GetEvents(ctx context.Context, request *GetEventsRequest) ([]*Event, error) {
+	var rsp []*Event
+	if err := c.conn.Invoke(ctx, methodGetEvents.FullName(), request, &rsp); err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *runtimeClient) Query(ctx context.Context, request *QueryRequest) (*QueryResponse, error) {
+	var rsp QueryResponse
+	if err := c.conn.Invoke(ctx, methodQuery.FullName(), request, &rsp); err != nil {
 		return nil, err
 	}
 	return &rsp, nil
 }
 
-func (c *runtimeClient) QueryTxs(ctx context.Context, request *QueryTxsRequest) ([]*TxResult, error) {
-	var rsp []*TxResult
-	if err := c.conn.Invoke(ctx, methodQueryTxs.FullName(), request, &rsp); err != nil {
-		return nil, err
-	}
-	return rsp, nil
+type stateReadSync struct {
+	c *runtimeClient
 }
 
-func (c *runtimeClient) WaitBlockIndexed(ctx context.Context, request *WaitBlockIndexedRequest) error {
-	return c.conn.Invoke(ctx, methodWaitBlockIndexed.FullName(), request, nil)
+// Implements syncer.ReadSyncer.
+func (rs *stateReadSync) SyncGet(ctx context.Context, request *syncer.GetRequest) (*syncer.ProofResponse, error) {
+	var rsp syncer.ProofResponse
+	if err := rs.c.conn.Invoke(ctx, methodStateSyncGet.FullName(), request, &rsp); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// Implements syncer.ReadSyncer.
+func (rs *stateReadSync) SyncGetPrefixes(ctx context.Context, request *syncer.GetPrefixesRequest) (*syncer.ProofResponse, error) {
+	var rsp syncer.ProofResponse
+	if err := rs.c.conn.Invoke(ctx, methodStateSyncGetPrefixes.FullName(), request, &rsp); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+// Implements syncer.ReadSyncer.
+func (rs *stateReadSync) SyncIterate(ctx context.Context, request *syncer.IterateRequest) (*syncer.ProofResponse, error) {
+	var rsp syncer.ProofResponse
+	if err := rs.c.conn.Invoke(ctx, methodStateSyncIterate.FullName(), request, &rsp); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+func (c *runtimeClient) State() syncer.ReadSyncer {
+	return &stateReadSync{c}
 }
 
 func (c *runtimeClient) WatchBlocks(ctx context.Context, runtimeID common.Namespace) (<-chan *roothash.AnnotatedBlock, pubsub.ClosableSubscription, error) {
@@ -520,13 +706,9 @@ func (c *runtimeClient) WatchBlocks(ctx context.Context, runtimeID common.Namesp
 	return ch, sub, nil
 }
 
-func (c *runtimeClient) Cleanup() {
-}
-
 // NewRuntimeClient creates a new gRPC runtime client service.
 func NewRuntimeClient(c *grpc.ClientConn) RuntimeClient {
 	return &runtimeClient{
-		Transport: enclaverpc.NewTransportClient(c),
-		conn:      c,
+		conn: c,
 	}
 }

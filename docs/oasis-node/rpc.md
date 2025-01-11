@@ -12,14 +12,16 @@ In order to support remote clients and different protocols (e.g. REST), a
 gateway that handles things like authentication and rate limiting should be
 used.
 
-{% hint style="info" %}
+:::info
+
 An example of such a gateway is the [Oasis Core Rosetta Gateway] which exposes
 a subset of the consensus layer via the [Rosetta API].
-{% endhint %}
+
+:::
 
 <!-- markdownlint-disable line-length -->
-[consensus]: ../consensus/index.md
-[runtime]: ../runtime/index.md
+[consensus]: ../consensus/README.md
+[runtime]: ../runtime/README.md
 [submit transactions]: ../consensus/transactions.md#submission
 [Oasis Core Rosetta Gateway]: https://github.com/oasisprotocol/oasis-core-rosetta-gateway
 [Rosetta API]: https://www.rosetta-api.org
@@ -30,8 +32,7 @@ a subset of the consensus layer via the [Rosetta API].
 Like other parts of Oasis Core, the RPC interface exposed by Oasis Node uses the
 [gRPC protocol] with the [CBOR codec (instead of Protocol Buffers)]. If your
 application is written in Go, you can use the convenience gRPC wrappers provided
-by Oasis Core to create clients (we also provide limited gRPC wrappers for Rust,
-see example in [`client/src/transaction/api/client.rs`]).
+by Oasis Core to create clients. Check the [Oasis SDK] for more information.
 
 For example to create a gRPC client connected to the Oasis Node endpoint exposed
 by your local node at `/path/to/datadir/internal.sock` you can do:
@@ -54,8 +55,8 @@ the gRPC helpers see the [API documentation].
 <!-- markdownlint-disable line-length -->
 [gRPC protocol]: https://grpc.io
 [CBOR codec (instead of Protocol Buffers)]: ../authenticated-grpc.md#cbor-codec
-[`client/src/transaction/api/client.rs`]: ../../client/src/transaction/api/client.rs
 [API documentation]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/common/grpc?tab=doc
+[Oasis SDK]: https://github.com/oasisprotocol/oasis-sdk
 <!-- markdownlint-enable line-length -->
 
 ## Errors
@@ -83,10 +84,12 @@ The following gRPC services are exposed (with links to API documentation):
   * [Staking] (`oasis-core.Staking`)
   * [Registry] (`oasis-core.Registry`)
   * [Scheduler] (`oasis-core.Scheduler`)
+  * [RootHash] (`oasis-core.RootHash`)
+  * [Governance] (`oasis-core.Governance`)
+  * [Beacon] (`oasis-core.Beacon`)
 * **Runtime Layer**
   * [Storage] (`oasis-core.Storage`)
   * [Runtime Client] (`oasis-core.RuntimeClient`)
-  * [EnclaveRPC] (`oasis-core.EnclaveRPC`)
 
 For more details about what the exposed services do see the respective
 documentation sections. The Go API also provides gRPC client implementations for
@@ -114,7 +117,9 @@ err := cc.SubmitTx(ctx, &tx)
 [Staking]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/staking/api?tab=doc#Backend
 [Registry]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/registry/api?tab=doc#Backend
 [Scheduler]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/scheduler/api?tab=doc#Backend
+[RootHash]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/roothash/api?tab=doc#Backend
+[Governance]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/governance/api?tab=doc#Backend
+[Beacon]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/beacon/api?tab=doc#Backend
 [Storage]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/storage/api?tab=doc#Backend
 [Runtime Client]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/runtime/client/api?tab=doc#RuntimeClient
-[EnclaveRPC]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/runtime/enclaverpc/api?tab=doc#Transport
 <!-- markdownlint-enable line-length -->

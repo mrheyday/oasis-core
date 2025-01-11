@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"math"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
@@ -10,7 +9,9 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
-	enclaverpc "github.com/oasisprotocol/oasis-core/go/runtime/enclaverpc/api"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle/component"
+	"github.com/oasisprotocol/oasis-core/go/runtime/host/protocol"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/syncer"
 )
 
 const (
@@ -18,7 +19,7 @@ const (
 	ModuleName = "runtime/client"
 
 	// RoundLatest is a special round number always referring to the latest round.
-	RoundLatest uint64 = math.MaxUint64
+	RoundLatest = roothash.RoundLatest
 )
 
 var (
@@ -28,14 +29,34 @@ var (
 	ErrInternal = errors.New(ModuleName, 2, "client: internal error")
 	// ErrTransactionExpired is an error returned when transaction expired.
 	ErrTransactionExpired = errors.New(ModuleName, 3, "client: transaction expired")
+	// ErrNotSynced is an error returned if transaction is submitted before node has finished
+	// initial syncing.
+	ErrNotSynced = errors.New(ModuleName, 4, "client: not finished initial sync")
+	// ErrCheckTxFailed is an error returned if the local transaction check fails.
+	ErrCheckTxFailed = errors.New(ModuleName, 5, "client: transaction check failed")
+	// ErrNoHostedRuntime is returned when the hosted runtime is not available locally.
+	ErrNoHostedRuntime = errors.New(ModuleName, 6, "client: no hosted runtime is available")
 )
 
 // RuntimeClient is the runtime client interface.
 type RuntimeClient interface {
-	enclaverpc.Transport
-
-	// SubmitTx submits a transaction to the runtime transaction scheduler.
+	// SubmitTx submits a transaction to the runtime transaction scheduler and waits
+	// for transaction execution results.
 	SubmitTx(ctx context.Context, request *SubmitTxRequest) ([]byte, error)
+
+	// SubmitTxMeta submits a transaction to the runtime transaction scheduler and waits for
+	// transaction execution results.
+	//
+	// Response includes transaction metadata - e.g. round at which the transaction was included
+	// in a block.
+	SubmitTxMeta(ctx context.Context, request *SubmitTxRequest) (*SubmitTxMetaResponse, error)
+
+	// SubmitTxNoWait submits a transaction to the runtime transaction scheduler but does
+	// not wait for transaction execution.
+	SubmitTxNoWait(ctx context.Context, request *SubmitTxRequest) error
+
+	// CheckTx asks the local runtime to check the specified transaction.
+	CheckTx(ctx context.Context, request *CheckTxRequest) error
 
 	// GetGenesisBlock returns the genesis block.
 	GetGenesisBlock(ctx context.Context, runtimeID common.Namespace) (*block.Block, error)
@@ -43,37 +64,61 @@ type RuntimeClient interface {
 	// GetBlock fetches the given runtime block.
 	GetBlock(ctx context.Context, request *GetBlockRequest) (*block.Block, error)
 
-	// GetBlockByHash fetches the given runtime block by its block hash.
-	GetBlockByHash(ctx context.Context, request *GetBlockByHashRequest) (*block.Block, error)
+	// GetLastRetainedBlock returns the last retained block.
+	GetLastRetainedBlock(ctx context.Context, runtimeID common.Namespace) (*block.Block, error)
 
-	// GetTx fetches the given runtime transaction.
-	GetTx(ctx context.Context, request *GetTxRequest) (*TxResult, error)
+	// GetTransactions fetches all runtime transactions in a given block.
+	GetTransactions(ctx context.Context, request *GetTransactionsRequest) ([][]byte, error)
 
-	// GetTxByBlockHash fetches the given rutnime transaction where the
-	// block is identified by its hash instead of its round number.
-	GetTxByBlockHash(ctx context.Context, request *GetTxByBlockHashRequest) (*TxResult, error)
+	// GetTransactionsWithResults fetches all runtime transactions in a given block together with
+	// its results (outputs and emitted events).
+	GetTransactionsWithResults(ctx context.Context, request *GetTransactionsRequest) ([]*TransactionWithResults, error)
 
-	// GetTxs fetches all runtime transactions in a given block.
-	GetTxs(ctx context.Context, request *GetTxsRequest) ([][]byte, error)
+	// GetUnconfirmedTransactions fetches all unconfirmed runtime transactions
+	// that are currently pending to be included in a block.
+	GetUnconfirmedTransactions(ctx context.Context, runtimeID common.Namespace) ([][]byte, error)
 
-	// QueryTx queries the indexer for a specific runtime transaction.
-	QueryTx(ctx context.Context, request *QueryTxRequest) (*TxResult, error)
+	// GetEvents returns all events emitted in a given block.
+	GetEvents(ctx context.Context, request *GetEventsRequest) ([]*Event, error)
 
-	// QueryTxs queries the indexer for specific runtime transactions.
-	QueryTxs(ctx context.Context, request *QueryTxsRequest) ([]*TxResult, error)
+	// Query makes a runtime-specific query.
+	Query(ctx context.Context, request *QueryRequest) (*QueryResponse, error)
 
 	// WatchBlocks subscribes to blocks for a specific runtimes.
 	WatchBlocks(ctx context.Context, runtimeID common.Namespace) (<-chan *roothash.AnnotatedBlock, pubsub.ClosableSubscription, error)
 
-	// WaitBlockIndexed waits for a runtime block to be indexed by the indexer.
-	WaitBlockIndexed(ctx context.Context, request *WaitBlockIndexedRequest) error
+	// State returns a MKVS read syncer that can be used to read runtime state from a remote node
+	// and verify it against the trusted local root.
+	State() syncer.ReadSyncer
+}
 
-	// Cleanup cleans up the backend.
-	Cleanup()
+// SubmitTxResult is the raw result of submitting a transaction for processing.
+type SubmitTxResult struct {
+	Error  error
+	Result *SubmitTxMetaResponse
 }
 
 // SubmitTxRequest is a SubmitTx request.
 type SubmitTxRequest struct {
+	RuntimeID common.Namespace `json:"runtime_id"`
+	Data      []byte           `json:"data"`
+}
+
+// SubmitTxMetaResponse is the SubmitTxMeta response.
+type SubmitTxMetaResponse struct {
+	// Output is the transaction output.
+	Output []byte `json:"data,omitempty"`
+	// Round is the roothash round in which the transaction was executed.
+	Round uint64 `json:"round,omitempty"`
+	// BatchOrder is the order of the transaction in the execution batch.
+	BatchOrder uint32 `json:"batch_order,omitempty"`
+
+	// CheckTxError is the CheckTx error in case transaction failed the transaction check.
+	CheckTxError *protocol.Error `json:"check_tx_error,omitempty"`
+}
+
+// CheckTxRequest is a CheckTx request.
+type CheckTxRequest struct {
 	RuntimeID common.Namespace `json:"runtime_id"`
 	Data      []byte           `json:"data"`
 }
@@ -84,87 +129,54 @@ type GetBlockRequest struct {
 	Round     uint64           `json:"round"`
 }
 
-// GetBlockByHashRequest is a GetBlockByHash request.
-type GetBlockByHashRequest struct {
-	RuntimeID common.Namespace `json:"runtime_id"`
-	BlockHash hash.Hash        `json:"block_hash"`
-}
-
-// TxResult is the transaction query result.
-type TxResult struct {
-	Block  *block.Block `json:"block"`
-	Index  uint32       `json:"index"`
-	Input  []byte       `json:"input"`
-	Output []byte       `json:"output"`
-}
-
-// GetTxRequest is a GetTx request.
-type GetTxRequest struct {
+// GetTransactionsRequest is a GetTransactions request.
+type GetTransactionsRequest struct {
 	RuntimeID common.Namespace `json:"runtime_id"`
 	Round     uint64           `json:"round"`
-	Index     uint32           `json:"index"`
 }
 
-// GetTxByBlockHashRequest is a GetTxByBlockHash request.
-type GetTxByBlockHashRequest struct {
-	RuntimeID common.Namespace `json:"runtime_id"`
-	BlockHash hash.Hash        `json:"block_hash"`
-	Index     uint32           `json:"index"`
+// TransactionWithResults is a transaction with its raw result and emitted events.
+type TransactionWithResults struct {
+	Tx     []byte        `json:"tx"`
+	Result []byte        `json:"result"`
+	Events []*PlainEvent `json:"events,omitempty"`
 }
 
-// GetTxsRequest is a GetTxs request.
-type GetTxsRequest struct {
-	RuntimeID common.Namespace `json:"runtime_id"`
-	Round     uint64           `json:"round"`
-	IORoot    hash.Hash        `json:"io_root"`
-}
-
-// QueryTxRequest is a QueryTx request.
-type QueryTxRequest struct {
-	RuntimeID common.Namespace `json:"runtime_id"`
-	Key       []byte           `json:"key"`
-	Value     []byte           `json:"value"`
-}
-
-// QueryCondition is a query condition.
-type QueryCondition struct {
-	// Key is the tag key that should be matched.
-	Key []byte `json:"key"`
-	// Values are a list of tag values that the given tag key should
-	// have. They are combined using an OR query which means that any
-	// of the values will match.
-	Values [][]byte `json:"values"`
-}
-
-// Query is a complex query against the index.
-type Query struct {
-	// RoundMin is an optional minimum round (inclusive).
-	RoundMin uint64 `json:"round_min"`
-	// RoundMax is an optional maximum round (inclusive).
-	//
-	// A zero value means that there is no upper limit.
-	RoundMax uint64 `json:"round_max"`
-
-	// Conditions are the query conditions.
-	//
-	// They are combined using an AND query which means that all of
-	// the conditions must be satisfied for an item to match.
-	Conditions []QueryCondition `json:"conditions"`
-
-	// Limit is the maximum number of results to return.
-	//
-	// A zero value means that the `maxQueryLimit` limit is used.
-	Limit uint64 `json:"limit"`
-}
-
-// QueryTxsRequest is a QueryTxs request.
-type QueryTxsRequest struct {
-	RuntimeID common.Namespace `json:"runtime_id"`
-	Query     Query            `json:"query"`
-}
-
-// WaitBlockIndexedRequest is a WaitBlockIndexed request.
-type WaitBlockIndexedRequest struct {
+// GetEventsRequest is a GetEvents request.
+type GetEventsRequest struct {
 	RuntimeID common.Namespace `json:"runtime_id"`
 	Round     uint64           `json:"round"`
+}
+
+// Event is an event emitted by a runtime in the form of a runtime transaction tag.
+//
+// Key and value semantics are runtime-dependent.
+type Event struct {
+	Key    []byte    `json:"key"`
+	Value  []byte    `json:"value"`
+	TxHash hash.Hash `json:"tx_hash"`
+}
+
+// PlainEvent is an event emitted by a runtime in the form of a runtime transaction tag. It
+// does not include the transaction hash.
+//
+// Key and value semantics are runtime-dependent.
+type PlainEvent struct {
+	Key   []byte `json:"key"`
+	Value []byte `json:"value"`
+}
+
+// QueryRequest is a Query request.
+type QueryRequest struct {
+	RuntimeID common.Namespace `json:"runtime_id"`
+	Component *component.ID    `json:"component,omitempty"`
+
+	Round  uint64 `json:"round"`
+	Method string `json:"method"`
+	Args   []byte `json:"args"`
+}
+
+// QueryResponse is a response to the runtime query.
+type QueryResponse struct {
+	Data []byte `json:"data"`
 }

@@ -24,11 +24,11 @@ var (
 )
 
 const (
-	// Prefix used in hash computations of leaf nodes.
+	// PrefixLeafNode is the prefix used in hash computations of leaf nodes.
 	PrefixLeafNode byte = 0x00
-	// Prefix used in hash computations of internal nodes.
+	// PrefixInternalNode is the prefix used in hash computations of internal nodes.
 	PrefixInternalNode byte = 0x01
-	// Prefix used to mark a nil pointer in a subtree serialization.
+	// PrefixNilNode is the prefix used to mark a nil pointer in a subtree serialization.
 	PrefixNilNode byte = 0x02
 
 	// PointerSize is the size of a node pointer in memory.
@@ -38,8 +38,6 @@ const (
 	// LeafNodeSize is the minimum size of a leaf node in memory.
 	LeafNodeSize = uint64(unsafe.Sizeof(LeafNode{}))
 
-	// VersionSize is the size of the encoded version.
-	VersionSize = int(unsafe.Sizeof(uint64(0)))
 	// ValueLengthSize is the size of the encoded value length.
 	ValueLengthSize = int(unsafe.Sizeof(uint32(0)))
 )
@@ -51,19 +49,50 @@ var (
 	_ encoding.BinaryUnmarshaler = (*LeafNode)(nil)
 )
 
+// RootType is a storage root type.
+type RootType uint8
+
+const (
+	// RootTypeInvalid is an invalid/uninitialized root type.
+	RootTypeInvalid RootType = 0
+	// RootTypeState is the type for state storage roots.
+	RootTypeState RootType = 1
+	// RootTypeIO is the type for IO storage roots.
+	RootTypeIO RootType = 2
+
+	// RootTypeMax is the number of different root types and should be kept at the last one.
+	RootTypeMax RootType = 2
+)
+
+// String returns the string representation of the storage root type.
+func (r RootType) String() string {
+	switch r {
+	case RootTypeInvalid:
+		return "invalid"
+	case RootTypeState:
+		return "state-root"
+	case RootTypeIO:
+		return "io-root"
+	default:
+		return fmt.Sprintf("[unknown root type: %d]", r)
+	}
+}
+
 // Root is a storage root.
 type Root struct {
 	// Namespace is the namespace under which the root is stored.
 	Namespace common.Namespace `json:"ns"`
 	// Version is the monotonically increasing version number in which the root is stored.
 	Version uint64 `json:"version"`
+	// Type is the type of storage this root is used for.
+	Type RootType `json:"root_type"`
 	// Hash is the merkle root hash.
 	Hash hash.Hash `json:"hash"`
 }
 
 // String returns the string representation of a storage root.
 func (r Root) String() string {
-	return fmt.Sprintf("<Root ns=%s version=%d hash=%s>", r.Namespace, r.Version, r.Hash)
+	return fmt.Sprintf("<Root ns=%s version=%d type=%v hash=%s>", r.Namespace, r.Version, r.Type, r.Hash)
 }
 
 // Empty sets the storage root to an empty root.
@@ -90,6 +119,9 @@ func (r *Root) IsEmpty() bool {
 
 // Equal compares against another root for equality.
 func (r *Root) Equal(other *Root) bool {
+	if r.Type != other.Type {
+		return false
+	}
 	if !r.Namespace.Equal(&other.Namespace) {
 		return false
 	}
@@ -108,6 +140,9 @@ func (r *Root) Equal(other *Root) bool {
 // It is the responsibility of the caller to check if the merkle roots
 // follow each other.
 func (r *Root) Follows(other *Root) bool {
+	if r.Type != other.Type {
+		return false
+	}
 	if !r.Namespace.Equal(&other.Namespace) {
 		return false
 	}
@@ -124,6 +159,15 @@ func (r *Root) EncodedHash() hash.Hash {
 	return hash.NewFrom(r)
 }
 
+// DBPointer contains NodeDB-specific internals to aid pointer resolution.
+type DBPointer interface {
+	// SetDitry marks the pointer as dirty.
+	SetDirty()
+
+	// Clone makes a copy of the pointer.
+	Clone() DBPointer
+}
+
 // Pointer is a pointer to another node.
 type Pointer struct {
 	Clean bool
@@ -131,9 +175,8 @@ type Pointer struct {
 	Node  Node
 	LRU   *list.Element
 
-	// DBInternal contains NodeDB-specific internal metadata to aid
-	// pointer resolution.
-	DBInternal interface{}
+	// DBInternal contains NodeDB-specific internal metadata to aid pointer resolution.
+	DBInternal DBPointer
 }
 
 // Size returns the size of this pointer in bytes.
@@ -169,6 +212,16 @@ func (p *Pointer) IsClean() bool {
 	return p.Clean
 }
 
+func (p *Pointer) SetDirty() {
+	p.Clean = false
+
+	// Clear any DB-specific pointer as making the node dirty invalidates the pointer.
+	if p.DBInternal != nil {
+		p.DBInternal.SetDirty()
+		p.DBInternal = nil
+	}
+}
+
 // Extract makes a copy of the pointer containing only hash references.
 func (p *Pointer) Extract() *Pointer {
 	if !p.IsClean() {
@@ -177,16 +230,22 @@ func (p *Pointer) Extract() *Pointer {
 	return p.ExtractUnchecked()
 }
 
-// Extract makes a copy of the pointer containing only hash references
+// ExtractUnchecked makes a copy of the pointer containing only hash references
 // without checking the dirty flag.
 func (p *Pointer) ExtractUnchecked() *Pointer {
 	if p == nil {
 		return nil
 	}
 
+	var dbPtr DBPointer
+	if p.DBInternal != nil {
+		dbPtr = p.DBInternal.Clone()
+	}
+
 	return &Pointer{
-		Clean: true,
-		Hash:  p.Hash,
+		Clean:      true,
+		Hash:       p.Hash,
+		DBInternal: dbPtr,
 	}
 }
 
@@ -230,15 +289,16 @@ type Node interface {
 	// IsClean returns true if the node is non-dirty.
 	IsClean() bool
 
-	// CompactMarshalBinary encodes a node into binary form without any hash
-	// pointers (e.g., for proofs).
-	CompactMarshalBinary() ([]byte, error)
+	// CompactMarshalBinaryV0 is a backwards compatibility compact marshalling for
+	// version 0 proofs.
+	CompactMarshalBinaryV0() ([]byte, error)
+
+	// CompactMarshalBinaryV1 encodes a node into binary form without any hash
+	// pointers, for version 1 proofs.
+	CompactMarshalBinaryV1() ([]byte, error)
 
 	// GetHash returns the node's cached hash.
 	GetHash() hash.Hash
-
-	// GetCreatedVersion returns the version in which the node has been created.
-	GetCreatedVersion() uint64
 
 	// UpdateHash updates the node's cached hash by recomputing it.
 	//
@@ -264,9 +324,7 @@ type Node interface {
 // Note that Label and LabelBitLength can only be empty iff the internal
 // node is the root of the tree.
 type InternalNode struct {
-	// Version is the version in which the node has been created.
-	Version uint64
-	Hash    hash.Hash
+	Hash hash.Hash
 	// Label is the label on the incoming edge.
 	Label Key
 	// LabelBitLength is the length of the label in bits.
@@ -295,9 +353,6 @@ func (n *InternalNode) Size() uint64 {
 //
 // Does not mark the node as clean.
 func (n *InternalNode) UpdateHash() {
-	var version [8]byte
-	binary.LittleEndian.PutUint64(version[:], n.Version)
-
 	leafNodeHash := n.LeafNode.GetHash()
 	leftHash := n.Left.GetHash()
 	rightHash := n.Right.GetHash()
@@ -305,7 +360,6 @@ func (n *InternalNode) UpdateHash() {
 
 	n.Hash.FromBytes(
 		[]byte{PrefixInternalNode},
-		version[:],
 		labelBitLength,
 		n.Label[:],
 		leafNodeHash[:],
@@ -319,56 +373,39 @@ func (n *InternalNode) GetHash() hash.Hash {
 	return n.Hash
 }
 
-// GetCreatedVersion returns the version in which the node has been created.
-func (n *InternalNode) GetCreatedVersion() uint64 {
-	return n.Version
-}
-
 // Extract makes a copy of the node containing only hash references.
-//
-// For LeafNode, it makes a deep copy so that the parent internal node always
-// ships it since we cannot address the LeafNode uniquely with NodeID (both the
-// internal node and LeafNode have the same path and bit depth).
 func (n *InternalNode) Extract() Node {
 	if !n.Clean {
 		panic("mkvs: extract called on dirty node")
 	}
 	return &InternalNode{
 		Clean:          true,
-		Version:        n.Version,
 		Hash:           n.Hash,
 		Label:          n.Label,
 		LabelBitLength: n.LabelBitLength,
-		// LeafNode is always contained in internal node.
-		LeafNode: n.LeafNode.ExtractWithNode(),
-		Left:     n.Left.Extract(),
-		Right:    n.Right.Extract(),
+		LeafNode:       n.LeafNode.Extract(),
+		Left:           n.Left.Extract(),
+		Right:          n.Right.Extract(),
 	}
 }
 
-// Extract makes a copy of the node containing only hash references without
+// ExtractUnchecked makes a copy of the node containing only hash references without
 // checking the dirty flag.
-//
-// For LeafNode, it makes a deep copy so that the parent internal node always
-// ships it since we cannot address the LeafNode uniquely with NodeID (both the
-// internal node and LeafNode have the same path and bit depth).
 func (n *InternalNode) ExtractUnchecked() Node {
 	return &InternalNode{
 		Clean:          true,
-		Version:        n.Version,
 		Hash:           n.Hash,
 		Label:          n.Label,
 		LabelBitLength: n.LabelBitLength,
-		// LeafNode is always contained in internal node.
-		LeafNode: n.LeafNode.ExtractWithNodeUnchecked(),
-		Left:     n.Left.ExtractUnchecked(),
-		Right:    n.Right.ExtractUnchecked(),
+		LeafNode:       n.LeafNode.ExtractUnchecked(),
+		Left:           n.Left.ExtractUnchecked(),
+		Right:          n.Right.ExtractUnchecked(),
 	}
 }
 
-// CompactMarshalBinary encodes an internal node into binary form without
-// any hash pointers (e.g., for proofs).
-func (n *InternalNode) CompactMarshalBinary() (data []byte, err error) {
+// CompactMarshalBinaryV0 is a backwards compatibility compact marshalling for
+// version 0 proofs.
+func (n *InternalNode) CompactMarshalBinaryV0() (data []byte, err error) {
 	// Internal node's LeafNode is always marshaled along the internal node.
 	var leafNodeBinary []byte
 	if n.LeafNode == nil {
@@ -380,32 +417,51 @@ func (n *InternalNode) CompactMarshalBinary() (data []byte, err error) {
 		}
 	}
 
-	data = make([]byte, 1+VersionSize+DepthSize+len(n.Label)+len(leafNodeBinary))
-	pos := 0
-	data[pos] = PrefixInternalNode
-	pos++
-	binary.LittleEndian.PutUint64(data[pos:pos+VersionSize], n.Version)
-	pos += VersionSize
-	copy(data[pos:pos+DepthSize], n.LabelBitLength.MarshalBinary()[:])
-	pos += DepthSize
-	copy(data[pos:pos+len(n.Label)], n.Label)
-	pos += len(n.Label)
-	copy(data[pos:pos+len(leafNodeBinary)], leafNodeBinary[:])
+	data = make([]byte, 0, 1+DepthSize+len(n.Label)+len(leafNodeBinary))
+	data = append(data, PrefixInternalNode)
+	data = append(data, n.LabelBitLength.MarshalBinary()...)
+	data = append(data, n.Label...)
+	data = append(data, leafNodeBinary...)
+
+	return
+}
+
+// CompactMarshalBinaryV1 encodes an internal node into binary form without
+// any hash pointers and also doesn't include the leaf node (e.g., for proofs).
+func (n *InternalNode) CompactMarshalBinaryV1() (data []byte, err error) {
+	data = make([]byte, 0, 1+DepthSize+len(n.Label)+1)
+	data = append(data, PrefixInternalNode)
+	data = append(data, n.LabelBitLength.MarshalBinary()...)
+	data = append(data, n.Label...)
+	data = append(data, PrefixNilNode)
+
 	return
 }
 
 // MarshalBinary encodes an internal node into binary form.
 func (n *InternalNode) MarshalBinary() (data []byte, err error) {
-	data, err = n.CompactMarshalBinary()
-	if err != nil {
-		return
+	// Internal node's LeafNode is always marshaled along the internal node.
+	var leafNodeBinary []byte
+	if n.LeafNode == nil {
+		leafNodeBinary = make([]byte, 1)
+		leafNodeBinary[0] = PrefixNilNode
+	} else {
+		if leafNodeBinary, err = n.LeafNode.Node.MarshalBinary(); err != nil {
+			return nil, fmt.Errorf("mkvs: failed to marshal leaf node: %w", err)
+		}
 	}
 
 	leftHash := n.Left.GetHash()
 	rightHash := n.Right.GetHash()
 
+	data = make([]byte, 0, 1+DepthSize+len(n.Label)+len(leafNodeBinary)+2*hash.Size)
+	data = append(data, PrefixInternalNode)
+	data = append(data, n.LabelBitLength.MarshalBinary()...)
+	data = append(data, n.Label...)
+	data = append(data, leafNodeBinary...)
 	data = append(data, leftHash[:]...)
 	data = append(data, rightHash[:]...)
+
 	return
 }
 
@@ -417,7 +473,7 @@ func (n *InternalNode) UnmarshalBinary(data []byte) error {
 
 // SizedUnmarshalBinary decodes a binary marshaled internal node.
 func (n *InternalNode) SizedUnmarshalBinary(data []byte) (int, error) {
-	if len(data) < 1+VersionSize+DepthSize+1 {
+	if len(data) < 1+DepthSize+1 {
 		return 0, ErrMalformedNode
 	}
 
@@ -426,9 +482,6 @@ func (n *InternalNode) SizedUnmarshalBinary(data []byte) (int, error) {
 		return 0, ErrMalformedNode
 	}
 	pos++
-
-	n.Version = binary.LittleEndian.Uint64(data[pos : pos+VersionSize])
-	pos += VersionSize
 
 	if _, err := n.LabelBitLength.UnmarshalBinary(data[pos:]); err != nil {
 		return 0, fmt.Errorf("mkvs: failed to unmarshal LabelBitLength: %w", err)
@@ -505,8 +558,7 @@ func (n *InternalNode) Equal(other Node) bool {
 		if n.Clean && other.Clean {
 			return n.Hash.Equal(&other.Hash)
 		}
-		return n.Version == other.Version &&
-			n.LeafNode.Equal(other.LeafNode) &&
+		return n.LeafNode.Equal(other.LeafNode) &&
 			n.Left.Equal(other.Left) &&
 			n.Right.Equal(other.Right) &&
 			n.LabelBitLength == other.LabelBitLength &&
@@ -518,11 +570,9 @@ func (n *InternalNode) Equal(other Node) bool {
 // LeafNode is a leaf node containing a key/value pair.
 type LeafNode struct {
 	Clean bool
-	// Version is the version in which the node has been created.
-	Version uint64
-	Hash    hash.Hash
-	Key     Key
-	Value   []byte
+	Hash  hash.Hash
+	Key   Key
+	Value []byte
 }
 
 // IsClean returns true if the node is non-dirty.
@@ -543,19 +593,15 @@ func (n *LeafNode) GetHash() hash.Hash {
 	return n.Hash
 }
 
-// GetCreatedVersion returns the version in which the node has been created.
-func (n *LeafNode) GetCreatedVersion() uint64 {
-	return n.Version
-}
-
 // UpdateHash updates the node's cached hash by recomputing it.
 //
 // Does not mark the node as clean.
 func (n *LeafNode) UpdateHash() {
-	var version [VersionSize]byte
-	binary.LittleEndian.PutUint64(version[:], n.Version)
+	var keyLen, valueLen [4]byte
+	binary.LittleEndian.PutUint32(keyLen[:], uint32(len(n.Key)))
+	binary.LittleEndian.PutUint32(valueLen[:], uint32(len(n.Value)))
 
-	n.Hash.FromBytes([]byte{PrefixLeafNode}, version[:], n.Key[:], n.Value[:])
+	n.Hash.FromBytes([]byte{PrefixLeafNode}, keyLen[:], n.Key[:], valueLen[:], n.Value[:])
 }
 
 // Extract makes a copy of the node containing only hash references.
@@ -566,42 +612,42 @@ func (n *LeafNode) Extract() Node {
 	return n.ExtractUnchecked()
 }
 
-// Extract makes a copy of the node containing only hash references
+// ExtractUnchecked makes a copy of the node containing only hash references
 // without checking the dirty flag.
 func (n *LeafNode) ExtractUnchecked() Node {
 	return &LeafNode{
-		Clean:   true,
-		Version: n.Version,
-		Hash:    n.Hash,
-		Key:     n.Key,
-		Value:   n.Value,
+		Clean: true,
+		Hash:  n.Hash,
+		Key:   n.Key,
+		Value: n.Value,
 	}
 }
 
-// CompactMarshalBinary encodes a leaf node into binary form.
-func (n *LeafNode) CompactMarshalBinary() (data []byte, err error) {
+// CompactMarshalBinaryV0 is a backwards compatibility compact marshaling for
+// version 0 proofs.
+func (n *LeafNode) CompactMarshalBinaryV0() ([]byte, error) {
+	return n.CompactMarshalBinaryV1() // Leaf node format is the same between versions.
+}
+
+// CompactMarshalBinaryV1 encodes a leaf node into binary form.
+func (n *LeafNode) CompactMarshalBinaryV1() (data []byte, err error) {
 	keyData, err := n.Key.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
 
-	data = make([]byte, 1+VersionSize+len(keyData)+ValueLengthSize+len(n.Value))
-	pos := 0
-	data[pos] = PrefixLeafNode
-	pos++
-	binary.LittleEndian.PutUint64(data[pos:pos+VersionSize], n.Version)
-	pos += VersionSize
-	copy(data[pos:pos+len(keyData)], keyData)
-	pos += len(keyData)
-	binary.LittleEndian.PutUint32(data[pos:pos+ValueLengthSize], uint32(len(n.Value)))
-	pos += ValueLengthSize
-	copy(data[pos:], n.Value)
+	data = make([]byte, 0, 1+len(keyData)+ValueLengthSize+len(n.Value))
+	data = append(data, PrefixLeafNode)
+	data = append(data, keyData...)
+	data = binary.LittleEndian.AppendUint32(data, uint32(len(n.Value)))
+	data = append(data, n.Value...)
+
 	return
 }
 
 // MarshalBinary encodes a leaf node into binary form.
 func (n *LeafNode) MarshalBinary() ([]byte, error) {
-	return n.CompactMarshalBinary()
+	return n.CompactMarshalBinaryV0() // Leaf node format is the same for compact and non-compact.
 }
 
 // UnmarshalBinary decodes a binary marshaled leaf node.
@@ -612,13 +658,11 @@ func (n *LeafNode) UnmarshalBinary(data []byte) error {
 
 // SizedUnmarshalBinary decodes a binary marshaled leaf node.
 func (n *LeafNode) SizedUnmarshalBinary(data []byte) (int, error) {
-	if len(data) < 1+VersionSize+DepthSize+ValueLengthSize || data[0] != PrefixLeafNode {
+	if len(data) < 1+DepthSize+ValueLengthSize || data[0] != PrefixLeafNode {
 		return 0, ErrMalformedNode
 	}
 
 	pos := 1
-	n.Version = binary.LittleEndian.Uint64(data[pos : pos+VersionSize])
-	pos += VersionSize
 
 	var key Key
 	keySize, err := key.SizedUnmarshalBinary(data[pos:])
@@ -661,8 +705,7 @@ func (n *LeafNode) Equal(other Node) bool {
 		if n.Clean && other.Clean {
 			return n.Hash.Equal(&other.Hash)
 		}
-		return n.Version == other.Version &&
-			n.Key.Equal(other.Key) &&
+		return n.Key.Equal(other.Key) &&
 			bytes.Equal(n.Value, other.Value)
 	}
 	return false

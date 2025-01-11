@@ -7,6 +7,14 @@ import (
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/node"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/writelog"
+)
+
+const (
+	// MinimumProofVersion is the minimum supported proof version.
+	MinimumProofVersion = 0
+	// LatestProofVersion is the latest supported proof version.
+	LatestProofVersion = 1
 )
 
 const (
@@ -18,6 +26,22 @@ const (
 
 // Proof is a Merkle proof for a subtree.
 type Proof struct {
+	// V is the proof version.
+	//
+	// Similar to `cbor.Versioned` but the version is omitted if it is 0.
+	// We don't use `cbor.Versioned` since we want version 0 proofs to be
+	// backwards compatible with the old structure which was not versioned.
+	//
+	// Version 0:
+	// Initial format.
+	//
+	// Version 1 change:
+	// Leaf nodes are included separately, as children. In version 0 the leaf node was
+	// serialized within the internal node.  The rationale behind this change is to eliminate
+	// the need to serialize all leaf nodes on the path when proving the existence of a
+	// specific value.
+	V uint16 `json:"v,omitempty"`
+
 	// UntrustedRoot is the root hash this proof is for. This should only be
 	// used as a quick sanity check and proof verification MUST use an
 	// independently obtained root hash as the prover can provide any root.
@@ -33,17 +57,48 @@ type proofNode struct {
 
 // ProofBuilder is a Merkle proof builder.
 type ProofBuilder struct {
-	root     hash.Hash
-	included map[hash.Hash]*proofNode
-	size     uint64
+	proofVersion uint16
+	root         hash.Hash
+	subtree      hash.Hash
+	included     map[hash.Hash]*proofNode
+	size         uint64
 }
 
 // NewProofBuilder creates a new Merkle proof builder for the given root.
-func NewProofBuilder(root hash.Hash) *ProofBuilder {
-	return &ProofBuilder{
-		root:     root,
-		included: make(map[hash.Hash]*proofNode),
+func NewProofBuilder(root, subtree hash.Hash) *ProofBuilder {
+	pb, err := NewProofBuilderForVersion(root, subtree, LatestProofVersion)
+	if err != nil {
+		panic(err)
 	}
+	return pb
+}
+
+// NewProofBuilderV0 creates a new version 0 proof builder for the given root.
+func NewProofBuilderV0(root, subtree hash.Hash) *ProofBuilder {
+	pb, err := NewProofBuilderForVersion(root, subtree, 0)
+	if err != nil {
+		panic(err)
+	}
+	return pb
+}
+
+// NewProofBuilderForVersion creates a new Merkle proof builder for the given root
+// in a given proof version format.
+func NewProofBuilderForVersion(root, subtree hash.Hash, proofVersion uint16) (*ProofBuilder, error) {
+	if proofVersion < MinimumProofVersion || proofVersion > LatestProofVersion {
+		return nil, fmt.Errorf("%v: %d", ErrUnsupportedProofVersion, proofVersion)
+	}
+	return &ProofBuilder{
+		proofVersion: proofVersion,
+		root:         root,
+		subtree:      subtree,
+		included:     make(map[hash.Hash]*proofNode),
+	}, nil
+}
+
+// Version returns the proof version.
+func (b *ProofBuilder) Version() uint16 {
+	return b.proofVersion
 }
 
 // Include adds a node to the set of included nodes.
@@ -66,19 +121,43 @@ func (b *ProofBuilder) Include(n node.Node) {
 	// Node is available, serialize it.
 	var err error
 	var pn proofNode
-	pn.serialized, err = n.CompactMarshalBinary()
+	switch b.proofVersion {
+	case 0:
+		// In version 0, the leaf is included in the internal node.
+		pn.serialized, err = n.CompactMarshalBinaryV0()
+	case 1:
+		// In version 1, the leaf node is added separately, as a child.
+		pn.serialized, err = n.CompactMarshalBinaryV1()
+	default:
+		panic("proof: unexpected proof version")
+	}
 	if err != nil {
 		panic(err)
 	}
 
 	// For internal nodes, also add any children.
 	if nd, ok := n.(*node.InternalNode); ok {
-		// Add leaf, left and right.
-		for _, child := range []*node.Pointer{
-			// NOTE: LeafNode is always included with the internal node.
-			nd.Left,
-			nd.Right,
-		} {
+
+		var children []*node.Pointer
+		switch b.proofVersion {
+		case 0:
+			// In version 0, the leaf node is included in the internal node.
+			children = []*node.Pointer{
+				nd.Left,
+				nd.Right,
+			}
+		case 1:
+			// In version 1, the leaf node is added separately, as a child.
+			children = []*node.Pointer{
+				nd.LeafNode,
+				nd.Left,
+				nd.Right,
+			}
+		default:
+			panic("proof: unexpected proof version")
+		}
+
+		for _, child := range children {
 			var childHash hash.Hash
 			if child == nil {
 				childHash.Empty()
@@ -94,14 +173,14 @@ func (b *ProofBuilder) Include(n node.Node) {
 	b.size += 1 + uint64(len(pn.serialized))
 }
 
-// HasRoot returns true if the root node has already been included.
-func (b *ProofBuilder) HasRoot() bool {
-	return b.included[b.root] != nil
+// HasSubtreeRoot returns true if the subtree root node has already been included.
+func (b *ProofBuilder) HasSubtreeRoot() bool {
+	return b.included[b.subtree] != nil
 }
 
-// GetRoot returns the root hash for this proof.
-func (b *ProofBuilder) GetRoot() hash.Hash {
-	return b.root
+// GetSubtreeRoot returns the subtree root hash for this proof.
+func (b *ProofBuilder) GetSubtreeRoot() hash.Hash {
+	return b.subtree
 }
 
 // Size returns the current size of this proof.
@@ -112,9 +191,19 @@ func (b *ProofBuilder) Size() uint64 {
 // Build tries to build the proof.
 func (b *ProofBuilder) Build(ctx context.Context) (*Proof, error) {
 	proof := Proof{
-		UntrustedRoot: b.root,
+		V: b.proofVersion,
 	}
-	if err := b.build(ctx, &proof, b.root); err != nil {
+
+	switch b.HasSubtreeRoot() {
+	case true:
+		// A partial proof for the subtree is available, include that.
+		proof.UntrustedRoot = b.subtree
+	case false:
+		// No partial proof available, we need to use the tree root.
+		proof.UntrustedRoot = b.root
+	}
+
+	if err := b.build(ctx, &proof, proof.UntrustedRoot); err != nil {
 		return nil, err
 	}
 	return &proof, nil
@@ -155,12 +244,55 @@ func (b *ProofBuilder) build(ctx context.Context, proof *Proof, h hash.Hash) err
 }
 
 // ProofVerifier enables verifying proofs returned by the ReadSyncer API.
-type ProofVerifier struct {
+type ProofVerifier struct{}
+
+type verifyOpts struct {
+	writeLog bool
+}
+
+type verifyResult struct {
+	// rootPtr is the pointer to the in-memory root node of the verified proof.
+	rootPtr *node.Pointer
+	// writeLog is the writelog containing key/value pairs if requested.
+	writeLog writelog.WriteLog
+}
+
+func (vr *verifyResult) addLeafToWriteLog(leaf *node.Pointer) {
+	if leaf == nil {
+		return
+	}
+	leafNode, ok := leaf.Node.(*node.LeafNode)
+	if !ok {
+		return
+	}
+	vr.writeLog = append(vr.writeLog, writelog.LogEntry{Key: leafNode.Key, Value: leafNode.Value})
 }
 
 // VerifyProof verifies a proof and generates an in-memory subtree representing
 // the nodes which are included in the proof.
 func (pv *ProofVerifier) VerifyProof(ctx context.Context, root hash.Hash, proof *Proof) (*node.Pointer, error) {
+	res, err := pv.verifyProofOpts(ctx, root, proof, &verifyOpts{})
+	if err != nil {
+		return nil, err
+	}
+	return res.rootPtr, nil
+}
+
+// VerifyProofToWriteLog verifies a proof and generates a write log representing the key/value pairs
+// which are included in the proof.
+func (pv *ProofVerifier) VerifyProofToWriteLog(ctx context.Context, root hash.Hash, proof *Proof) (writelog.WriteLog, error) {
+	res, err := pv.verifyProofOpts(ctx, root, proof, &verifyOpts{writeLog: true})
+	if err != nil {
+		return nil, err
+	}
+	return res.writeLog, nil
+}
+
+func (pv *ProofVerifier) verifyProofOpts(ctx context.Context, root hash.Hash, proof *Proof, opts *verifyOpts) (*verifyResult, error) {
+	if proof.V < MinimumProofVersion || proof.V > LatestProofVersion {
+		return nil, fmt.Errorf("verifier: unsupported proof version: %d", proof.V)
+	}
+
 	// Sanity check that the proof is for the correct root (as otherwise it
 	// makes no sense to verify the proof).
 	if !proof.UntrustedRoot.Equal(&root) {
@@ -173,15 +305,21 @@ func (pv *ProofVerifier) VerifyProof(ctx context.Context, root hash.Hash, proof 
 		return nil, errors.New("verifier: empty proof")
 	}
 
-	_, rootNode, err := pv.verifyProof(ctx, proof, 0)
+	var res verifyResult
+	idx, rootPtr, err := pv.verifyProof(ctx, proof, 0, opts, &res)
 	if err != nil {
 		return nil, err
 	}
-	rootNodeHash := rootNode.GetHash()
+	// Make sure that all of the entries in the proof have been used. The returned index should
+	// point to just beyond the last element.
+	if idx != len(proof.Entries) {
+		return nil, fmt.Errorf("verifier: unused entries in proof")
+	}
+	rootNodeHash := rootPtr.GetHash()
 	if rootNodeHash.IsEmpty() {
 		// Make sure that in case the root node is empty we always return nil
 		// and not a pointer that represents nil.
-		rootNode = nil
+		rootPtr = nil
 	}
 
 	if !rootNodeHash.Equal(&root) {
@@ -190,10 +328,13 @@ func (pv *ProofVerifier) VerifyProof(ctx context.Context, root hash.Hash, proof 
 			rootNodeHash,
 		)
 	}
-	return rootNode, nil
+
+	res.rootPtr = rootPtr
+
+	return &res, nil
 }
 
-func (pv *ProofVerifier) verifyProof(ctx context.Context, proof *Proof, idx int) (int, *node.Pointer, error) {
+func (pv *ProofVerifier) verifyProof(ctx context.Context, proof *Proof, idx int, opts *verifyOpts, res *verifyResult) (int, *node.Pointer, error) {
 	if ctx.Err() != nil {
 		return -1, nil, ctx.Err()
 	}
@@ -220,13 +361,31 @@ func (pv *ProofVerifier) verifyProof(ctx context.Context, proof *Proof, idx int)
 		// For internal nodes, also decode children.
 		pos := idx + 1
 		if nd, ok := n.(*node.InternalNode); ok {
+			switch proof.V {
+			case 0:
+				// In version 0, the leaf node is included in the internal node.
+				if opts.writeLog {
+					res.addLeafToWriteLog(nd.LeafNode)
+				}
+			case 1:
+				// In version 1, the leaf node is added separately, as a child.
+				// Leaf.
+				pos, nd.LeafNode, err = pv.verifyProof(ctx, proof, pos, opts, res)
+				if err != nil {
+					return -1, nil, err
+				}
+			default:
+				// Checked in verifyProofOpts.
+				panic("unexpected proof version")
+			}
+
 			// Left.
-			pos, nd.Left, err = pv.verifyProof(ctx, proof, pos)
+			pos, nd.Left, err = pv.verifyProof(ctx, proof, pos, opts, res)
 			if err != nil {
 				return -1, nil, err
 			}
 			// Right.
-			pos, nd.Right, err = pv.verifyProof(ctx, proof, pos)
+			pos, nd.Right, err = pv.verifyProof(ctx, proof, pos, opts, res)
 			if err != nil {
 				return -1, nil, err
 			}
@@ -235,7 +394,13 @@ func (pv *ProofVerifier) verifyProof(ctx context.Context, proof *Proof, idx int)
 			nd.UpdateHash()
 		}
 
-		return pos, &node.Pointer{Clean: true, Hash: n.GetHash(), Node: n}, nil
+		ptr := &node.Pointer{Clean: true, Hash: n.GetHash(), Node: n}
+
+		if opts.writeLog {
+			res.addLeafToWriteLog(ptr)
+		}
+
+		return pos, ptr, nil
 	case proofEntryHash:
 		// Hash of a node.
 		var h hash.Hash

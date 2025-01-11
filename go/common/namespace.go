@@ -15,6 +15,9 @@ const (
 	// NamespaceSize is the size of a chain namespace identifier in bytes.
 	NamespaceSize = 32
 
+	// NamespaceHexSize is the size of the chain namespace identifier in string format.
+	NamespaceHexSize = NamespaceSize * 2
+
 	// NamespaceIDSize is the size of the identifier component of a namespace.
 	NamespaceIDSize = NamespaceSize - 8
 
@@ -60,18 +63,25 @@ func (n *Namespace) UnmarshalBinary(data []byte) error {
 }
 
 // MarshalText encodes a namespace identifier into text form.
-func (n Namespace) MarshalText() (data []byte, err error) {
-	return []byte(base64.StdEncoding.EncodeToString(n[:])), nil
+func (n Namespace) MarshalText() ([]byte, error) {
+	return n.MarshalHex()
 }
 
 // UnmarshalText decodes a text marshaled namespace identifier.
 func (n *Namespace) UnmarshalText(text []byte) error {
-	b, err := base64.StdEncoding.DecodeString(string(text))
+	err := n.UnmarshalHex(string(text))
 	if err != nil {
-		return err
+		// For backwards compatibility (e.g. to be able to load the
+		// Cobalt Upgrade genesis file), fallback to accepting
+		// Base64-encoded namespace identifiers.
+		return n.UnmarshalBase64(text)
 	}
+	return nil
+}
 
-	return n.UnmarshalBinary(b)
+// MarshalHex encodes a namespace identifier into a hexadecimal form.
+func (n *Namespace) MarshalHex() ([]byte, error) {
+	return []byte(hex.EncodeToString(n[:])), nil
 }
 
 // UnmarshalHex deserializes a hexadecimal text string into the given type.
@@ -84,17 +94,44 @@ func (n *Namespace) UnmarshalHex(text string) error {
 	return n.UnmarshalBinary(b)
 }
 
+// UnmarshalBase64 deserializes a Base64 text string into the given type.
+func (n *Namespace) UnmarshalBase64(text []byte) error {
+	b, err := base64.StdEncoding.DecodeString(string(text))
+	if err != nil {
+		return err
+	}
+	return n.UnmarshalBinary(b)
+}
+
 // Equal compares vs another namespace for equality.
 func (n *Namespace) Equal(cmp *Namespace) bool {
-	if cmp == nil {
+	if n == cmp {
+		return true
+	}
+	if n == nil || cmp == nil {
 		return false
 	}
 	return bytes.Equal(n[:], cmp[:])
 }
 
-// String returns the string representation of a chain namespace identifier.
+// Base64 returns the base64 string representation of a namespace identifier.
+func (n Namespace) Base64() string {
+	return base64.StdEncoding.EncodeToString(n[:])
+}
+
+// Hex returns the hexadecimal string representation of a namespace identifier.
+func (n Namespace) Hex() string {
+	return hex.EncodeToString(n[:])
+}
+
+// String returns the string representation of a namespace identifier.
 func (n Namespace) String() string {
 	return hex.EncodeToString(n[:])
+}
+
+// Hash returns a cryptographic hash of a namespace identifier.
+func (n Namespace) Hash() hash.Hash {
+	return hash.NewFromBytes(n[:])
 }
 
 // IsTest returns true iff the namespace is for a test runtime.

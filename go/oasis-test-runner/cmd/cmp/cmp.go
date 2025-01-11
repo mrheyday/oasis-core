@@ -21,6 +21,8 @@ import (
 
 const (
 	cfgMetrics                = "metrics"
+	cfgMetricsAddr            = "metrics.address"
+	cfgMetricsLabels          = "metrics.labels"
 	cfgMetricsP               = "m"
 	cfgMetricsTargetGitBranch = "metrics.target.git_branch"
 	cfgMetricsSourceGitBranch = "metrics.source.git_branch"
@@ -503,16 +505,16 @@ func fetchAndCompare(
 func initCmpLogger() error {
 	var logFmt logging.Format
 	if err := logFmt.Set(viper.GetString(common.CfgLogFmt)); err != nil {
-		return fmt.Errorf("root: failed to set log format: %w", err)
+		return fmt.Errorf("cmp/root: failed to set log format: %w", err)
 	}
 
 	var logLevel logging.Level
 	if err := logLevel.Set(viper.GetString(common.CfgLogLevel)); err != nil {
-		return fmt.Errorf("root: failed to set log level: %w", err)
+		return fmt.Errorf("cmp/root: failed to set log level: %w", err)
 	}
 
 	if err := logging.Initialize(os.Stdout, logFmt, logLevel, nil); err != nil {
-		return fmt.Errorf("root: failed to initialize logging: %w", err)
+		return fmt.Errorf("cmp/root: failed to initialize logging: %w", err)
 	}
 
 	cmpLogger = logging.GetLogger("cmd/cmp")
@@ -520,15 +522,19 @@ func initCmpLogger() error {
 	return nil
 }
 
-func runCmp(cmd *cobra.Command, args []string) {
+func runCmp(cmd *cobra.Command, _ []string) {
 	if err := initCmpLogger(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 
+	// Workaround for viper bug: https://github.com/spf13/viper/issues/233
+	_ = viper.BindPFlag(cfgMetricsAddr, cmd.Flags().Lookup(cfgMetricsAddr))
+	_ = viper.BindPFlag(cfgMetricsLabels, cmd.Flags().Lookup(cfgMetricsLabels))
+
 	var err error
 	client, err = api.NewClient(api.Config{
-		Address: viper.GetString(metrics.CfgMetricsAddr),
+		Address: viper.GetString(cfgMetricsAddr),
 	})
 	if err != nil {
 		cmpLogger.Error("error creating client", "err", err)
@@ -555,7 +561,7 @@ func runCmp(cmd *cobra.Command, args []string) {
 		// Set other required Prometheus labels, if passed.
 		// TODO: Integrate scenario parameters and parameter set combinations if
 		// multiple values are provided like we do in oasis-test-runner.
-		for k, v := range viper.GetStringMapString(metrics.CfgMetricsLabels) {
+		for k, v := range viper.GetStringMapString(cfgMetricsLabels) {
 			srcLabels[k] = v
 			tgtLabels[k] = v
 		}
@@ -673,6 +679,9 @@ func Register(parentCmd *cobra.Command) {
 		"(optional) git_branch label for the target benchmark instance",
 	)
 	cmpFlags.String(cfgMetricsNetDevice, "lo", "network device traffic to compare")
+
+	cmpFlags.String(cfgMetricsAddr, "http://127.0.0.1:3000", "metrics pull address")
+	cmpFlags.StringToString(cfgMetricsLabels, map[string]string{}, "metrics push instance label")
 
 	_ = viper.BindPFlags(cmpFlags)
 	cmpCmd.Flags().AddFlagSet(cmpFlags)

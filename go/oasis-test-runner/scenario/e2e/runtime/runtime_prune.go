@@ -26,29 +26,29 @@ const (
 )
 
 type runtimePruneImpl struct {
-	runtimeImpl
+	Scenario
 }
 
 func newRuntimePruneImpl() scenario.Scenario {
 	return &runtimePruneImpl{
-		runtimeImpl: *newRuntimeImpl("runtime-prune", "", nil),
+		Scenario: *NewScenario("runtime-prune", nil),
 	}
 }
 
 func (sc *runtimePruneImpl) Clone() scenario.Scenario {
 	return &runtimePruneImpl{
-		runtimeImpl: *sc.runtimeImpl.Clone().(*runtimeImpl),
+		Scenario: *sc.Scenario.Clone().(*Scenario),
 	}
 }
 
 func (sc *runtimePruneImpl) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := sc.runtimeImpl.Fixture()
+	f, err := sc.Scenario.Fixture()
 	if err != nil {
 		return nil, err
 	}
 
 	// Avoid unexpected blocks.
-	f.Network.EpochtimeMock = true
+	f.Network.SetMockEpoch()
 	// Configure pruning.
 	f.Runtimes[1].Pruner = oasis.RuntimePrunerCfg{
 		Strategy: history.PrunerStrategyKeepLast,
@@ -59,7 +59,7 @@ func (sc *runtimePruneImpl) Fixture() (*oasis.NetworkFixture, error) {
 	return f, nil
 }
 
-func (sc *runtimePruneImpl) Run(childEnv *env.Env) error {
+func (sc *runtimePruneImpl) Run(ctx context.Context, _ *env.Env) error {
 	if err := sc.Net.Start(); err != nil {
 		return err
 	}
@@ -69,11 +69,10 @@ func (sc *runtimePruneImpl) Run(childEnv *env.Env) error {
 		return err
 	}
 
-	if err = sc.initialEpochTransitions(fixture); err != nil {
+	if _, err = sc.initialEpochTransitions(ctx, fixture); err != nil {
 		return err
 	}
 
-	ctx := context.Background()
 	c := sc.Net.ClientController().RuntimeClient
 
 	// Submit transactions.
@@ -82,7 +81,7 @@ func (sc *runtimePruneImpl) Run(childEnv *env.Env) error {
 			"seq", i,
 		)
 
-		if err = sc.submitKeyValueRuntimeInsertTx(ctx, runtimeID, "hello", fmt.Sprintf("world %d", i)); err != nil {
+		if _, err = sc.submitKeyValueRuntimeInsertTx(ctx, KeyValueRuntimeID, uint64(i), "hello", fmt.Sprintf("world %d", i), 0, 0, plaintextTxKind); err != nil {
 			return err
 		}
 	}
@@ -93,7 +92,7 @@ func (sc *runtimePruneImpl) Run(childEnv *env.Env) error {
 	// Once the transactions are complete, check if blocks got pruned.
 	sc.Logger.Info("fetching latest block")
 	latestBlk, err := c.GetBlock(ctx, &api.GetBlockRequest{
-		RuntimeID: runtimeID,
+		RuntimeID: KeyValueRuntimeID,
 		Round:     api.RoundLatest,
 	})
 	if err != nil {
@@ -105,7 +104,7 @@ func (sc *runtimePruneImpl) Run(childEnv *env.Env) error {
 	)
 	for i := uint64(0); i <= latestBlk.Header.Round; i++ {
 		_, err = c.GetBlock(ctx, &api.GetBlockRequest{
-			RuntimeID: runtimeID,
+			RuntimeID: KeyValueRuntimeID,
 			Round:     i,
 		})
 		if i <= latestBlk.Header.Round-pruneNumKept {

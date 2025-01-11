@@ -87,7 +87,7 @@ func errorFromGrpc(err error) error {
 			return err
 		}
 
-		if mappedErr := errors.FromCode(ge.Module, ge.Code); mappedErr != nil {
+		if mappedErr := errors.FromCode(ge.Module, ge.Code, sp.Message); mappedErr != nil {
 			return mappedErr
 		}
 	}
@@ -98,7 +98,7 @@ func errorFromGrpc(err error) error {
 func serverUnaryErrorMapper(
 	ctx context.Context,
 	req interface{},
-	info *grpc.UnaryServerInfo,
+	_ *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
 	rsp, err := handler(ctx, req)
@@ -108,7 +108,7 @@ func serverUnaryErrorMapper(
 func serverStreamErrorMapper(
 	srv interface{},
 	ss grpc.ServerStream,
-	info *grpc.StreamServerInfo,
+	_ *grpc.StreamServerInfo,
 	handler grpc.StreamHandler,
 ) error {
 	err := handler(srv, ss)

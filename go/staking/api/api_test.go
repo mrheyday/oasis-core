@@ -1,10 +1,15 @@
 package api
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/oasisprotocol/oasis-core/go/beacon/api"
+	"github.com/oasisprotocol/oasis-core/go/common/cbor"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 )
 
@@ -20,10 +25,11 @@ func TestConsensusParameters(t *testing.T) {
 		KindEntity:            *quantity.NewQuantity(),
 		KindNodeValidator:     *quantity.NewQuantity(),
 		KindNodeCompute:       *quantity.NewQuantity(),
-		KindNodeStorage:       *quantity.NewQuantity(),
+		KindNodeObserver:      *quantity.NewQuantity(),
 		KindNodeKeyManager:    *quantity.NewQuantity(),
 		KindRuntimeCompute:    *quantity.NewQuantity(),
 		KindRuntimeKeyManager: *quantity.NewQuantity(),
+		KindKeyManagerChurp:   *quantity.NewQuantity(),
 	}
 	validThresholdsParams := ConsensusParameters{
 		Thresholds:         validThresholds,
@@ -41,12 +47,100 @@ func TestConsensusParameters(t *testing.T) {
 		FeeSplitWeightNextPropose: mustInitQuantity(t, 0),
 	}
 	require.Error(degenerateFeeSplit.SanityCheck(), "consensus parameters with degenerate fee split should be invalid")
+
+	// Reward schedule steps.
+	r1 := ConsensusParameters{
+		Thresholds:         validThresholds,
+		FeeSplitWeightVote: mustInitQuantity(t, 1),
+		RewardSchedule:     nil,
+	}
+	require.NoError(r1.SanityCheck(), "nil reward schedule should be valid")
+
+	r2 := ConsensusParameters{
+		Thresholds:         validThresholds,
+		FeeSplitWeightVote: mustInitQuantity(t, 1),
+		RewardSchedule:     []RewardStep{},
+	}
+	require.NoError(r2.SanityCheck(), "empty reward schedule should be valid")
+
+	r3 := ConsensusParameters{
+		Thresholds:         validThresholds,
+		FeeSplitWeightVote: mustInitQuantity(t, 1),
+		RewardSchedule: []RewardStep{
+			{10, mustInitQuantity(t, 10_000_000)},
+			{20, mustInitQuantity(t, 5_000_000)},
+			{30, mustInitQuantity(t, 1_000_000)},
+		},
+	}
+	require.NoError(r3.SanityCheck(), "sequential reward schedule should be valid")
+
+	r4 := ConsensusParameters{
+		Thresholds:         validThresholds,
+		FeeSplitWeightVote: mustInitQuantity(t, 1),
+		RewardSchedule: []RewardStep{
+			{30, mustInitQuantity(t, 1_000_000)},
+			{10, mustInitQuantity(t, 10_000_000)},
+			{20, mustInitQuantity(t, 5_000_000)},
+		},
+	}
+	require.Error(r4.SanityCheck(), "non-sequential reward schedule should be invalid")
+
+	r5 := ConsensusParameters{
+		Thresholds:         validThresholds,
+		FeeSplitWeightVote: mustInitQuantity(t, 1),
+		RewardSchedule: []RewardStep{
+			{10, mustInitQuantity(t, 10_000_000)},
+			{20, mustInitQuantity(t, 5_000_000)},
+			{5, mustInitQuantity(t, 1_000_000)},
+		},
+	}
+	require.Error(r5.SanityCheck(), "another non-sequential reward schedule should be invalid")
+
+	r6 := ConsensusParameters{
+		Thresholds:         validThresholds,
+		FeeSplitWeightVote: mustInitQuantity(t, 1),
+		RewardSchedule: []RewardStep{
+			{api.EpochMax, mustInitQuantity(t, 1_000_000)},
+		},
+	}
+	require.NoError(r6.SanityCheck(), "reward schedule with only one step should be valid")
+
+	r7 := ConsensusParameters{
+		Thresholds:         validThresholds,
+		FeeSplitWeightVote: mustInitQuantity(t, 1),
+		RewardSchedule: []RewardStep{
+			{api.EpochInvalid, mustInitQuantity(t, 1_000_000)},
+		},
+	}
+	require.Error(r7.SanityCheck(), "reward schedule with invalid epoch in until field should be invalid")
+
+	r8 := ConsensusParameters{
+		Thresholds:         validThresholds,
+		FeeSplitWeightVote: mustInitQuantity(t, 1),
+		RewardSchedule: []RewardStep{
+			{10, mustInitQuantity(t, 10_000_000)},
+			{10, mustInitQuantity(t, 5_000_000)},
+		},
+	}
+	require.Error(r8.SanityCheck(), "reward schedule steps should not have same until field")
+
+	over := RewardAmountDenominator.Clone()
+	require.False(over.IsZero())
+	require.NoError(over.Add(quantity.NewFromUint64(1)))
+	r9 := ConsensusParameters{
+		Thresholds:         validThresholds,
+		FeeSplitWeightVote: mustInitQuantity(t, 1),
+		RewardSchedule: []RewardStep{
+			{10, *over},
+		},
+	}
+	require.Error(r9.SanityCheck(), "reward schedule step scale should not be greater than the reward amount denominator")
 }
 
 func TestThresholdKind(t *testing.T) {
 	require := require.New(t)
 
-	for k := ThresholdKind(0); k <= KindMax; k++ {
+	for _, k := range ThresholdKinds {
 		enc, err := k.MarshalText()
 		require.NoError(err, "MarshalText")
 
@@ -102,8 +196,8 @@ func TestStakeThreshold(t *testing.T) {
 		{StakeThreshold{}, StakeThreshold{Constant: &c2}, false},
 		{StakeThreshold{}, StakeThreshold{}, false},
 	} {
-		require.True(t.a.Equal(&t.b) == t.equal, "stake threshold equality should work (a == b)")
-		require.True(t.b.Equal(&t.a) == t.equal, "stake threshold equality should work (b == a)")
+		require.True(t.a.Equal(&t.b) == t.equal, "stake threshold equality should work (a == b)") //nolint:gosec
+		require.True(t.b.Equal(&t.a) == t.equal, "stake threshold equality should work (b == a)") //nolint:gosec
 	}
 }
 
@@ -114,10 +208,10 @@ func TestStakeAccumulator(t *testing.T) {
 		KindEntity:            *quantity.NewFromUint64(1_000),
 		KindNodeValidator:     *quantity.NewFromUint64(10_000),
 		KindNodeCompute:       *quantity.NewFromUint64(5_000),
-		KindNodeStorage:       *quantity.NewFromUint64(2_000),
 		KindNodeKeyManager:    *quantity.NewFromUint64(50_000),
-		KindRuntimeCompute:    *quantity.NewFromUint64(100_000),
+		KindRuntimeCompute:    *quantity.NewFromUint64(2_000),
 		KindRuntimeKeyManager: *quantity.NewFromUint64(1_000_000),
+		KindKeyManagerChurp:   *quantity.NewFromUint64(500_000),
 	}
 
 	// Empty escrow account tests.
@@ -150,22 +244,22 @@ func TestStakeAccumulator(t *testing.T) {
 	require.Error(err, "updating a stake claim with insufficient stake should fail")
 	require.Equal(err, ErrInsufficientStake)
 
-	err = acct.AddStakeClaim(thresholds, StakeClaim("claim1"), GlobalStakeThresholds(KindEntity, KindNodeStorage))
+	err = acct.AddStakeClaim(thresholds, StakeClaim("claim1"), GlobalStakeThresholds(KindEntity, KindRuntimeCompute))
 	require.NoError(err, "updating a stake claim with sufficient stake should work")
 
-	err = acct.AddStakeClaim(thresholds, StakeClaim("claim1"), GlobalStakeThresholds(KindEntity, KindNodeStorage))
+	err = acct.AddStakeClaim(thresholds, StakeClaim("claim1"), GlobalStakeThresholds(KindEntity, KindRuntimeCompute))
 	require.NoError(err, "updating a stake claim with sufficient stake should work")
 	err = acct.CheckStakeClaims(thresholds)
 	require.NoError(err, "escrow account should check out")
 
 	// Add another claim.
-	err = acct.AddStakeClaim(thresholds, StakeClaim("claim2"), GlobalStakeThresholds(KindNodeStorage))
+	err = acct.AddStakeClaim(thresholds, StakeClaim("claim2"), GlobalStakeThresholds(KindRuntimeCompute))
 	require.Error(err, "updating a stake claim with insufficient stake should fail")
 	require.Equal(err, ErrInsufficientStake)
 
 	acct.Active.Balance = *quantity.NewFromUint64(13_000)
 
-	err = acct.AddStakeClaim(thresholds, StakeClaim("claim2"), GlobalStakeThresholds(KindNodeStorage))
+	err = acct.AddStakeClaim(thresholds, StakeClaim("claim2"), GlobalStakeThresholds(KindRuntimeCompute))
 	require.NoError(err, "adding a stake claim with sufficient stake should work")
 	err = acct.CheckStakeClaims(thresholds)
 	require.NoError(err, "escrow account should check out")
@@ -203,9 +297,453 @@ func TestStakeAccumulator(t *testing.T) {
 	err = acct.CheckStakeClaims(thresholds)
 	require.NoError(err, "escrow account should check out")
 
+	// Add claim with empty threshold list.
+	err = acct.AddStakeClaim(thresholds, StakeClaim("claimEmptyList"), []StakeThreshold{})
+	require.NoError(err, "adding an empty list stake claim should work")
+	err = acct.RemoveStakeClaim(StakeClaim("claimEmptyList"))
+	require.NoError(err, "removing an empty claim should work")
+
+	err = acct.AddStakeClaim(thresholds, StakeClaim("claimNilList"), nil)
+	require.NoError(err, "adding an nil list stake claim should work")
+	err = acct.RemoveStakeClaim(StakeClaim("claimNilList"))
+	require.NoError(err, "removing an nil claim should work")
+
 	// Reduce stake.
 	acct.Active.Balance = *quantity.NewFromUint64(5_000)
 	err = acct.CheckStakeClaims(thresholds)
 	require.Error(err, "escrow account should no longer check out")
 	require.Equal(err, ErrInsufficientStake)
+}
+
+func TestDebondingDelegationMerge(t *testing.T) {
+	require := require.New(t)
+
+	one := mustInitQuantity(t, 1)
+	toAdd := DebondingDelegation{
+		Shares:        mustInitQuantity(t, 10),
+		DebondEndTime: api.EpochTime(100),
+	}
+	for _, t := range []struct {
+		base      *DebondingDelegation
+		msg       string
+		shouldErr bool
+		result    *DebondingDelegation
+	}{
+		{
+			&DebondingDelegation{Shares: one, DebondEndTime: 1},
+			"end time doesn't match",
+			true,
+			nil,
+		},
+		{
+			&DebondingDelegation{Shares: one, DebondEndTime: 100},
+			"merge should correctly merge debonding delegations",
+			false,
+			&DebondingDelegation{Shares: mustInitQuantity(t, 11), DebondEndTime: 100},
+		},
+	} {
+		err := t.base.Merge(toAdd)
+		if t.shouldErr {
+			require.Error(err, t.msg)
+			continue
+		}
+		require.NoError(err)
+		require.EqualValues(t.result, t.base, t.msg)
+	}
+}
+
+func TestAccountsSerialization(t *testing.T) {
+	require := require.New(t)
+
+	kind := KindNodeCompute
+	// NOTE: These cases should be synced with tests in runtime/src/consensus/staking.rs.
+	for _, tc := range []struct {
+		rr             Account
+		expectedBase64 string
+	}{
+		{Account{}, "oA=="},
+		{Account{General: GeneralAccount{
+			Balance: mustInitQuantity(t, 10),
+			Nonce:   33,
+		}}, "oWdnZW5lcmFsomVub25jZRghZ2JhbGFuY2VBCg=="},
+		{Account{
+			General: GeneralAccount{
+				Allowances: map[Address]quantity.Quantity{
+					CommonPoolAddress:         mustInitQuantity(t, 100),
+					GovernanceDepositsAddress: mustInitQuantity(t, 33),
+				},
+			},
+		}, "oWdnZW5lcmFsoWphbGxvd2FuY2VzolUAdU/0RxQ6XsX0cbMPhna5TVaxV1BBIVUA98Te1iET4sKC6oZyI6VE7VXWum5BZA=="},
+		{Account{
+			Escrow: EscrowAccount{
+				Active: SharePool{
+					Balance:     mustInitQuantity(t, 1100),
+					TotalShares: mustInitQuantity(t, 11),
+				},
+				Debonding: SharePool{},
+				CommissionSchedule: CommissionSchedule{
+					Bounds: []CommissionRateBoundStep{
+						{
+							Start:   33,
+							RateMin: mustInitQuantity(t, 10),
+							RateMax: mustInitQuantity(t, 1000),
+						},
+					},
+				},
+				StakeAccumulator: StakeAccumulator{map[StakeClaim][]StakeThreshold{
+					KindEntityName: {
+						{Constant: mustInitQuantityP(t, 77)},
+						{
+							Global: &kind,
+						},
+					},
+				}},
+			},
+		}, "oWZlc2Nyb3ejZmFjdGl2ZaJnYmFsYW5jZUIETGx0b3RhbF9zaGFyZXNBC3FzdGFrZV9hY2N1bXVsYXRvcqFmY2xhaW1zoWZlbnRpdHmCoWVjb25zdEFNoWZnbG9iYWwCc2NvbW1pc3Npb25fc2NoZWR1bGWhZmJvdW5kc4GjZXN0YXJ0GCFocmF0ZV9tYXhCA+hocmF0ZV9taW5BCg=="},
+	} {
+		enc := cbor.Marshal(tc.rr)
+		require.Equal(tc.expectedBase64, base64.StdEncoding.EncodeToString(enc), "serialization should match")
+
+		var dec Account
+		err := cbor.Unmarshal(enc, &dec)
+		require.NoError(err, "Unmarshal")
+		require.EqualValues(tc.rr, dec, "Account serialization should round-trip")
+	}
+}
+
+func TestDelegationSerialization(t *testing.T) {
+	require := require.New(t)
+
+	// NOTE: These cases should be synced with tests in runtime/src/consensus/staking.rs.
+	for _, tc := range []struct {
+		rr             Delegation
+		expectedBase64 string
+	}{
+		{Delegation{}, "oWZzaGFyZXNA"},
+		{
+			Delegation{Shares: mustInitQuantity(t, 100)},
+			"oWZzaGFyZXNBZA==",
+		},
+	} {
+		enc := cbor.Marshal(tc.rr)
+		require.Equal(tc.expectedBase64, base64.StdEncoding.EncodeToString(enc), "serialization should match")
+
+		var dec Delegation
+		err := cbor.Unmarshal(enc, &dec)
+		require.NoError(err, "Unmarshal")
+		require.EqualValues(tc.rr, dec, "Delegation serialization should round-trip")
+	}
+}
+
+func TestDebondingDelegationSerialization(t *testing.T) {
+	require := require.New(t)
+
+	// NOTE: These cases should be synced with tests in runtime/src/consensus/staking.rs.
+	for _, tc := range []struct {
+		rr             DebondingDelegation
+		expectedBase64 string
+	}{
+		{DebondingDelegation{}, "omZzaGFyZXNAamRlYm9uZF9lbmQA"},
+		{
+			DebondingDelegation{
+				Shares:        mustInitQuantity(t, 100),
+				DebondEndTime: 23,
+			},
+			"omZzaGFyZXNBZGpkZWJvbmRfZW5kFw==",
+		},
+	} {
+		enc := cbor.Marshal(tc.rr)
+		require.Equal(tc.expectedBase64, base64.StdEncoding.EncodeToString(enc), "serialization should match")
+
+		var dec DebondingDelegation
+		err := cbor.Unmarshal(enc, &dec)
+		require.NoError(err, "Unmarshal")
+		require.EqualValues(tc.rr, dec, "DebondingDelegation serialization should round-trip")
+	}
+}
+
+func TestTransferResultsSerialization(t *testing.T) {
+	require := require.New(t)
+
+	pk1 := signature.NewPublicKey("aaafffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr1 := NewAddress(pk1)
+	pk2 := signature.NewPublicKey("bbbfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr2 := NewAddress(pk2)
+
+	// NOTE: These cases should be synced with tests in runtime/src/consensus/staking.rs.
+	for _, tc := range []struct {
+		rr             interface{}
+		expectedBase64 string
+	}{
+		{TransferResult{}, "o2J0b1UAAAAAAAAAAAAAAAAAAAAAAAAAAABkZnJvbVUAAAAAAAAAAAAAAAAAAAAAAAAAAABmYW1vdW50QA=="},
+		{
+			TransferResult{
+				From:   addr1,
+				To:     addr2,
+				Amount: mustInitQuantity(t, 100),
+			},
+			"o2J0b1UAuRI5eJXmRwxR+r7MndyD9wrthqFkZnJvbVUAIHIUNIk/YWwJgUjiz5+Z4+KCbhNmYW1vdW50QWQ=",
+		},
+	} {
+		enc := cbor.Marshal(tc.rr)
+		require.Equal(tc.expectedBase64, base64.StdEncoding.EncodeToString(enc), "serialization should match")
+
+		var dec TransferResult
+		err := cbor.Unmarshal(enc, &dec)
+		require.NoError(err, "Unmarshal")
+		require.EqualValues(tc.rr, dec, "TransferResult serialization should round-trip")
+	}
+}
+
+func TestWithdrawResultsSerialization(t *testing.T) {
+	require := require.New(t)
+
+	pk1 := signature.NewPublicKey("aaafffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr1 := NewAddress(pk1)
+	pk2 := signature.NewPublicKey("bbbfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr2 := NewAddress(pk2)
+
+	// NOTE: These cases should be synced with tests in runtime/src/consensus/staking.rs.
+	for _, tc := range []struct {
+		rr             interface{}
+		expectedBase64 string
+	}{
+		{WithdrawResult{}, "pGVvd25lclUAAAAAAAAAAAAAAAAAAAAAAAAAAABpYWxsb3dhbmNlQGtiZW5lZmljaWFyeVUAAAAAAAAAAAAAAAAAAAAAAAAAAABtYW1vdW50X2NoYW5nZUA="},
+		{
+			WithdrawResult{
+				Owner:        addr1,
+				Beneficiary:  addr2,
+				Allowance:    mustInitQuantity(t, 10),
+				AmountChange: mustInitQuantity(t, 5),
+			},
+			"pGVvd25lclUAIHIUNIk/YWwJgUjiz5+Z4+KCbhNpYWxsb3dhbmNlQQprYmVuZWZpY2lhcnlVALkSOXiV5kcMUfq+zJ3cg/cK7YahbWFtb3VudF9jaGFuZ2VBBQ==",
+		},
+	} {
+		enc := cbor.Marshal(tc.rr)
+		require.Equal(tc.expectedBase64, base64.StdEncoding.EncodeToString(enc), "serialization should match")
+
+		var dec WithdrawResult
+		err := cbor.Unmarshal(enc, &dec)
+		require.NoError(err, "Unmarshal")
+		require.EqualValues(tc.rr, dec, "WithdrawResult serialization should round-trip")
+	}
+}
+
+func TestAddEscrowResultsSerialization(t *testing.T) {
+	require := require.New(t)
+
+	pk1 := signature.NewPublicKey("aaafffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr1 := NewAddress(pk1)
+	pk2 := signature.NewPublicKey("bbbfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr2 := NewAddress(pk2)
+
+	// NOTE: These cases should be synced with tests in runtime/src/consensus/staking.rs.
+	for _, tc := range []struct {
+		rr             interface{}
+		expectedBase64 string
+	}{
+		{AddEscrowResult{}, "pGVvd25lclUAAAAAAAAAAAAAAAAAAAAAAAAAAABmYW1vdW50QGZlc2Nyb3dVAAAAAAAAAAAAAAAAAAAAAAAAAAAAam5ld19zaGFyZXNA"},
+		{
+			AddEscrowResult{
+				Owner:     addr1,
+				Escrow:    addr2,
+				Amount:    mustInitQuantity(t, 100),
+				NewShares: mustInitQuantity(t, 5),
+			},
+			"pGVvd25lclUAIHIUNIk/YWwJgUjiz5+Z4+KCbhNmYW1vdW50QWRmZXNjcm93VQC5Ejl4leZHDFH6vsyd3IP3Cu2GoWpuZXdfc2hhcmVzQQU=",
+		},
+	} {
+		enc := cbor.Marshal(tc.rr)
+		require.Equal(tc.expectedBase64, base64.StdEncoding.EncodeToString(enc), "serialization should match")
+
+		var dec AddEscrowResult
+		err := cbor.Unmarshal(enc, &dec)
+		require.NoError(err, "Unmarshal")
+		require.EqualValues(tc.rr, dec, "AddEscrow serialization should round-trip")
+	}
+}
+
+func TestReclaimEscrowResultsSerialization(t *testing.T) {
+	require := require.New(t)
+
+	pk1 := signature.NewPublicKey("aaafffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr1 := NewAddress(pk1)
+	pk2 := signature.NewPublicKey("bbbfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr2 := NewAddress(pk2)
+
+	// NOTE: These cases should be synced with tests in runtime/src/consensus/staking.rs.
+	for _, tc := range []struct {
+		rr             interface{}
+		expectedBase64 string
+	}{
+		{ReclaimEscrowResult{}, "pmVvd25lclUAAAAAAAAAAAAAAAAAAAAAAAAAAABmYW1vdW50QGZlc2Nyb3dVAAAAAAAAAAAAAAAAAAAAAAAAAAAAb2RlYm9uZF9lbmRfdGltZQBwZGVib25kaW5nX3NoYXJlc0BwcmVtYWluaW5nX3NoYXJlc0A="},
+		{
+			ReclaimEscrowResult{
+				Owner:           addr1,
+				Escrow:          addr2,
+				Amount:          mustInitQuantity(t, 100),
+				RemainingShares: mustInitQuantity(t, 50),
+				DebondingShares: mustInitQuantity(t, 25),
+				DebondEndTime:   api.EpochTime(42),
+			},
+			"pmVvd25lclUAIHIUNIk/YWwJgUjiz5+Z4+KCbhNmYW1vdW50QWRmZXNjcm93VQC5Ejl4leZHDFH6vsyd3IP3Cu2GoW9kZWJvbmRfZW5kX3RpbWUYKnBkZWJvbmRpbmdfc2hhcmVzQRlwcmVtYWluaW5nX3NoYXJlc0Ey",
+		},
+	} {
+		enc := cbor.Marshal(tc.rr)
+		require.Equal(tc.expectedBase64, base64.StdEncoding.EncodeToString(enc), "serialization should match")
+
+		var dec ReclaimEscrowResult
+		err := cbor.Unmarshal(enc, &dec)
+		require.NoError(err, "Unmarshal")
+		require.EqualValues(tc.rr, dec, "ReclaimEscrow serialization should round-trip")
+	}
+}
+
+func TestEventsSerialization(t *testing.T) {
+	require := require.New(t)
+
+	pk1 := signature.NewPublicKey("aaafffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr1 := NewAddress(pk1)
+	pk2 := signature.NewPublicKey("bbbfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	addr2 := NewAddress(pk2)
+	var txHash hash.Hash
+	txHash.Empty()
+
+	// NOTE: These cases should be synced with tests in runtime/src/consensus/staking.rs.
+	for _, tc := range []struct {
+		ev             Event
+		expectedBase64 string
+	}{
+		{Event{}, "oWd0eF9oYXNoWCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="},
+		{Event{Height: 42}, "omZoZWlnaHQYKmd0eF9oYXNoWCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="},
+		{Event{Height: 42, TxHash: txHash}, "omZoZWlnaHQYKmd0eF9oYXNoWCDGcrjR71btKKuHw2IsURQGm90617j5c3SY0MAezvCWeg=="},
+
+		// Transfer.
+		{
+			Event{
+				Height: 42,
+				TxHash: txHash,
+				Transfer: &TransferEvent{
+					From:   addr1,
+					To:     addr2,
+					Amount: mustInitQuantity(t, 100),
+				},
+			},
+			"o2ZoZWlnaHQYKmd0eF9oYXNoWCDGcrjR71btKKuHw2IsURQGm90617j5c3SY0MAezvCWemh0cmFuc2ZlcqNidG9VALkSOXiV5kcMUfq+zJ3cg/cK7YahZGZyb21VACByFDSJP2FsCYFI4s+fmePigm4TZmFtb3VudEFk",
+		},
+
+		// Burn.
+		{
+			Event{
+				Height: 42,
+				TxHash: txHash,
+				Burn: &BurnEvent{
+					Owner:  addr1,
+					Amount: mustInitQuantity(t, 100),
+				},
+			},
+			"o2RidXJuomVvd25lclUAIHIUNIk/YWwJgUjiz5+Z4+KCbhNmYW1vdW50QWRmaGVpZ2h0GCpndHhfaGFzaFggxnK40e9W7Sirh8NiLFEUBpvdOte4+XN0mNDAHs7wlno=",
+		},
+
+		// Escrow.
+		{
+			Event{
+				Height: 42,
+				TxHash: txHash,
+				Escrow: &EscrowEvent{
+					Add: &AddEscrowEvent{
+						Owner:     addr1,
+						Escrow:    addr2,
+						Amount:    mustInitQuantity(t, 100),
+						NewShares: mustInitQuantity(t, 50),
+					},
+				},
+			},
+			"o2Zlc2Nyb3ehY2FkZKRlb3duZXJVACByFDSJP2FsCYFI4s+fmePigm4TZmFtb3VudEFkZmVzY3Jvd1UAuRI5eJXmRwxR+r7MndyD9wrthqFqbmV3X3NoYXJlc0EyZmhlaWdodBgqZ3R4X2hhc2hYIMZyuNHvVu0oq4fDYixRFAab3TrXuPlzdJjQwB7O8JZ6",
+		},
+		{
+			Event{
+				Height: 42,
+				TxHash: txHash,
+				Escrow: &EscrowEvent{
+					Take: &TakeEscrowEvent{
+						Owner:           addr1,
+						Amount:          mustInitQuantity(t, 100),
+						DebondingAmount: mustInitQuantity(t, 20),
+					},
+				},
+			},
+			"o2Zlc2Nyb3ehZHRha2WjZW93bmVyVQAgchQ0iT9hbAmBSOLPn5nj4oJuE2ZhbW91bnRBZHBkZWJvbmRpbmdfYW1vdW50QRRmaGVpZ2h0GCpndHhfaGFzaFggxnK40e9W7Sirh8NiLFEUBpvdOte4+XN0mNDAHs7wlno=",
+		},
+		{
+			Event{
+				Height: 42,
+				TxHash: txHash,
+				Escrow: &EscrowEvent{
+					DebondingStart: &DebondingStartEscrowEvent{
+						Owner:           addr1,
+						Escrow:          addr2,
+						Amount:          mustInitQuantity(t, 100),
+						ActiveShares:    mustInitQuantity(t, 50),
+						DebondingShares: mustInitQuantity(t, 25),
+						DebondEndTime:   42,
+					},
+				},
+			},
+			"o2Zlc2Nyb3ehb2RlYm9uZGluZ19zdGFydKZlb3duZXJVACByFDSJP2FsCYFI4s+fmePigm4TZmFtb3VudEFkZmVzY3Jvd1UAuRI5eJXmRwxR+r7MndyD9wrthqFtYWN0aXZlX3NoYXJlc0Eyb2RlYm9uZF9lbmRfdGltZRgqcGRlYm9uZGluZ19zaGFyZXNBGWZoZWlnaHQYKmd0eF9oYXNoWCDGcrjR71btKKuHw2IsURQGm90617j5c3SY0MAezvCWeg==",
+		},
+		{
+			Event{
+				Height: 42,
+				TxHash: txHash,
+				Escrow: &EscrowEvent{
+					Reclaim: &ReclaimEscrowEvent{
+						Owner:  addr1,
+						Escrow: addr2,
+						Amount: mustInitQuantity(t, 100),
+						Shares: mustInitQuantity(t, 25),
+					},
+				},
+			},
+			"o2Zlc2Nyb3ehZ3JlY2xhaW2kZW93bmVyVQAgchQ0iT9hbAmBSOLPn5nj4oJuE2ZhbW91bnRBZGZlc2Nyb3dVALkSOXiV5kcMUfq+zJ3cg/cK7YahZnNoYXJlc0EZZmhlaWdodBgqZ3R4X2hhc2hYIMZyuNHvVu0oq4fDYixRFAab3TrXuPlzdJjQwB7O8JZ6",
+		},
+
+		// Allowance change.
+		{
+			Event{
+				Height: 42,
+				TxHash: txHash,
+				AllowanceChange: &AllowanceChangeEvent{
+					Owner:        addr1,
+					Beneficiary:  addr2,
+					Allowance:    mustInitQuantity(t, 100),
+					Negative:     false,
+					AmountChange: mustInitQuantity(t, 50),
+				},
+			},
+			"o2ZoZWlnaHQYKmd0eF9oYXNoWCDGcrjR71btKKuHw2IsURQGm90617j5c3SY0MAezvCWenBhbGxvd2FuY2VfY2hhbmdlpGVvd25lclUAIHIUNIk/YWwJgUjiz5+Z4+KCbhNpYWxsb3dhbmNlQWRrYmVuZWZpY2lhcnlVALkSOXiV5kcMUfq+zJ3cg/cK7YahbWFtb3VudF9jaGFuZ2VBMg==",
+		},
+		{
+			Event{
+				Height: 42,
+				TxHash: txHash,
+				AllowanceChange: &AllowanceChangeEvent{
+					Owner:        addr1,
+					Beneficiary:  addr2,
+					Allowance:    mustInitQuantity(t, 100),
+					Negative:     true,
+					AmountChange: mustInitQuantity(t, 50),
+				},
+			},
+			"o2ZoZWlnaHQYKmd0eF9oYXNoWCDGcrjR71btKKuHw2IsURQGm90617j5c3SY0MAezvCWenBhbGxvd2FuY2VfY2hhbmdlpWVvd25lclUAIHIUNIk/YWwJgUjiz5+Z4+KCbhNobmVnYXRpdmX1aWFsbG93YW5jZUFka2JlbmVmaWNpYXJ5VQC5Ejl4leZHDFH6vsyd3IP3Cu2GoW1hbW91bnRfY2hhbmdlQTI=",
+		},
+	} {
+		enc := cbor.Marshal(tc.ev)
+		require.Equal(tc.expectedBase64, base64.StdEncoding.EncodeToString(enc), "serialization should match")
+
+		var dec Event
+		err := cbor.Unmarshal(enc, &dec)
+		require.NoError(err, "Unmarshal")
+		require.EqualValues(tc.ev, dec, "Event serialization should round-trip")
+	}
 }

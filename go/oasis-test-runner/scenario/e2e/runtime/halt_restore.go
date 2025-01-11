@@ -1,147 +1,141 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"fmt"
-	"hash"
-	"io"
-	"os"
-	"path/filepath"
 	"reflect"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
+	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	genesis "github.com/oasisprotocol/oasis-core/go/genesis/file"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
+	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 )
 
 var (
 	// HaltRestore is the halt and restore scenario.
-	HaltRestore scenario.Scenario = newHaltRestoreImpl()
-
-	dumpGlob = "genesis-*.json"
+	HaltRestore scenario.Scenario = newHaltRestoreImpl(false)
+	// HaltRestoreSuspended is the halt and restore scenario with a suspended runtime.
+	HaltRestoreSuspended scenario.Scenario = newHaltRestoreImpl(true)
 )
 
-const haltEpoch = 3
+const haltEpoch = 10
 
 type haltRestoreImpl struct {
-	runtimeImpl
+	Scenario
+
+	suspendRuntime bool
+	haltEpoch      beacon.EpochTime
 }
 
-func newHaltRestoreImpl() scenario.Scenario {
+func newHaltRestoreImpl(suspended bool) scenario.Scenario {
+	name := "halt-restore"
+	haltEpoch := haltEpoch
+	if suspended {
+		name += "-suspended"
+		// Add some epochs since we're also suspending a runtime.
+		haltEpoch += 5
+	}
 	return &haltRestoreImpl{
-		runtimeImpl: *newRuntimeImpl(
-			"halt-restore",
-			"test-long-term-client",
-			[]string{"--mode", "part1"},
+		Scenario: *NewScenario(
+			name,
+			NewTestClient().WithScenario(InsertTransferScenario),
 		),
+		haltEpoch:      beacon.EpochTime(haltEpoch),
+		suspendRuntime: suspended,
 	}
 }
 
 func (sc *haltRestoreImpl) Clone() scenario.Scenario {
 	return &haltRestoreImpl{
-		runtimeImpl: *sc.runtimeImpl.Clone().(*runtimeImpl),
+		Scenario:       *sc.Scenario.Clone().(*Scenario),
+		suspendRuntime: sc.suspendRuntime,
+		haltEpoch:      sc.haltEpoch,
 	}
 }
 
 func (sc *haltRestoreImpl) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := sc.runtimeImpl.Fixture()
+	f, err := sc.Scenario.Fixture()
 	if err != nil {
 		return nil, err
 	}
-	f.Network.HaltEpoch = haltEpoch
+	f.Network.SetMockEpoch()
+	f.Network.HaltEpoch = uint64(sc.haltEpoch)
 	for _, val := range f.Validators {
 		val.AllowEarlyTermination = true
 	}
 	return f, nil
 }
 
-func (sc *haltRestoreImpl) getExportedGenesisFiles() ([]string, error) {
-	// Gather all nodes.
-	var nodes []interface {
-		ExportsPath() string
-	}
-	for _, v := range sc.Net.Validators() {
-		nodes = append(nodes, v)
-	}
-	for _, n := range sc.Net.ComputeWorkers() {
-		nodes = append(nodes, n)
-	}
-	for _, n := range sc.Net.StorageWorkers() {
-		nodes = append(nodes, n)
-	}
-	for _, n := range sc.Net.Keymanagers() {
-		nodes = append(nodes, n)
+func (sc *haltRestoreImpl) Run(ctx context.Context, childEnv *env.Env) error { // nolint: gocyclo
+	if err := sc.StartNetworkAndTestClient(ctx, childEnv); err != nil {
+		return err
 	}
 
-	// Gather all genesis files.
-	var files []string
-	for _, node := range nodes {
-		dumpGlobPath := filepath.Join(node.ExportsPath(), dumpGlob)
-		globMatch, err := filepath.Glob(dumpGlobPath)
-		if err != nil {
-			return nil, fmt.Errorf("glob failed: %s: %w", dumpGlobPath, err)
-		}
-		if len(globMatch) == 0 {
-			return nil, fmt.Errorf("genesis file not found in: %s", dumpGlobPath)
-		}
-		if len(globMatch) > 1 {
-			return nil, fmt.Errorf("more than one genesis file found in: %s", dumpGlobPath)
-		}
-		files = append(files, globMatch[0])
-	}
-
-	// Assert all exported files match.
-	var firstHash hash.Hash
-	for _, file := range files {
-		// Compute hash.
-		f, err := os.Open(file)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open file: %s: %w", file, err)
-		}
-		defer f.Close()
-		hnew := sha256.New()
-		if _, err := io.Copy(hnew, f); err != nil {
-			return nil, fmt.Errorf("sha256 failed on: %s: %w", file, err)
-		}
-		if firstHash == nil {
-			firstHash = hnew
-		}
-
-		// Compare hash with first hash.
-		if !bytes.Equal(firstHash.Sum(nil), hnew.Sum(nil)) {
-			return nil, fmt.Errorf("exported genesis files do not match %s, %s", files[0], file)
-		}
-	}
-
-	return files, nil
-}
-
-func (sc *haltRestoreImpl) Run(childEnv *env.Env) error {
-	clientErrCh, cmd, err := sc.runtimeImpl.start(childEnv)
+	fixture, err := sc.Fixture()
 	if err != nil {
 		return err
 	}
+	var nextEpoch beacon.EpochTime
+	if nextEpoch, err = sc.initialEpochTransitions(ctx, fixture); err != nil {
+		return err
+	}
+	nextEpoch++ // Next, after initial transitions.
 
 	// Wait for the client to exit.
-	select {
-	case err = <-sc.Net.Errors():
-		_ = cmd.Process.Kill()
-	case err = <-clientErrCh:
-	}
-	if err != nil {
+	if err = sc.WaitTestClient(); err != nil {
 		return err
 	}
 
-	// Wait for the epoch after the halt epoch.
-	ctx := context.Background()
-	sc.Logger.Info("waiting for halt epoch")
-	// Wait for halt epoch.
-	err = sc.Net.Controller().Consensus.WaitEpoch(ctx, haltEpoch)
-	if err != nil {
-		return fmt.Errorf("failed waiting for halt epoch: %w", err)
+	if sc.suspendRuntime {
+		// Stop compute nodes.
+		sc.Logger.Info("stopping compute nodes")
+		for _, n := range sc.Net.ComputeWorkers() {
+			if err = n.StopGracefully(); err != nil {
+				return fmt.Errorf("failed to stop node: %w", err)
+			}
+		}
+
+		// Epoch transitions so nodes expire.
+		sc.Logger.Info("performing epoch transitions so nodes expire")
+		for i := 0; i < 3; i++ {
+
+			if err = sc.Net.Controller().SetEpoch(ctx, nextEpoch); err != nil {
+				return fmt.Errorf("failed to set epoch %d: %w", nextEpoch, err)
+			}
+			nextEpoch++
+		}
+
+		// Ensure that runtime got suspended.
+		sc.Logger.Info("checking that runtime got suspended")
+		_, err = sc.Net.Controller().Registry.GetRuntime(ctx, &registry.GetRuntimeQuery{
+			Height: consensus.HeightLatest,
+			ID:     fixture.Runtimes[1].ID,
+		})
+		switch err {
+		case nil:
+			return fmt.Errorf("runtime should be suspended but it is not")
+		case registry.ErrNoSuchRuntime:
+			// Runtime is suspended.
+			sc.Logger.Info("runtime is suspended")
+		default:
+			return fmt.Errorf("unexpected error while fetching runtime: %w", err)
+		}
+	}
+
+	// Transition to halt epoch.
+	sc.Logger.Info("transitioning to halt epoch",
+		"halt_epoch", sc.haltEpoch,
+	)
+	for i := nextEpoch; i <= sc.haltEpoch; i++ {
+		sc.Logger.Info("setting epoch",
+			"epoch", i,
+		)
+		if err = sc.Net.Controller().SetEpoch(ctx, i); err != nil && i != sc.haltEpoch {
+			return fmt.Errorf("failed to set epoch %d: %w", i, err)
+		}
 	}
 
 	// Wait for validators to exit so that genesis docs are dumped.
@@ -156,7 +150,7 @@ func (sc *haltRestoreImpl) Run(childEnv *env.Env) error {
 	_, _, _ = reflect.Select(exitChs)
 
 	sc.Logger.Info("gathering exported genesis files")
-	files, err := sc.getExportedGenesisFiles()
+	files, err := sc.ExportedGenesisFiles(true)
 	if err != nil {
 		return fmt.Errorf("failure getting exported genesis files: %w", err)
 	}
@@ -164,7 +158,7 @@ func (sc *haltRestoreImpl) Run(childEnv *env.Env) error {
 	// Stop the network.
 	sc.Logger.Info("stopping the network")
 	sc.Net.Stop()
-	if err = sc.ResetConsensusState(childEnv); err != nil {
+	if err = sc.ResetConsensusState(childEnv, nil); err != nil {
 		return fmt.Errorf("failed to reset consensus state: %w", err)
 	}
 
@@ -172,13 +166,7 @@ func (sc *haltRestoreImpl) Run(childEnv *env.Env) error {
 	// works with restored state.
 	sc.Logger.Info("starting the network again")
 
-	fixture, err := sc.Fixture()
-	if err != nil {
-		return err
-	}
-
-	// Update halt epoch in the exported genesis so the network doesn't
-	// instantly halt.
+	// Ensure compute runtime in genesis is in expected state.
 	genesisFileProvider, err := genesis.NewFileProvider(files[0])
 	if err != nil {
 		sc.Logger.Error("failed getting genesis file provider",
@@ -194,27 +182,52 @@ func (sc *haltRestoreImpl) Run(childEnv *env.Env) error {
 		)
 		return err
 	}
-	genesisDoc.HaltEpoch = 2 * haltEpoch
-	if err = genesisDoc.WriteFileJSON(files[0]); err != nil {
-		sc.Logger.Error("failed to update genesis",
-			"err", err,
+
+	var rtList []*registry.Runtime
+	switch sc.suspendRuntime {
+	case true:
+		rtList = genesisDoc.Registry.SuspendedRuntimes
+	default:
+		rtList = genesisDoc.Registry.Runtimes
+	}
+	var found bool
+	for _, rt := range rtList {
+		if rt.Kind != registry.KindCompute {
+			continue
+		}
+		found = true
+	}
+	if !found {
+		sc.Logger.Error("runtime not in expected state",
+			"expected_suspended", sc.suspendRuntime,
+			"runtimes", genesisDoc.Registry.Runtimes,
+			"suspended_runtimes", genesisDoc.Registry.SuspendedRuntimes,
 		)
-		return err
+		return fmt.Errorf("runtime not in expected state")
 	}
 
+	// Disable halt epoch so the network doesn't instantly halt.
+	fixture.Network.HaltEpoch = 0
 	// Use the updated genesis file.
 	fixture.Network.GenesisFile = files[0]
 	// Make sure to not overwrite the entity.
 	fixture.Entities[1].Restore = true
+	// If network is used, enable shorter per-node socket paths, because some e2e test datadir
+	// exceed maximum unix socket path length.
+	fixture.Network.UseShortGrpcSocketPaths = true
 
 	if sc.Net, err = fixture.Create(childEnv); err != nil {
 		return err
 	}
 
-	// If network is used, enable shorter per-node socket paths, because some e2e test datadir exceed maximum unix
-	// socket path length.
-	sc.Net.Config().UseShortGrpcSocketPaths = true
+	sc.Scenario.TestClient = NewTestClient().WithSeed("seed2").WithScenario(RemoveScenario)
 
-	sc.runtimeImpl.clientArgs = []string{"--mode", "part2"}
-	return sc.runtimeImpl.Run(childEnv)
+	// Start the new network again and run the test client.
+	if err = sc.StartNetworkAndWaitForClientSync(ctx); err != nil {
+		return err
+	}
+	if _, err = sc.initialEpochTransitionsWith(ctx, fixture, genesisDoc.Beacon.Base); err != nil {
+		return err
+	}
+	return sc.RunTestClientAndCheckLogs(ctx, childEnv)
 }

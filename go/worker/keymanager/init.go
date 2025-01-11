@@ -5,115 +5,108 @@ import (
 	"context"
 	"fmt"
 
-	flag "github.com/spf13/pflag"
-	"github.com/spf13/viper"
-
-	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/grpc/policy"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
-	ias "github.com/oasisprotocol/oasis-core/go/ias/api"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	"github.com/oasisprotocol/oasis-core/go/keymanager/api"
-	enclaverpc "github.com/oasisprotocol/oasis-core/go/runtime/enclaverpc/api"
-	"github.com/oasisprotocol/oasis-core/go/runtime/localstorage"
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 	workerCommon "github.com/oasisprotocol/oasis-core/go/worker/common"
+	workerKeymanager "github.com/oasisprotocol/oasis-core/go/worker/keymanager/api"
+	"github.com/oasisprotocol/oasis-core/go/worker/keymanager/p2p"
 	"github.com/oasisprotocol/oasis-core/go/worker/registration"
 )
 
-const (
-	// CfgEnabled enables the key manager worker.
-	CfgEnabled = "worker.keymanager.enabled"
-
-	// CfgRuntimeID configures the runtime ID.
-	CfgRuntimeID = "worker.keymanager.runtime.id"
-	// CfgMayGenerate allows the enclave to generate a master secret.
-	CfgMayGenerate = "worker.keymanager.may_generate"
-)
-
-// Flags has the configuration flags.
-var Flags = flag.NewFlagSet("", flag.ContinueOnError)
-
-// Enabled reads our enabled flag from viper.
-func Enabled() bool {
-	return viper.GetBool(CfgEnabled)
-}
-
 // New constructs a new key manager worker.
 func New(
-	dataDir string,
 	commonWorker *workerCommon.Worker,
-	ias ias.Endpoint,
 	r *registration.Worker,
 	backend api.Backend,
 ) (*Worker, error) {
+	var enabled bool
+	switch config.GlobalConfig.Mode {
+	case config.ModeKeyManager:
+		// When configured in keymanager mode, enable the keymanager worker.
+		enabled = true
+	default:
+		enabled = false
+	}
+
 	ctx, cancelFn := context.WithCancel(context.Background())
 
 	w := &Worker{
 		logger:       logging.GetLogger("worker/keymanager"),
 		ctx:          ctx,
 		cancelCtx:    cancelFn,
-		stopCh:       make(chan struct{}),
 		quitCh:       make(chan struct{}),
 		initCh:       make(chan struct{}),
-		initTickerCh: nil,
+		nodeID:       commonWorker.Identity.NodeSigner.Public(),
+		peerMap:      NewPeerMap(),
+		accessList:   NewAccessList(),
 		commonWorker: commonWorker,
 		backend:      backend,
-		grpcPolicy:   policy.NewDynamicRuntimePolicyChecker(enclaverpc.ServiceName, commonWorker.GrpcPolicyWatcher),
-		enabled:      Enabled(),
-		mayGenerate:  viper.GetBool(CfgMayGenerate),
+		enabled:      enabled,
 	}
 
-	if w.enabled {
-		if !w.commonWorker.Enabled() {
-			panic("common worker should have been enabled for key manager worker")
-		}
-
-		var runtimeID common.Namespace
-		if err := runtimeID.UnmarshalHex(viper.GetString(CfgRuntimeID)); err != nil {
-			return nil, fmt.Errorf("worker/keymanager: failed to parse runtime ID: %w", err)
-		}
-
-		// Create local storage for the key manager.
-		path, err := runtimeRegistry.EnsureRuntimeStateDir(dataDir, runtimeID)
-		if err != nil {
-			return nil, fmt.Errorf("worker/keymanager: failed to ensure runtime state directory: %w", err)
-		}
-		localStorage, err := localstorage.New(path, runtimeRegistry.LocalStorageFile, runtimeID)
-		if err != nil {
-			return nil, fmt.Errorf("worker/keymanager: cannot create local storage: %w", err)
-		}
-
-		w.roleProvider, err = r.NewRuntimeRoleProvider(node.RoleKeyManager, runtimeID)
-		if err != nil {
-			return nil, fmt.Errorf("worker/keymanager: failed to create role provider: %w", err)
-		}
-
-		w.runtime, err = commonWorker.RuntimeRegistry.NewUnmanagedRuntime(ctx, runtimeID)
-		if err != nil {
-			return nil, fmt.Errorf("worker/keymanager: failed to create runtime registry entry: %w", err)
-		}
-
-		w.runtimeHostHandler = newHostHandler(w, commonWorker, localStorage)
-
-		// Prepare the runtime host node helpers.
-		w.RuntimeHostNode, err = workerCommon.NewRuntimeHostNode(commonWorker.GetConfig().RuntimeHost, w)
-		if err != nil {
-			return nil, fmt.Errorf("worker/keymanager: failed to create runtime host helpers: %w", err)
-		}
-
-		// Register the Keymanager EnclaveRPC transport gRPC service.
-		enclaverpc.RegisterService(w.commonWorker.Grpc.Server(), w)
+	if !w.enabled {
+		return w, nil
 	}
+
+	initMetrics()
+
+	// Parse runtime ID.
+	if err := w.runtimeID.UnmarshalHex(config.GlobalConfig.Keymanager.RuntimeID); err != nil {
+		return nil, fmt.Errorf("worker/keymanager: failed to parse runtime ID: %w", err)
+	}
+	w.runtimeLabel = w.runtimeID.String()
+
+	var err error
+	w.roleProvider, err = r.NewRuntimeRoleProvider(node.RoleKeyManager, w.runtimeID)
+	if err != nil {
+		return nil, fmt.Errorf("worker/keymanager: failed to create role provider: %w", err)
+	}
+
+	w.runtime, err = commonWorker.RuntimeRegistry.GetRuntime(w.runtimeID)
+	if err != nil {
+		return nil, fmt.Errorf("worker/keymanager: failed to get runtime: %w", err)
+	}
+
+	// Prepare the runtime host node helpers.
+	w.RuntimeHostNode, err = runtimeRegistry.NewRuntimeHostNode(w)
+	if err != nil {
+		return nil, fmt.Errorf("worker/keymanager: failed to create runtime host helpers: %w", err)
+	}
+
+	// Prepare watchers.
+	w.kmNodeWatcher = newKmNodeWatcher(w.runtimeID, commonWorker.Consensus, w.peerMap, w.accessList, w.commonWorker.P2P.PeerManager().PeerTagger())
+	w.kmRuntimeWatcher = newKmRuntimeWatcher(w.runtimeID, commonWorker.Consensus, w.accessList)
+
+	// Prepare sub-workers.
+	w.secretsWorker, err = newSecretsWorker(w.runtimeID, commonWorker, w, r, backend)
+	if err != nil {
+		return nil, fmt.Errorf("worker/keymanager: failed to create secrets worker: %w", err)
+	}
+	w.churpWorker, err = newChurpWorker(w)
+	if err != nil {
+		return nil, fmt.Errorf("worker/keymanager: failed to create churp worker: %w", err)
+	}
+
+	// Prepare access controllers and register their methods.
+	w.accessControllers = []workerKeymanager.RPCAccessController{
+		w.secretsWorker,
+		w.churpWorker,
+	}
+	w.accessControllersByMethod = make(map[string]workerKeymanager.RPCAccessController)
+	for _, ctrl := range w.accessControllers {
+		for _, m := range ctrl.Methods() {
+			if _, ok := w.accessControllersByMethod[m]; ok {
+				return nil, fmt.Errorf("worker/keymanager: duplicate enclave RPC method: %s", m)
+			}
+			w.accessControllersByMethod[m] = ctrl
+		}
+	}
+
+	// Register keymanager service.
+	commonWorker.P2P.RegisterProtocolServer(p2p.NewServer(commonWorker.ChainContext, w.runtimeID, w))
 
 	return w, nil
-}
-
-func init() {
-	Flags.Bool(CfgEnabled, false, "Enable key manager worker")
-
-	Flags.String(CfgRuntimeID, "", "Key manager Runtime ID")
-	Flags.Bool(CfgMayGenerate, false, "Key manager may generate new master secret")
-
-	_ = viper.BindPFlags(Flags)
 }

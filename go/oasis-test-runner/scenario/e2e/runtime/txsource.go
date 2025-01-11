@@ -10,18 +10,20 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/drbg"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/mathrand"
 	commonGrpc "github.com/oasisprotocol/oasis-core/go/common/grpc"
-	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/debug/txsource"
@@ -31,24 +33,27 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/oasis"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/scenario/e2e"
+	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
-	"github.com/oasisprotocol/oasis-core/go/storage/database"
 )
 
 const (
-	timeLimitShort = 3 * time.Minute
-	timeLimitLong  = 12 * time.Hour
+	timeLimitShort    = 6 * time.Minute
+	timeLimitShortSGX = 6 * time.Minute
+	timeLimitLong     = 12 * time.Hour
 
 	nodeRestartIntervalLong = 2 * time.Minute
 	nodeLongRestartInterval = 15 * time.Minute
 	nodeLongRestartDuration = 10 * time.Minute
-	livenessCheckInterval   = 1 * time.Minute
+	livenessCheckInterval   = 2 * time.Minute
 	txSourceGasPrice        = 1
+
+	crashPointProbability = 0.0005
 )
 
 // TxSourceMultiShort uses multiple workloads for a short time.
 var TxSourceMultiShort scenario.Scenario = &txSourceImpl{
-	runtimeImpl: *newRuntimeImpl("txsource-multi-short", "", nil),
+	Scenario: *NewScenario("txsource-multi-short", nil),
 	clientWorkloads: []string{
 		workload.NameCommission,
 		workload.NameDelegation,
@@ -57,6 +62,7 @@ var TxSourceMultiShort scenario.Scenario = &txSourceImpl{
 		workload.NameRegistration,
 		workload.NameRuntime,
 		workload.NameTransfer,
+		workload.NameGovernance,
 	},
 	allNodeWorkloads: []string{
 		workload.NameQueries,
@@ -66,15 +72,15 @@ var TxSourceMultiShort scenario.Scenario = &txSourceImpl{
 	consensusPruneDisabledProbability: 0.1,
 	consensusPruneMinKept:             100,
 	consensusPruneMaxKept:             200,
-	// XXX: use no more than 2 storage, 4 compute nodes as SGX E2E test
-	// instances cannot handle any more nodes that are currently configured.
-	numStorageNodes: 2,
-	numComputeNodes: 4,
+	numValidatorNodes:                 4,
+	numKeyManagerNodes:                2,
+	numComputeNodes:                   4,
+	numClientNodes:                    2,
 }
 
-// TxSourceMulti uses multiple workloads.
-var TxSourceMulti scenario.Scenario = &txSourceImpl{
-	runtimeImpl: *newRuntimeImpl("txsource-multi", "", nil),
+// TxSourceMultiShortSGX uses multiple workloads for a short time.
+var TxSourceMultiShortSGX scenario.Scenario = &txSourceImpl{
+	Scenario: *NewScenario("txsource-multi-short-sgx", nil),
 	clientWorkloads: []string{
 		workload.NameCommission,
 		workload.NameDelegation,
@@ -83,6 +89,36 @@ var TxSourceMulti scenario.Scenario = &txSourceImpl{
 		workload.NameRegistration,
 		workload.NameRuntime,
 		workload.NameTransfer,
+		workload.NameGovernance,
+	},
+	allNodeWorkloads: []string{
+		workload.NameQueries,
+	},
+	timeLimit:                         timeLimitShortSGX,
+	livenessCheckInterval:             livenessCheckInterval,
+	consensusPruneDisabledProbability: 0.1,
+	consensusPruneMinKept:             100,
+	consensusPruneMaxKept:             200,
+	// XXX: don't use more nodes as SGX E2E test instances cannot handle many
+	// more nodes that are currently configured.
+	numValidatorNodes:  2,
+	numKeyManagerNodes: 1,
+	numComputeNodes:    2,
+	numClientNodes:     1,
+}
+
+// TxSourceMulti uses multiple workloads.
+var TxSourceMulti scenario.Scenario = &txSourceImpl{
+	Scenario: *NewScenario("txsource-multi", nil),
+	clientWorkloads: []string{
+		workload.NameCommission,
+		workload.NameDelegation,
+		workload.NameOversized,
+		workload.NameParallel,
+		workload.NameRegistration,
+		workload.NameRuntime,
+		workload.NameTransfer,
+		workload.NameGovernance,
 	},
 	allNodeWorkloads: []string{
 		workload.NameQueries,
@@ -95,23 +131,29 @@ var TxSourceMulti scenario.Scenario = &txSourceImpl{
 	consensusPruneDisabledProbability: 0.1,
 	consensusPruneMinKept:             100,
 	consensusPruneMaxKept:             1000,
-	// Nodes getting killed commonly result in corrupted tendermint WAL when the
-	// node is restarted. Enable automatic corrupted WAL recovery for validator
-	// nodes.
-	tendermintRecoverCorruptedWAL: true,
-	// Use 4 storage nodes so runtime continues to work when one of the nodes
-	// is shut down.
-	numStorageNodes: 4,
-	// In tests with long restarts we want to have 3 worker nodes nodes in the
-	// runtime executor worker committee. That is so that each published runtime
+	enableCrashPoints:                 true,
+	// Nodes getting killed commonly result in corrupted CometBFT WAL when the
+	// node is restarted. Enable automatic corrupted WAL recovery for nodes.
+	cmtRecoverCorruptedWAL: true,
+	// Use 4 validators so that consensus can keep making progress when a node
+	// is being killed and restarted.
+	numValidatorNodes: 4,
+	// Use 2 keymanagers so that at least one keymanager is accessible when
+	// the other one is being killed or shut down.
+	numKeyManagerNodes: 2,
+	// In tests with long restarts we want to have 3 worker nodes in the runtime
+	// executor worker committee. That is so that each published runtime
 	// transaction will be received by at least one active executor worker.
 	// In worst case, 2 nodes can be offline at the same time. Aditionally we
 	// need one backup node and one extra node.
 	numComputeNodes: 5,
+	// Second client node is used to run supplementary-sanity checks which can
+	// cause the node to fall behind over the long run.
+	numClientNodes: 2,
 }
 
 type txSourceImpl struct { // nolint: maligned
-	runtimeImpl
+	Scenario
 
 	clientWorkloads  []string
 	allNodeWorkloads []string
@@ -126,25 +168,20 @@ type txSourceImpl struct { // nolint: maligned
 	consensusPruneMinKept             int64
 	consensusPruneMaxKept             int64
 
-	tendermintRecoverCorruptedWAL bool
+	cmtRecoverCorruptedWAL bool
 
-	// Configurable number of storage nodes. If running tests with long node
-	// shutdowns enabled, make sure this is at least `MinWriteReplication+1`,
-	// so that the runtime continues to work, even if one of the nodes is shut
-	// down.
-	// XXX: this is configurable because SGX E2E test instances cannot handle
-	// more test nodes that we already use, and we don't need additional storage
-	// nodes in the short test variant.
-	numStorageNodes int
+	enableCrashPoints bool
 
-	// Configurable number of compute nodes.
-	numComputeNodes int
+	numValidatorNodes  int
+	numKeyManagerNodes int
+	numComputeNodes    int
+	numClientNodes     int
 
 	rng  *rand.Rand
 	seed string
 }
 
-func (sc *txSourceImpl) PreInit(childEnv *env.Env) error {
+func (sc *txSourceImpl) PreInit() error {
 	// Generate a new random seed and log it so we can reproduce the run.
 	// Use existing seed, if it already exists.
 	if sc.seed == "" {
@@ -166,7 +203,7 @@ func (sc *txSourceImpl) PreInit(childEnv *env.Env) error {
 	if err != nil {
 		return fmt.Errorf("failed to create random source: %w", err)
 	}
-	sc.rng = rand.New(mathrand.New(src))
+	sc.rng = rand.New(mathrand.New(src)) //nolint:gosec
 
 	return nil
 }
@@ -184,12 +221,19 @@ func (sc *txSourceImpl) generateConsensusFixture(f *oasis.ConsensusFixture, forc
 }
 
 func (sc *txSourceImpl) Fixture() (*oasis.NetworkFixture, error) {
-	f, err := sc.runtimeImpl.Fixture()
+	f, err := sc.Scenario.Fixture()
 	if err != nil {
 		return nil, err
 	}
 	// Use deterministic identities as we need to allocate funds to nodes.
 	f.Network.DeterministicIdentities = true
+	f.Network.GovernanceParameters = &governance.ConsensusParameters{
+		VotingPeriod:              10,
+		MinProposalDeposit:        *quantity.NewFromUint64(300),
+		StakeThreshold:            68,
+		UpgradeMinEpochDiff:       40,
+		UpgradeCancelMinEpochDiff: 20,
+	}
 	f.Network.StakingGenesis = &staking.Genesis{
 		Parameters: staking.ConsensusParameters{
 			CommissionScheduleRules: staking.CommissionScheduleRules{
@@ -211,8 +255,19 @@ func (sc *txSourceImpl) Fixture() (*oasis.NetworkFixture, error) {
 			FeeSplitWeightPropose:     *quantity.NewFromUint64(2),
 			FeeSplitWeightVote:        *quantity.NewFromUint64(1),
 			FeeSplitWeightNextPropose: *quantity.NewFromUint64(1),
+			AllowEscrowMessages:       true,
+			Thresholds: map[staking.ThresholdKind]quantity.Quantity{
+				staking.KindEntity:            *quantity.NewFromUint64(0),
+				staking.KindNodeValidator:     *quantity.NewFromUint64(0),
+				staking.KindNodeCompute:       *quantity.NewFromUint64(0),
+				staking.KindNodeObserver:      *quantity.NewFromUint64(0),
+				staking.KindNodeKeyManager:    *quantity.NewFromUint64(0),
+				staking.KindRuntimeCompute:    *quantity.NewFromUint64(100),
+				staking.KindRuntimeKeyManager: *quantity.NewFromUint64(100),
+				staking.KindKeyManagerChurp:   *quantity.NewFromUint64(0),
+			},
 		},
-		TotalSupply: *quantity.NewFromUint64(150000000000),
+		TotalSupply: *quantity.NewFromUint64(150000001400),
 		Ledger: map[staking.Address]*staking.Account{
 			e2e.DeterministicValidator0: {
 				General: staking.GeneralAccount{
@@ -289,11 +344,84 @@ func (sc *txSourceImpl) Fixture() (*oasis.NetworkFixture, error) {
 					Balance: *quantity.NewFromUint64(10000000000),
 				},
 			},
+			// Entity accounts need escrow so that validators have voting power
+			// for governance.
+			e2e.DeterministicEntity1: {
+				Escrow: staking.EscrowAccount{
+					Active: staking.SharePool{
+						Balance:     *quantity.NewFromUint64(100),
+						TotalShares: *quantity.NewFromUint64(100),
+					},
+				},
+			},
+			e2e.DeterministicEntity2: {
+				Escrow: staking.EscrowAccount{
+					Active: staking.SharePool{
+						Balance:     *quantity.NewFromUint64(100),
+						TotalShares: *quantity.NewFromUint64(100),
+					},
+				},
+			},
+			e2e.DeterministicEntity3: {
+				Escrow: staking.EscrowAccount{
+					Active: staking.SharePool{
+						Balance:     *quantity.NewFromUint64(100),
+						TotalShares: *quantity.NewFromUint64(100),
+					},
+				},
+			},
+			e2e.DeterministicEntity4: {
+				Escrow: staking.EscrowAccount{
+					Active: staking.SharePool{
+						Balance:     *quantity.NewFromUint64(100),
+						TotalShares: *quantity.NewFromUint64(100),
+					},
+				},
+			},
+			// Ensure test entity has enough stake to register runtimes.
+			e2e.TestEntityAccount: {
+				Escrow: staking.EscrowAccount{
+					Active: staking.SharePool{
+						Balance:     *quantity.NewFromUint64(1000),
+						TotalShares: *quantity.NewFromUint64(100),
+					},
+				},
+			},
+		},
+		Delegations: map[staking.Address]map[staking.Address]*staking.Delegation{
+			e2e.DeterministicEntity1: {
+				e2e.DeterministicEntity1: &staking.Delegation{
+					Shares: *quantity.NewFromUint64(100),
+				},
+			},
+			e2e.DeterministicEntity2: {
+				e2e.DeterministicEntity2: &staking.Delegation{
+					Shares: *quantity.NewFromUint64(100),
+				},
+			},
+			e2e.DeterministicEntity3: {
+				e2e.DeterministicEntity3: &staking.Delegation{
+					Shares: *quantity.NewFromUint64(100),
+				},
+			},
+			e2e.DeterministicEntity4: {
+				e2e.DeterministicEntity4: &staking.Delegation{
+					Shares: *quantity.NewFromUint64(100),
+				},
+			},
+			e2e.TestEntityAccount: {
+				e2e.TestEntityAccount: &staking.Delegation{
+					Shares: *quantity.NewFromUint64(100),
+				},
+			},
 		},
 	}
-
-	// Disable CheckTx on the client node so we can submit invalid transactions.
-	f.Clients[0].Consensus.DisableCheckTx = true
+	f.Entities = []oasis.EntityCfg{
+		{IsDebugTestEntity: true},
+	}
+	for i := 0; i < sc.numValidatorNodes; i++ {
+		f.Entities = append(f.Entities, oasis.EntityCfg{})
+	}
 
 	// Runtime configuration.
 	// Transaction scheduling.
@@ -305,27 +433,24 @@ func (sc *txSourceImpl) Fixture() (*oasis.NetworkFixture, error) {
 	f.Runtimes[1].Storage.CheckpointNumKept = 2
 	f.Runtimes[1].Storage.CheckpointChunkSize = 1024 * 1024
 
-	// Storage committee.
-	f.Runtimes[1].Storage.GroupSize = uint64(sc.numStorageNodes)
-	f.Runtimes[1].Storage.MinWriteReplication = f.Runtimes[1].Storage.GroupSize
-
 	// Executor committee.
 	f.Runtimes[1].Executor.GroupBackupSize = 1
-	f.Runtimes[1].Executor.GroupSize = uint64(sc.numComputeNodes) -
+	f.Runtimes[1].Executor.GroupSize = uint16(sc.numComputeNodes) -
 		f.Runtimes[1].Executor.GroupBackupSize
+	f.Runtimes[1].Constraints[scheduler.KindComputeExecutor][scheduler.RoleWorker].MinPoolSize.Limit = f.Runtimes[1].Executor.GroupSize
+	f.Runtimes[1].Constraints[scheduler.KindComputeExecutor][scheduler.RoleBackupWorker].MinPoolSize.Limit = f.Runtimes[1].Executor.GroupBackupSize
 
 	if sc.nodeLongRestartInterval > 0 {
-		// One storage node could be offline.
-		f.Runtimes[1].Storage.GroupSize--
-		// Storage node that is part of the committee could be offline.
-		f.Runtimes[1].Storage.MinWriteReplication = f.Runtimes[1].Storage.GroupSize - 1
-
 		// One executor can be offline.
 		f.Runtimes[1].Executor.GroupSize--
+		f.Runtimes[1].Constraints[scheduler.KindComputeExecutor][scheduler.RoleWorker].MinPoolSize.Limit--
+		f.Runtimes[1].Constraints[scheduler.KindComputeExecutor][scheduler.RoleBackupWorker].MinPoolSize.Limit--
+		// Allow one straggler to handle the case where the backup and primary worker are offline
+		// at the same time.
+		f.Runtimes[1].Executor.AllowedStragglers = 1
 
-		// Lower proposer and round timeouts as nodes are expected to go offline for longer time.
-		f.Runtimes[1].TxnScheduler.ProposerTimeout = 5
-		f.Runtimes[1].Executor.RoundTimeout = 15
+		// Lower round timeouts as nodes are expected to go offline for longer time.
+		f.Runtimes[1].Executor.RoundTimeout = 10
 	}
 
 	if sc.nodeRestartInterval > 0 || sc.nodeLongRestartInterval > 0 {
@@ -334,14 +459,21 @@ func (sc *txSourceImpl) Fixture() (*oasis.NetworkFixture, error) {
 		f.Network.DefaultLogWatcherHandlerFactories = []log.WatcherHandlerFactory{}
 	}
 
-	// Use at least 4 validators so that consensus can keep making progress
-	// when a node is being killed and restarted.
-	f.Validators = []oasis.ValidatorFixture{
-		{Entity: 1},
-		{Entity: 1},
-		{Entity: 1},
-		{Entity: 1},
+	var validators []oasis.ValidatorFixture
+	for i := 0; i < sc.numValidatorNodes; i++ {
+		validators = append(validators, oasis.ValidatorFixture{
+			Entity: i + 1, // Skip 0, which is the test entity.
+		})
 	}
+	f.Validators = validators
+	var keymanagers []oasis.KeymanagerFixture
+	for i := 0; i < sc.numKeyManagerNodes; i++ {
+		keymanagers = append(keymanagers, oasis.KeymanagerFixture{
+			Runtime: 0,
+			Entity:  1,
+		})
+	}
+	f.Keymanagers = keymanagers
 	var computeWorkers []oasis.ComputeWorkerFixture
 	for i := 0; i < sc.numComputeNodes; i++ {
 		computeWorkers = append(computeWorkers, oasis.ComputeWorkerFixture{
@@ -350,51 +482,54 @@ func (sc *txSourceImpl) Fixture() (*oasis.NetworkFixture, error) {
 		})
 	}
 	f.ComputeWorkers = computeWorkers
-	f.Keymanagers = []oasis.KeymanagerFixture{
-		{Runtime: 0, Entity: 1},
-		{Runtime: 0, Entity: 1},
+	var clients []oasis.ClientFixture
+	for i := 0; i < sc.numClientNodes; i++ {
+		c := oasis.ClientFixture{}
+		// Enable runtime on the first node.
+		if i == 0 {
+			c.Runtimes = []int{1}
+		}
+		// Enable supplementary sanity and profiling on the last client node.
+		if i == sc.numClientNodes-1 {
+			c.Consensus.SupplementarySanityInterval = 1
+			c.EnableProfiling = true
+		}
+		clients = append(clients, c)
 	}
-	var storageWorkers []oasis.StorageWorkerFixture
-	for i := 0; i < sc.numStorageNodes; i++ {
-		storageWorkers = append(storageWorkers, oasis.StorageWorkerFixture{
-			Backend: database.BackendNameBadgerDB,
-			Entity:  1,
-		})
-	}
-	f.StorageWorkers = storageWorkers
+	f.Clients = clients
 
 	// Update validators to require fee payments.
 	for i := range f.Validators {
 		f.Validators[i].Consensus.MinGasPrice = txSourceGasPrice
 		f.Validators[i].Consensus.SubmissionGasPrice = txSourceGasPrice
 		// Enable recovery from corrupted WAL.
-		f.Validators[i].Consensus.TendermintRecoverCorruptedWAL = sc.tendermintRecoverCorruptedWAL
+		f.Validators[i].Consensus.CometBFTRecoverCorruptedWAL = sc.cmtRecoverCorruptedWAL
 		// Ensure validator-0 does not have pruning enabled, so nodes taken down
 		// for long period can sync from it.
 		// Note: validator-0 is also never restarted.
 		sc.generateConsensusFixture(&f.Validators[i].Consensus, i == 0)
+		if i > 0 && sc.enableCrashPoints {
+			f.Validators[i].CrashPointsProbability = crashPointProbability
+		}
 	}
 	// Update all other nodes to use a specific gas price.
 	for i := range f.Keymanagers {
 		f.Keymanagers[i].Consensus.SubmissionGasPrice = txSourceGasPrice
 		// Enable recovery from corrupted WAL.
-		f.Keymanagers[i].Consensus.TendermintRecoverCorruptedWAL = sc.tendermintRecoverCorruptedWAL
+		f.Keymanagers[i].Consensus.CometBFTRecoverCorruptedWAL = sc.cmtRecoverCorruptedWAL
 		sc.generateConsensusFixture(&f.Keymanagers[i].Consensus, false)
-	}
-	for i := range f.StorageWorkers {
-		f.StorageWorkers[i].Consensus.SubmissionGasPrice = txSourceGasPrice
-		// Enable recovery from corrupted WAL.
-		f.StorageWorkers[i].Consensus.TendermintRecoverCorruptedWAL = sc.tendermintRecoverCorruptedWAL
-		sc.generateConsensusFixture(&f.StorageWorkers[i].Consensus, false)
-		if i > 0 {
-			f.StorageWorkers[i].CheckpointSyncEnabled = true
+		if i > 0 && sc.enableCrashPoints {
+			f.Keymanagers[i].CrashPointsProbability = crashPointProbability
 		}
 	}
 	for i := range f.ComputeWorkers {
 		f.ComputeWorkers[i].Consensus.SubmissionGasPrice = txSourceGasPrice
 		// Enable recovery from corrupted WAL.
-		f.ComputeWorkers[i].Consensus.TendermintRecoverCorruptedWAL = sc.tendermintRecoverCorruptedWAL
+		f.ComputeWorkers[i].Consensus.CometBFTRecoverCorruptedWAL = sc.cmtRecoverCorruptedWAL
 		sc.generateConsensusFixture(&f.ComputeWorkers[i].Consensus, false)
+		if i > 0 && sc.enableCrashPoints {
+			f.ComputeWorkers[i].CrashPointsProbability = crashPointProbability
+		}
 	}
 	for i := range f.ByzantineNodes {
 		f.ByzantineNodes[i].Consensus.SubmissionGasPrice = txSourceGasPrice
@@ -404,8 +539,8 @@ func (sc *txSourceImpl) Fixture() (*oasis.NetworkFixture, error) {
 	return f, nil
 }
 
-func (sc *txSourceImpl) manager(env *env.Env, errCh chan error) {
-	ctx, cancel := context.WithCancel(context.Background())
+func (sc *txSourceImpl) manager(ctx context.Context, env *env.Env, errCh chan error) {
+	ctx, cancel := context.WithCancel(ctx)
 	// Make sure we exit when the environment gets torn down.
 	stopCh := make(chan struct{})
 	env.AddOnCleanup(func() {
@@ -435,16 +570,13 @@ func (sc *txSourceImpl) manager(env *env.Env, errCh chan error) {
 	var restartableNodes []*oasis.Node
 	// Keep one of each types of nodes always running.
 	for _, v := range sc.Net.Validators()[1:] {
-		restartableNodes = append(restartableNodes, &v.Node)
-	}
-	for _, s := range sc.Net.StorageWorkers()[1:] {
-		restartableNodes = append(restartableNodes, &s.Node)
+		restartableNodes = append(restartableNodes, v.Node)
 	}
 	for _, c := range sc.Net.ComputeWorkers()[1:] {
-		restartableNodes = append(restartableNodes, &c.Node)
+		restartableNodes = append(restartableNodes, c.Node)
 	}
 	for _, k := range sc.Net.Keymanagers()[1:] {
-		restartableNodes = append(restartableNodes, &k.Node)
+		restartableNodes = append(restartableNodes, k.Node)
 	}
 
 	restartTicker := time.NewTicker(sc.nodeRestartInterval)
@@ -557,6 +689,78 @@ func (sc *txSourceImpl) manager(env *env.Env, errCh chan error) {
 			sc.Logger.Info("current consensus height",
 				"height", blk.Height,
 			)
+
+			//
+			// Check if the transactions are properly sorted by priority.
+			//
+
+			latestHeight := blk.Height
+
+			// Unfortunately, CometBFT doesn't store the priority anywhere,
+			// so we need to kludge this a bit.
+			priority := map[string]int64{
+				"beacon":     100000,
+				"keymanager": 50000,
+				"registry":   50000,
+				"governance": 25000,
+				"roothash":   15000,
+				"staking":    1000,
+			}
+
+			// Make sure that transactions at each height since our last check
+			// are properly sorted by their priority.
+			var h int64
+			for h = lastHeight; h < latestHeight; h++ {
+				// Fetch transactions.
+				txs, err := sc.Net.Controller().Consensus.GetTransactions(ctx, h)
+				if err != nil {
+					errCh <- err
+					return
+				}
+
+				priorities := make([]int64, 0, len(txs))
+
+				for _, rawtx := range txs {
+					// Decode transaction.
+					var sigTx transaction.SignedTransaction
+					if err = cbor.Unmarshal(rawtx, &sigTx); err != nil {
+						errCh <- fmt.Errorf("malformed transaction: %w", err)
+						return
+					}
+
+					var tx transaction.Transaction
+					if err = sigTx.Open(&tx); err != nil {
+						errCh <- fmt.Errorf("bad transaction signature: %w", err)
+						return
+					}
+
+					// Determine transaction's priority.
+					var pri int64
+					if tx.Method == "registry.RegisterNode" {
+						// This is currently the only special case.
+						pri = 60000
+					} else {
+						// Determine consensus app from the tx's method.
+						app := strings.Split(string(tx.Method), ".")[0]
+						if p, exists := priority[app]; exists {
+							pri = p
+						} else {
+							continue
+						}
+					}
+
+					priorities = append(priorities, pri)
+				}
+
+				// All priorities must be sorted from highest to lowest.
+				if !sort.SliceIsSorted(priorities, func(i, j int) bool {
+					return priorities[i] > priorities[j]
+				}) {
+					errCh <- fmt.Errorf("transactions at height %d are not sorted by priority", h)
+					return
+				}
+			}
+
 			lastHeight = blk.Height
 		}
 	}
@@ -582,26 +786,24 @@ func (sc *txSourceImpl) startWorkload(childEnv *env.Env, errCh chan error, name 
 		return err
 	}
 
-	logFmt := logging.FmtJSON
-	logLevel := logging.LevelDebug
-
 	args := []string{
 		"debug", "txsource",
 		"--address", "unix:" + node.SocketPath(),
 		"--" + common.CfgDebugAllowTestKeys,
-		"--" + common.CfgDataDir, d.String(),
 		"--" + flags.CfgDebugDontBlameOasis,
 		"--" + flags.CfgDebugTestEntity,
-		"--log.format", logFmt.String(),
-		"--log.level", logLevel.String(),
 		"--" + commonGrpc.CfgLogDebug,
 		"--" + flags.CfgGenesisFile, sc.Net.GenesisPath(),
-		"--" + workload.CfgRuntimeID, runtimeID.String(),
+		"--" + workload.CfgRuntimeID, KeyValueRuntimeID.String(),
 		"--" + txsource.CfgWorkload, name,
 		"--" + txsource.CfgTimeLimit, sc.timeLimit.String(),
 		"--" + txsource.CfgSeed, sc.seed,
+		"--" + txsource.CfgGasPrice, strconv.FormatUint(txSourceGasPrice, 10),
 		// Use half the configured interval due to fast blocks.
 		"--" + workload.CfgConsensusNumKeptVersions, strconv.FormatUint(node.Consensus().PruneNumKept/2, 10),
+	}
+	for _, ent := range sc.Net.Entities()[1:] {
+		args = append(args, "--"+txsource.CfgValidatorEntity, ent.EntityKeyPath())
 	}
 	// Disable runtime queries on non-client node.
 	if node.Name != sc.Net.Clients()[0].Name {
@@ -631,11 +833,13 @@ func (sc *txSourceImpl) startWorkload(childEnv *env.Env, errCh chan error, name 
 	}
 
 	go func() {
-		errCh <- cmd.Wait()
+		waitErr := cmd.Wait()
+		errCh <- waitErr
 
 		sc.Logger.Info("workload finished",
 			"name", name,
 			"node", node.Name,
+			"err", waitErr,
 		)
 	}()
 
@@ -644,7 +848,7 @@ func (sc *txSourceImpl) startWorkload(childEnv *env.Env, errCh chan error, name 
 
 func (sc *txSourceImpl) Clone() scenario.Scenario {
 	return &txSourceImpl{
-		runtimeImpl:                       *sc.runtimeImpl.Clone().(*runtimeImpl),
+		Scenario:                          *sc.Scenario.Clone().(*Scenario),
 		clientWorkloads:                   sc.clientWorkloads,
 		allNodeWorkloads:                  sc.allNodeWorkloads,
 		timeLimit:                         sc.timeLimit,
@@ -655,25 +859,26 @@ func (sc *txSourceImpl) Clone() scenario.Scenario {
 		consensusPruneDisabledProbability: sc.consensusPruneDisabledProbability,
 		consensusPruneMinKept:             sc.consensusPruneMinKept,
 		consensusPruneMaxKept:             sc.consensusPruneMaxKept,
-		tendermintRecoverCorruptedWAL:     sc.tendermintRecoverCorruptedWAL,
-		numStorageNodes:                   sc.numStorageNodes,
+		cmtRecoverCorruptedWAL:            sc.cmtRecoverCorruptedWAL,
+		enableCrashPoints:                 sc.enableCrashPoints,
+		numValidatorNodes:                 sc.numValidatorNodes,
+		numKeyManagerNodes:                sc.numKeyManagerNodes,
 		numComputeNodes:                   sc.numComputeNodes,
+		numClientNodes:                    sc.numClientNodes,
 		seed:                              sc.seed,
 		// rng must always be reinitialized from seed by calling PreInit().
 	}
 }
 
-func (sc *txSourceImpl) Run(childEnv *env.Env) error {
+func (sc *txSourceImpl) Run(ctx context.Context, childEnv *env.Env) error {
 	if err := sc.Net.Start(); err != nil {
 		return fmt.Errorf("scenario net Start: %w", err)
 	}
 
 	// Wait for all nodes to be synced before we proceed.
-	if err := sc.waitNodesSynced(); err != nil {
+	if err := sc.WaitNodesSynced(ctx); err != nil {
 		return err
 	}
-
-	ctx := context.Background()
 
 	sc.Logger.Info("waiting for network to come up")
 	if err := sc.Net.Controller().WaitNodesRegistered(ctx, sc.Net.NumRegisterNodes()); err != nil {
@@ -683,7 +888,7 @@ func (sc *txSourceImpl) Run(childEnv *env.Env) error {
 	// Start all configured workloads.
 	errCh := make(chan error, len(sc.clientWorkloads)+len(sc.allNodeWorkloads)+2)
 	for _, name := range sc.clientWorkloads {
-		if err := sc.startWorkload(childEnv, errCh, name, &sc.Net.Clients()[0].Node); err != nil {
+		if err := sc.startWorkload(childEnv, errCh, name, sc.Net.Clients()[0].Node); err != nil {
 			return fmt.Errorf("failed to start client workload %s: %w", name, err)
 		}
 	}
@@ -696,7 +901,7 @@ func (sc *txSourceImpl) Run(childEnv *env.Env) error {
 		}
 	}
 	// Start background scenario manager.
-	go sc.manager(childEnv, errCh)
+	go sc.manager(ctx, childEnv, errCh)
 
 	// Wait for any workload to terminate.
 	var err error
@@ -708,9 +913,5 @@ func (sc *txSourceImpl) Run(childEnv *env.Env) error {
 		return err
 	}
 
-	if err = sc.Net.CheckLogWatchers(); err != nil {
-		return err
-	}
-
-	return nil
+	return sc.Net.CheckLogWatchers()
 }

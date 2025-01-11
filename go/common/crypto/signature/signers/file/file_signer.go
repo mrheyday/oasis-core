@@ -2,32 +2,39 @@
 package file
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
-	"github.com/oasisprotocol/ed25519"
+	"github.com/oasisprotocol/curve25519-voi/primitives/ed25519"
+	"github.com/oasisprotocol/curve25519-voi/primitives/ed25519/extra/ecvrf"
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/pem"
 )
 
 const (
-	privateKeyPemType = "ED25519 PRIVATE KEY"
+	privateKeyPemType    = "ED25519 PRIVATE KEY"
+	staticEntropyPemType = "STATIC ENTROPY"
 
 	filePerm = 0o600
 
 	// SignerName is the name used to identify the file backed signer.
 	SignerName = "file"
+
+	// StaticEntropySize is the size of the provided static entropy.
+	StaticEntropySize = 32
 )
 
 var (
-	_ signature.SignerFactoryCtor = NewFactory
-	_ signature.SignerFactory     = (*Factory)(nil)
-	_ signature.Signer            = (*Signer)(nil)
+	_ signature.SignerFactoryCtor     = NewFactory
+	_ signature.SignerFactory         = (*Factory)(nil)
+	_ signature.Signer                = (*Signer)(nil)
+	_ signature.VRFSigner             = (*Signer)(nil)
+	_ signature.StaticEntropyProvider = (*Signer)(nil)
 
 	// FileEntityKey is the entity key filename.
 	FileEntityKey = "entity.pem"
@@ -35,14 +42,19 @@ var (
 	FileIdentityKey = "identity.pem"
 	// FileP2PKey is the P2P key filename.
 	FileP2PKey = "p2p.pem"
+	// FileP2PStaticEntropy is the static P2P entropy filename.
+	FileP2PStaticEntropy = "p2p_entropy.pem"
 	// FileConsensusKey is the consensus key filename.
 	FileConsensusKey = "consensus.pem"
+	// FileVRFKey is the vrf key filename.
+	FileVRFKey = "vrf.pem"
 
 	rolePEMFiles = map[signature.SignerRole]string{
 		signature.SignerEntity:    FileEntityKey,
 		signature.SignerNode:      FileIdentityKey,
 		signature.SignerP2P:       FileP2PKey,
 		signature.SignerConsensus: FileConsensusKey,
+		signature.SignerVRF:       FileVRFKey,
 	}
 )
 
@@ -110,11 +122,33 @@ func (fac *Factory) Generate(role signature.SignerRole, rng io.Reader) (signatur
 	if err != nil {
 		return nil, err
 	}
-	if err = ioutil.WriteFile(fn, buf, filePerm); err != nil {
+	if err = os.WriteFile(fn, buf, filePerm); err != nil {
 		return nil, err
 	}
 
+	switch role {
+	case signature.SignerP2P:
+		// Generate new static entropy for P2P signers.
+		if err = fac.generateStaticEntropy(FileP2PStaticEntropy, signer, rng); err != nil {
+			return nil, err
+		}
+	default:
+	}
+
 	return signer, nil
+}
+
+func (fac *Factory) generateStaticEntropy(fn string, signer *Signer, rng io.Reader) error {
+	if _, err := rng.Read(signer.staticEntropy[:]); err != nil {
+		return err
+	}
+
+	// Persist the entropy.
+	buf, err := signer.marshalStaticEntropyPEM()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(fac.dataDir, fn), buf, filePerm)
 }
 
 // Load will load the private key corresponding to the role, and return a Signer
@@ -133,7 +167,7 @@ func (fac *Factory) ForceLoad(fn string) (signature.Signer, error) {
 	return fac.doLoad(fn, signature.SignerUnknown)
 }
 
-func (fac *Factory) doLoad(fn string, role signature.SignerRole) (signature.Signer, error) {
+func (fac *Factory) loadPEM(fn string) ([]byte, error) {
 	f, err := os.Open(fn)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -152,7 +186,11 @@ func (fac *Factory) doLoad(fn string, role signature.SignerRole) (signature.Sign
 		return nil, fmt.Errorf("signature/signer/file: invalid PEM file permissions %o on %s", fi.Mode(), fn)
 	}
 
-	buf, err := ioutil.ReadAll(f)
+	return io.ReadAll(f)
+}
+
+func (fac *Factory) doLoad(fn string, role signature.SignerRole) (signature.Signer, error) {
+	buf, err := fac.loadPEM(fn)
 	if err != nil {
 		return nil, err
 	}
@@ -163,13 +201,40 @@ func (fac *Factory) doLoad(fn string, role signature.SignerRole) (signature.Sign
 	}
 	signer.role = role
 
+	switch role {
+	case signature.SignerP2P:
+		// Load static entropy for P2P signers.
+		err = fac.loadStaticEntropy(FileP2PStaticEntropy, &signer)
+		switch err {
+		case nil:
+		case signature.ErrNotExist:
+			// Old versions of the file signer didn't provide static entropy, generate some now.
+			if err = fac.generateStaticEntropy(FileP2PStaticEntropy, &signer, rand.Reader); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, err
+		}
+	default:
+	}
+
 	return &signer, nil
+}
+
+func (fac *Factory) loadStaticEntropy(fn string, signer *Signer) error {
+	buf, err := fac.loadPEM(filepath.Join(fac.dataDir, fn))
+	if err != nil {
+		return err
+	}
+
+	return signer.unmarshalStaticEntropyPEM(buf)
 }
 
 // Signer is a PEM file backed Signer.
 type Signer struct {
-	privateKey ed25519.PrivateKey
-	role       signature.SignerRole
+	privateKey    ed25519.PrivateKey
+	role          signature.SignerRole
+	staticEntropy [StaticEntropySize]byte
 }
 
 // Public returns the PublicKey corresponding to the signer.
@@ -202,6 +267,24 @@ func (s *Signer) Reset() {
 	}
 }
 
+// Prove generates a VRF proof with the private key over the alpha.
+func (s *Signer) Prove(alphaString []byte) ([]byte, error) {
+	if s.role != signature.SignerVRF {
+		return nil, signature.ErrInvalidRole
+	}
+	return ecvrf.Prove(s.privateKey, alphaString), nil
+}
+
+// StaticEntropy returns PrivateKeySize bytes of cryptographic entropy that
+// is independent from the Signer's private key.  The value of this entropy
+// is constant for the lifespan of the signer's underlying key pair.
+func (s *Signer) StaticEntropy() ([]byte, error) {
+	if s.role != signature.SignerP2P {
+		return nil, signature.ErrInvalidRole
+	}
+	return s.staticEntropy[:], nil
+}
+
 func (s *Signer) marshalPEM() ([]byte, error) {
 	return pem.Marshal(privateKeyPemType, s.privateKey[:])
 }
@@ -216,6 +299,24 @@ func (s *Signer) unmarshalPEM(data []byte) error {
 	}
 
 	s.privateKey = ed25519.PrivateKey(data)
+
+	return nil
+}
+
+func (s *Signer) marshalStaticEntropyPEM() ([]byte, error) {
+	return pem.Marshal(staticEntropyPemType, s.staticEntropy[:])
+}
+
+func (s *Signer) unmarshalStaticEntropyPEM(data []byte) error {
+	data, err := pem.Unmarshal(staticEntropyPemType, data)
+	if err != nil {
+		return err
+	}
+	if len(data) != StaticEntropySize {
+		return signature.ErrMalformedPrivateKey
+	}
+
+	copy(s.staticEntropy[:], data)
 
 	return nil
 }

@@ -11,12 +11,12 @@ use std::{
 
 use ansi_term::Color::{Green, Red, White};
 use anyhow::{anyhow, Context as AnyContext, Result};
-use clap::{App, Arg, SubCommand};
+use clap::Arg;
 use oasis_core_tools::cargo;
 use thiserror::Error;
 
 /// Target tripe for SGX platform.
-const TARGET_TRIPLE: &'static str = "x86_64-fortanix-unknown-sgx";
+const TARGET_TRIPLE: &str = "x86_64-fortanix-unknown-sgx";
 /// Default heap size.
 const DEFAULT_HEAP_SIZE: u64 = 0x2000000;
 /// Default SSA frame size.
@@ -38,18 +38,19 @@ enum CommandFail {
 
 fn run_command(mut cmd: Command) -> Result<(), CommandFail> {
     match cmd.status() {
-        Err(e) => Err(CommandFail::Io(format!("{:?}", cmd), e)),
+        Err(e) => Err(CommandFail::Io(format!("{cmd:?}"), e)),
         Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(CommandFail::Status(format!("{:?}", cmd), status)),
+        Ok(status) => Err(CommandFail::Status(format!("{cmd:?}"), status)),
     }
 }
 
 fn real_main() -> Result<()> {
-    let matches = App::new("cargo")
+    let matches = clap::Command::new("cargo")
         .subcommand(
-            SubCommand::with_name("elf2sgxs").arg(
-                Arg::with_name("release")
+            clap::Command::new("elf2sgxs").arg(
+                Arg::new("release")
                     .long("release")
+                    .action(clap::ArgAction::SetTrue)
                     .help("Use release build artifacts"),
             ),
         )
@@ -73,7 +74,7 @@ fn real_main() -> Result<()> {
     // Build target directory.
     let mut target_path = package_root.target_path();
     target_path.push(TARGET_TRIPLE);
-    if matches.is_present("release") {
+    if matches.get_flag("release") {
         target_path.push("release");
     } else {
         target_path.push("debug");
@@ -121,10 +122,9 @@ fn real_main() -> Result<()> {
                 println!(
                     "{} {}",
                     Green.bold().paint(format!("{:>12}", "elf2sgxs")),
-                    White.dimmed().paint(format!(
-                        "(skipped {} due to newer target file)",
-                        target_name
-                    )),
+                    White
+                        .dimmed()
+                        .paint(format!("(skipped {target_name} due to newer target file)")),
                 );
                 continue;
             }

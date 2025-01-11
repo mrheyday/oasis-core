@@ -1,17 +1,25 @@
 // Package version implements Oasis protocol and runtime versioning.
 //
 // For a more detailed explanation of Oasis Core's versioning, see:
-// https://docs.oasis.dev/oasis-core/processes/versioning.
+// https://docs.oasis.io/core/versioning.
 package version
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 
-	"github.com/tendermint/tendermint/version"
+	"github.com/oasisprotocol/oasis-core/go/common/prettyprint"
 )
+
+// VersionUndefined represents an undefined version.
+const VersionUndefined = "undefined"
+
+var _ prettyprint.PrettyPrinter = (*ProtocolVersions)(nil)
 
 // NOTE: This should be kept in sync with runtime/src/common/version.rs.
 
@@ -22,6 +30,27 @@ type Version struct {
 	Patch uint16 `json:"patch,omitempty"`
 }
 
+// ValidateBasic does basic validation of a protocol version.
+func (v Version) ValidateBasic() error {
+	empty := Version{}
+	if v == empty {
+		return fmt.Errorf("invalid version: %s", empty)
+	}
+	return nil
+}
+
+// Cmp returns a negative number when the given version is larger, a positive
+// number when smaller, and zero when both versions are equal.
+func (v Version) Cmp(other Version) int {
+	if v.Major != other.Major {
+		return int(v.Major) - int(other.Major)
+	}
+	if v.Minor != other.Minor {
+		return int(v.Minor) - int(other.Minor)
+	}
+	return int(v.Patch) - int(other.Patch)
+}
+
 // ToU64 returns the version as platform-dependent uint64.
 func (v Version) ToU64() uint64 {
 	return (uint64(v.Major) << 32) | (uint64(v.Minor) << 16) | (uint64(v.Patch))
@@ -30,15 +59,51 @@ func (v Version) ToU64() uint64 {
 // FromU64 returns the version from platform-dependent uint64.
 func FromU64(v uint64) Version {
 	return Version{
-		Major: uint16((v >> 32) & 0xff),
-		Minor: uint16((v >> 16) & 0xff),
-		Patch: uint16(v & 0xff),
+		Major: uint16((v >> 32) & 0xffff),
+		Minor: uint16((v >> 16) & 0xffff),
+		Patch: uint16(v & 0xffff),
 	}
 }
 
 // String returns the protocol version as a string.
 func (v Version) String() string {
 	return fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Patch)
+}
+
+// FromString parses version in semver format. e.g. "1.0.0"
+// major.minor.patch components are considered where major is mandatory.
+// Any component following patch is ignored.
+func FromString(s string) (Version, error) {
+	// Trim potential pre-release suffix.
+	s = strings.Split(s, "-")[0]
+	// Trim potential git commit.
+	s = strings.Split(s, "+")[0]
+	// Take at most four components: major.minor.patch.remainder.
+	split := strings.SplitN(s, ".", 4)
+
+	semVers := []uint16{0, 0, 0}
+	for i, v := range split {
+		if i >= 3 {
+			// Ignore any components following major.minor.patch.
+			break
+		}
+		ver, err := strconv.ParseUint(v, 10, 16)
+		if err != nil {
+			return Version{}, fmt.Errorf("version: failed to parse SemVer '%s': %w", s, err)
+		}
+		semVers[i] = uint16(ver)
+	}
+
+	return Version{Major: semVers[0], Minor: semVers[1], Patch: semVers[2]}, nil
+}
+
+// MustFromString parses version in semver format and panics, if there is an error.
+func MustFromString(s string) Version {
+	ver, err := FromString(s)
+	if err != nil {
+		panic(err)
+	}
+	return ver
 }
 
 // MaskNonMajor masks all non-major version segments to 0 and returns a new
@@ -64,78 +129,123 @@ var (
 	// This is mostly used for reporting and metrics.
 	GitBranch = ""
 
-	// RuntimeHostProtocol versions the protocol between the Oasis node(s) and
-	// the runtime.
-	//
-	// NOTE: This version must be synced with runtime/src/common/version.rs.
-	RuntimeHostProtocol = Version{Major: 1, Minor: 0, Patch: 0}
-
-	// RuntimeCommitteeProtocol versions the P2P protocol used by the runtime
-	// committee members.
-	RuntimeCommitteeProtocol = Version{Major: 2, Minor: 0, Patch: 0}
-
 	// ConsensusProtocol versions all data structures and processing used by
 	// the epochtime, beacon, registry, roothash, etc. modules that are
 	// backend by consensus.
 	//
 	// NOTE: Consensus protocol version compatibility is currently not directly
 	// checked in Oasis Core.
-	// It is converted to TendermintAppVersion whose compatibility is checked
-	// via Tendermint's version checks.
-	ConsensusProtocol = Version{Major: 2, Minor: 0, Patch: 0}
+	// It is converted to CometBFTAppVersion whose compatibility is checked
+	// via CometBFT's version checks.
+	ConsensusProtocol = Version{Major: 7, Minor: 0, Patch: 0}
 
-	// TendermintAppVersion is Tendermint ABCI application's version computed by
-	// masking non-major consensus protocol version segments to 0 to be
-	// compatible with Tendermint's version checks.
+	// RuntimeHostProtocol versions the protocol between the Oasis node(s) and
+	// the runtime.
 	//
-	// NOTE: Tendermint's version checks compare the whole version uint64
+	// NOTE: This version must be synced with runtime/src/common/version.rs.
+	RuntimeHostProtocol = Version{Major: 5, Minor: 1, Patch: 0}
+
+	// RuntimeCommitteeProtocol versions the P2P protocol used by the runtime
+	// committee members.
+	RuntimeCommitteeProtocol = Version{Major: 5, Minor: 0, Patch: 0}
+
+	// CometBFTAppVersion is CometBFT ABCI application's version computed by
+	// masking non-major consensus protocol version segments to 0 to be
+	// compatible with CometBFT's version checks.
+	//
+	// NOTE: CometBFT's version checks compare the whole version uint64
 	// directly. For example:
-	// https://github.com/tendermint/tendermint/blob/1635d1339c73ae6a82e062cd2dc7191b029efa14/state/validation.go#L21-L22.
-	TendermintAppVersion = ConsensusProtocol.MaskNonMajor().ToU64()
-
-	// Tendermint exposes the tendermint core version.
-	Tendermint = parseSemVerStr(version.TMCoreSemVer)
-
-	// ABCI is the version of the tendermint ABCI library.
-	ABCI = parseSemVerStr(version.ABCIVersion)
+	// https://github.com/cometbft/cometbft/blob/v0.37.1/state/validation.go#L21-L22
+	CometBFTAppVersion = ConsensusProtocol.MaskNonMajor().ToU64()
 
 	// Toolchain is the version of the Go compiler/standard library.
-	Toolchain = parseSemVerStr(strings.TrimPrefix(runtime.Version(), "go"))
+	Toolchain = MustFromString(strings.TrimPrefix(runtime.Version(), "go"))
 )
 
-// Versions contains all known protocol versions.
-var Versions = struct {
-	RuntimeHostProtocol      Version
-	RuntimeCommitteeProtocol Version
-	ConsensusProtocol        Version
-	Tendermint               Version
-	ABCI                     Version
-	Toolchain                Version
-}{
-	RuntimeHostProtocol,
-	RuntimeCommitteeProtocol,
-	ConsensusProtocol,
-	Tendermint,
-	ABCI,
-	Toolchain,
+// ProtocolVersions are the protocol versions.
+type ProtocolVersions struct {
+	ConsensusProtocol        Version `json:"consensus_protocol"`
+	RuntimeHostProtocol      Version `json:"runtime_host_protocol"`
+	RuntimeCommitteeProtocol Version `json:"runtime_committee_protocol"`
 }
 
-func parseSemVerStr(s string) Version {
-	// Trim potential pre-release suffix.
-	s = strings.Split(s, "-")[0]
-	split := strings.SplitN(s, ".", 4)
+// ValidateBasic does basic validation checks of the protocol versions.
+func (pv *ProtocolVersions) ValidateBasic() error {
+	if err := pv.ConsensusProtocol.ValidateBasic(); err != nil {
+		return fmt.Errorf("invalid Consensus protocol version: %w", err)
+	}
+	if err := pv.RuntimeHostProtocol.ValidateBasic(); err != nil {
+		return fmt.Errorf("invalid Runtime Host protocol version: %w", err)
+	}
+	if err := pv.RuntimeCommitteeProtocol.ValidateBasic(); err != nil {
+		return fmt.Errorf("invalid Runtime Committee protocol version: %w", err)
+	}
+	return nil
+}
 
-	var semVers []uint16 = []uint16{0, 0, 0}
-	for i, v := range split {
-		if i >= 3 {
-			break
-		}
-		ver, err := strconv.ParseUint(v, 10, 16)
-		if err != nil {
-			panic("version: failed to parse SemVer: " + err.Error())
-		}
-		semVers[i] = uint16(ver)
+// Compatible returns if the two protocol versions are compatible.
+func (pv *ProtocolVersions) Compatible(other ProtocolVersions) bool {
+	if pv.ConsensusProtocol.MaskNonMajor() != other.ConsensusProtocol.MaskNonMajor() {
+		return false
+	}
+	if pv.RuntimeHostProtocol.MaskNonMajor() != other.RuntimeHostProtocol.MaskNonMajor() {
+		return false
+	}
+	if pv.RuntimeCommitteeProtocol.MaskNonMajor() != other.RuntimeCommitteeProtocol.MaskNonMajor() {
+		return false
+	}
+	return true
+}
+
+// String returns the protocol versions as a string.
+func (pv ProtocolVersions) String() string {
+	return fmt.Sprintf(
+		"Consensus protocol: %s, Runtime Host protocol: %s, Runtime Committee protocol: %s",
+		pv.ConsensusProtocol, pv.RuntimeHostProtocol, pv.RuntimeCommitteeProtocol,
+	)
+}
+
+// PrettyPrint writes a pretty-printed representation of ProtocolVersions to the
+// given writer.
+func (pv ProtocolVersions) PrettyPrint(_ context.Context, prefix string, w io.Writer) {
+	fmt.Fprintf(w, "%sConsensus Protocol: %s\n", prefix, pv.ConsensusProtocol)
+	fmt.Fprintf(w, "%sRuntime Host Protocol: %s\n", prefix, pv.RuntimeHostProtocol)
+	fmt.Fprintf(w, "%sRuntime Committee Protocol: %s\n", prefix, pv.RuntimeCommitteeProtocol)
+}
+
+// PrettyType returns a representation of ProtocolVersions that can be used for
+// pretty printing.
+func (pv ProtocolVersions) PrettyType() (interface{}, error) {
+	return pv, nil
+}
+
+// Versions are current protocol versions.
+var Versions = ProtocolVersions{
+	ConsensusProtocol,
+	RuntimeHostProtocol,
+	RuntimeCommitteeProtocol,
+}
+
+var goModulesVersionRegex = regexp.MustCompile(`v0.(?P<year>[0-9]{2})(?P<minor>[0-9]{2}).(?P<micro>[0-9]+)`)
+
+// ConvertGoModulesVersion converts a Go modules compatible version to Oasis Core's canonical version.
+func ConvertGoModulesVersion(goModVersion string) string {
+	match := goModulesVersionRegex.FindStringSubmatch(goModVersion)
+	// NOTE: match[0] contains the whole matched string.
+	if len(match) != 4 {
+		return VersionUndefined
 	}
 
-	return Version{Major: semVers[0], Minor: semVers[1], Patch: semVers[2]}
+	result := make(map[string]string)
+	for i, name := range goModulesVersionRegex.SubexpNames() {
+		if i != 0 && name != "" {
+			result[name] = match[i]
+		}
+	}
+
+	version := result["year"] + "." + strings.TrimPrefix(result["minor"], "0")
+	if result["micro"] != "0" {
+		version += "." + result["micro"]
+	}
+	return version
 }
