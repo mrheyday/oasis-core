@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/rpc"
 	"os/exec"
+	"slices"
 	"sync"
 
 	hclog "github.com/hashicorp/go-hclog"
@@ -67,7 +68,7 @@ func Serve(name string, impl Signer) {
 
 // NewFactory creates a new factory backed by the specified plugin
 // and plugin configuration.
-func NewFactory(config interface{}, roles ...signature.SignerRole) (signature.SignerFactory, error) {
+func NewFactory(config any, roles ...signature.SignerRole) (signature.SignerFactory, error) {
 	cfg, ok := config.(*FactoryConfig)
 	if !ok {
 		return nil, fmt.Errorf("signature/signer/plugin: invalid plugin signer configuration provided")
@@ -75,6 +76,13 @@ func NewFactory(config interface{}, roles ...signature.SignerRole) (signature.Si
 
 	if cfg.Name == "" {
 		return nil, fmt.Errorf("signature/signer/plugin: a plugin name must be specified")
+	}
+
+	// It's not like all the cheap HSMs people seem to like using is going
+	// to support ECVRF anytime soon, when they don't even fully support
+	// RFC 8032.
+	if slices.Contains(roles, signature.SignerVRF) {
+		return nil, signature.ErrVRFNotSupported
 	}
 
 	// Why yes, the correct thing to do is to call `client.Kill`,
@@ -166,7 +174,11 @@ func (wf *wrapperFactory) EnsureRole(role signature.SignerRole) error {
 	return nil
 }
 
-func (wf *wrapperFactory) Generate(role signature.SignerRole, _rng io.Reader) (signature.Signer, error) {
+func (wf *wrapperFactory) Generate(role signature.SignerRole, _ io.Reader) (signature.Signer, error) {
+	if role == signature.SignerVRF {
+		return nil, signature.ErrVRFNotSupported
+	}
+
 	wf.Lock()
 	defer wf.Unlock()
 
@@ -183,6 +195,10 @@ func (wf *wrapperFactory) Generate(role signature.SignerRole, _rng io.Reader) (s
 }
 
 func (wf *wrapperFactory) Load(role signature.SignerRole) (signature.Signer, error) {
+	if role == signature.SignerVRF {
+		return nil, signature.ErrVRFNotSupported
+	}
+
 	wf.Lock()
 	defer wf.Unlock()
 
@@ -254,13 +270,13 @@ type signerPlugin struct {
 	impl Signer
 }
 
-func (p *signerPlugin) Server(_broker *plugin.MuxBroker) (interface{}, error) {
+func (p *signerPlugin) Server(*plugin.MuxBroker) (any, error) {
 	return &rpcServer{
 		impl: p.impl,
 	}, nil
 }
 
-func (signerPlugin) Client(b *plugin.MuxBroker, c *rpc.Client) (interface{}, error) {
+func (signerPlugin) Client(_ *plugin.MuxBroker, c *rpc.Client) (any, error) {
 	return &rpcClient{
 		client: c,
 	}, nil

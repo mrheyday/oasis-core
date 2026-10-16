@@ -19,6 +19,8 @@ var (
 	methodGetCommittees = serviceName.NewMethod("GetCommittees", GetCommitteesRequest{})
 	// methodStateToGenesis is the StateToGenesis method.
 	methodStateToGenesis = serviceName.NewMethod("StateToGenesis", int64(0))
+	// methodConsensusParameters is the ConsensusParameters method.
+	methodConsensusParameters = serviceName.NewMethod("ConsensusParameters", int64(0))
 
 	// methodWatchCommittees is the WatchCommittees method.
 	methodWatchCommittees = serviceName.NewMethod("WatchCommittees", nil)
@@ -40,6 +42,10 @@ var (
 				MethodName: methodStateToGenesis.ShortName(),
 				Handler:    handlerStateToGenesis,
 			},
+			{
+				MethodName: methodConsensusParameters.ShortName(),
+				Handler:    handlerConsensusParameters,
+			},
 		},
 		Streams: []grpc.StreamDesc{
 			{
@@ -51,12 +57,12 @@ var (
 	}
 )
 
-func handlerGetValidators( // nolint: golint
-	srv interface{},
+func handlerGetValidators(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -68,18 +74,18 @@ func handlerGetValidators( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetValidators.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetValidators(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerGetCommittees( // nolint: golint
-	srv interface{},
+func handlerGetCommittees(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var req GetCommitteesRequest
 	if err := dec(&req); err != nil {
 		return nil, err
@@ -91,18 +97,18 @@ func handlerGetCommittees( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetCommittees.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetCommittees(ctx, req.(*GetCommitteesRequest))
 	}
 	return interceptor(ctx, &req, info, handler)
 }
 
-func handlerStateToGenesis( // nolint: golint
-	srv interface{},
+func handlerStateToGenesis(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -114,13 +120,36 @@ func handlerStateToGenesis( // nolint: golint
 		Server:     srv,
 		FullMethod: methodStateToGenesis.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).StateToGenesis(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerWatchCommittees(srv interface{}, stream grpc.ServerStream) error {
+func handlerConsensusParameters(
+	srv any,
+	ctx context.Context,
+	dec func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
+	var height int64
+	if err := dec(&height); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).ConsensusParameters(ctx, height)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodConsensusParameters.FullName(),
+	}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).ConsensusParameters(ctx, req.(int64))
+	}
+	return interceptor(ctx, height, info, handler)
+}
+
+func handlerWatchCommittees(srv any, stream grpc.ServerStream) error {
 	if err := stream.RecvMsg(nil); err != nil {
 		return err
 	}
@@ -153,11 +182,19 @@ func RegisterService(server *grpc.Server, service Backend) {
 	server.RegisterService(&serviceDesc, service)
 }
 
-type schedulerClient struct {
+// Client is a gRPC scheduler client.
+type Client struct {
 	conn *grpc.ClientConn
 }
 
-func (c *schedulerClient) GetValidators(ctx context.Context, height int64) ([]*Validator, error) {
+// NewClient creates a new gRPC scheduler client.
+func NewClient(c *grpc.ClientConn) *Client {
+	return &Client{
+		conn: c,
+	}
+}
+
+func (c *Client) GetValidators(ctx context.Context, height int64) ([]*Validator, error) {
 	var rsp []*Validator
 	if err := c.conn.Invoke(ctx, methodGetValidators.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -165,7 +202,7 @@ func (c *schedulerClient) GetValidators(ctx context.Context, height int64) ([]*V
 	return rsp, nil
 }
 
-func (c *schedulerClient) GetCommittees(ctx context.Context, request *GetCommitteesRequest) ([]*Committee, error) {
+func (c *Client) GetCommittees(ctx context.Context, request *GetCommitteesRequest) ([]*Committee, error) {
 	var rsp []*Committee
 	if err := c.conn.Invoke(ctx, methodGetCommittees.FullName(), request, &rsp); err != nil {
 		return nil, err
@@ -173,7 +210,7 @@ func (c *schedulerClient) GetCommittees(ctx context.Context, request *GetCommitt
 	return rsp, nil
 }
 
-func (c *schedulerClient) StateToGenesis(ctx context.Context, height int64) (*Genesis, error) {
+func (c *Client) StateToGenesis(ctx context.Context, height int64) (*Genesis, error) {
 	var rsp Genesis
 	if err := c.conn.Invoke(ctx, methodStateToGenesis.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -181,7 +218,15 @@ func (c *schedulerClient) StateToGenesis(ctx context.Context, height int64) (*Ge
 	return &rsp, nil
 }
 
-func (c *schedulerClient) WatchCommittees(ctx context.Context) (<-chan *Committee, pubsub.ClosableSubscription, error) {
+func (c *Client) ConsensusParameters(ctx context.Context, height int64) (*ConsensusParameters, error) {
+	var rsp ConsensusParameters
+	if err := c.conn.Invoke(ctx, methodConsensusParameters.FullName(), height, &rsp); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+func (c *Client) WatchCommittees(ctx context.Context) (<-chan *Committee, pubsub.ClosableSubscription, error) {
 	ctx, sub := pubsub.NewContextSubscription(ctx)
 
 	stream, err := c.conn.NewStream(ctx, &serviceDesc.Streams[0], methodWatchCommittees.FullName())
@@ -216,10 +261,5 @@ func (c *schedulerClient) WatchCommittees(ctx context.Context) (<-chan *Committe
 	return ch, sub, nil
 }
 
-func (c *schedulerClient) Cleanup() {
-}
-
-// NewSchedulerClient creates a new gRPC scheduler client service.
-func NewSchedulerClient(c *grpc.ClientConn) Backend {
-	return &schedulerClient{c}
+func (c *Client) Cleanup() {
 }

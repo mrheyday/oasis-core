@@ -1,22 +1,16 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/spf13/viper"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/grpc"
-	"github.com/oasisprotocol/oasis-core/go/common/grpc/policy"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
-	"github.com/oasisprotocol/oasis-core/go/common/persistent"
-	"github.com/oasisprotocol/oasis-core/go/common/workerpool"
-	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
-	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
-	"github.com/oasisprotocol/oasis-core/go/runtime/registry"
-	"github.com/oasisprotocol/oasis-core/go/storage/api"
-	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	workerCommon "github.com/oasisprotocol/oasis-core/go/worker/common"
 	committeeCommon "github.com/oasisprotocol/oasis-core/go/worker/common/committee"
 	"github.com/oasisprotocol/oasis-core/go/worker/registration"
@@ -24,14 +18,13 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/worker/storage/committee"
 )
 
-var workerStorageDBBucketName = "worker/storage/watchers"
-
-// Enabled reads our enabled flag from viper.
-func Enabled() bool {
-	return viper.GetBool(CfgWorkerEnabled)
+// Config is the storage worker config.
+type Config struct {
+	// HasLocalStorage is true when node stores state locally.
+	HasLocalStorage bool
 }
 
-// Worker is a worker handling storage operations.
+// Worker is a worker handling storage operations for all common worker runtimes.
 type Worker struct {
 	enabled bool
 
@@ -42,209 +35,201 @@ type Worker struct {
 	initCh chan struct{}
 	quitCh chan struct{}
 
-	runtimes   map[common.Namespace]*committee.Node
-	watchState *persistent.ServiceStore
-	fetchPool  *workerpool.Pool
+	runtimes map[common.Namespace]*committee.Worker
 
-	grpcPolicy *policy.DynamicRuntimePolicyChecker
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // New constructs a new storage worker.
 func New(
+	cfg Config,
 	grpcInternal *grpc.Server,
 	commonWorker *workerCommon.Worker,
 	registration *registration.Worker,
-	genesis genesis.Provider,
-	commonStore *persistent.CommonStore,
 ) (*Worker, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	enabled := cfg.HasLocalStorage && len(commonWorker.GetRuntimes()) > 0
+
 	s := &Worker{
-		enabled:      viper.GetBool(CfgWorkerEnabled),
+		enabled:      enabled,
 		commonWorker: commonWorker,
 		registration: registration,
 		logger:       logging.GetLogger("worker/storage"),
 		initCh:       make(chan struct{}),
 		quitCh:       make(chan struct{}),
-		runtimes:     make(map[common.Namespace]*committee.Node),
+		runtimes:     make(map[common.Namespace]*committee.Worker),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
-	if s.enabled {
-		var err error
-
-		s.fetchPool = workerpool.New("storage_fetch")
-		s.fetchPool.Resize(viper.GetUint(cfgWorkerFetcherCount))
-
-		s.watchState, err = commonStore.GetServiceStore(workerStorageDBBucketName)
-		if err != nil {
-			return nil, err
-		}
-
-		// Attach storage interface to gRPC server.
-		s.grpcPolicy = policy.NewDynamicRuntimePolicyChecker(api.ServiceName, s.commonWorker.GrpcPolicyWatcher)
-		api.RegisterService(s.commonWorker.Grpc.Server(), &storageService{
-			w:                  s,
-			storage:            s.commonWorker.RuntimeRegistry.StorageRouter(),
-			debugRejectUpdates: viper.GetBool(CfgWorkerDebugIgnoreApply) && flags.DebugDontBlameOasis(),
-		})
-
-		var checkpointerCfg *checkpoint.CheckpointerConfig
-		if !viper.GetBool(CfgWorkerCheckpointerDisabled) {
-			checkpointerCfg = &checkpoint.CheckpointerConfig{
-				CheckInterval: viper.GetDuration(CfgWorkerCheckpointCheckInterval),
-			}
-		}
-
-		// Start storage node for every runtime.
-		for _, rt := range s.commonWorker.GetRuntimes() {
-			if err := s.registerRuntime(commonWorker.DataDir, rt, checkpointerCfg); err != nil {
-				return nil, err
-			}
-		}
-
-		// Attach the storage worker's internal GRPC interface.
-		storageWorkerAPI.RegisterService(grpcInternal.Server(), s)
+	if !enabled {
+		return s, nil
 	}
+
+	// Register the storage worker for every runtime.
+	for id, rt := range s.commonWorker.GetRuntimes() {
+		if err := s.registerRuntime(rt); err != nil {
+			return nil, fmt.Errorf("failed to create storage worker for runtime %s: %w", id, err)
+		}
+	}
+
+	// Attach the storage worker's internal GRPC interface.
+	storageWorkerAPI.RegisterService(grpcInternal.Server(), s)
 
 	return s, nil
 }
 
-func (s *Worker) registerRuntime(dataDir string, commonNode *committeeCommon.Node, checkpointerCfg *checkpoint.CheckpointerConfig) error {
+func (w *Worker) registerRuntime(commonNode *committeeCommon.Node) error {
 	id := commonNode.Runtime.ID()
-	s.logger.Info("registering new runtime",
+	w.logger.Info("registering new runtime",
 		"runtime_id", id,
 	)
 
-	rp, err := s.registration.NewRuntimeRoleProvider(node.RoleStorageWorker, id)
+	// Since the storage node is always coupled with another role, make sure to not add any
+	// particular role here. Instead this only serves to prevent registration until the storage node
+	// is synced by making the role provider unavailable.
+	rp, err := w.registration.NewRuntimeRoleProvider(node.RoleEmpty, id)
 	if err != nil {
 		return fmt.Errorf("failed to create role provider: %w", err)
 	}
-
-	path, err := registry.EnsureRuntimeStateDir(dataDir, id)
-	if err != nil {
-		return err
+	var rpRPC registration.RoleProvider
+	if config.GlobalConfig.Storage.PublicRPCEnabled {
+		rpRPC, err = w.registration.NewRuntimeRoleProvider(node.RoleStorageRPC, id)
+		if err != nil {
+			return fmt.Errorf("failed to create rpc role provider: %w", err)
+		}
 	}
 
-	localStorage, err := NewLocalBackend(path, id, commonNode.Identity)
+	localStorage, err := NewLocalBackend(commonNode.Runtime.DataDir(), id)
 	if err != nil {
 		return fmt.Errorf("can't create local storage backend: %w", err)
 	}
-	commonNode.Runtime.RegisterStorage(localStorage)
 
-	node, err := committee.NewNode(
+	worker, err := committee.New(
 		commonNode,
-		s.grpcPolicy,
-		s.fetchPool,
-		s.watchState,
 		rp,
-		s.commonWorker.GetConfig(),
+		rpRPC,
 		localStorage,
-		checkpointerCfg,
-		viper.GetBool(CfgWorkerCheckpointSyncDisabled),
+		&committee.CheckpointSyncConfig{
+			Disabled:          config.GlobalConfig.Storage.CheckpointSyncDisabled,
+			ChunkFetcherCount: config.GlobalConfig.Storage.FetcherCount,
+		},
+		committee.PruneConfig{
+			Enabled:  config.GlobalConfig.Runtime.Prune.IsEnabled(),
+			Interval: config.GlobalConfig.Runtime.Prune.Interval,
+		},
 	)
 	if err != nil {
 		return err
 	}
-	commonNode.AddHooks(node)
-	s.runtimes[id] = node
+	commonNode.Runtime.RegisterStorage(localStorage)
+	commonNode.AddHooks(worker)
+	w.runtimes[id] = worker
 
-	s.logger.Info("new runtime registered",
+	w.logger.Info("new runtime registered",
 		"runtime_id", id,
 	)
 
 	return nil
 }
 
-// Name returns the service name.
-func (s *Worker) Name() string {
+// Name returns the worker name.
+func (w *Worker) Name() string {
 	return "storage worker"
 }
 
 // Enabled returns if worker is enabled.
-func (s *Worker) Enabled() bool {
-	return s.enabled
+func (w *Worker) Enabled() bool {
+	return w.enabled
 }
 
 // Initialized returns a channel that will be closed when the storage worker
 // is initialized and ready to service requests.
-func (s *Worker) Initialized() <-chan struct{} {
-	return s.initCh
+func (w *Worker) Initialized() <-chan struct{} {
+	return w.initCh
 }
 
 // Start starts the storage service.
-func (s *Worker) Start() error {
-	if !s.enabled {
-		s.logger.Info("not starting storage worker as it is disabled")
+func (w *Worker) Start() error {
+	go func() {
+		if err := w.Serve(w.ctx); err != nil {
+			w.logger.Error("worker stopped", "error", err)
+		}
+	}()
+	return nil
+}
+
+// Serve starts a state sync worker for each of the configured runtime, unless
+// disabled.
+//
+// If any state sync worker returns an error, it cancels the remaining ones and
+// waits for all of them to finish. The error from the first failing worker is
+// returned.
+func (w *Worker) Serve(ctx context.Context) error {
+	if !w.enabled {
+		w.logger.Info("not starting storage worker as it is disabled")
 
 		// In case the worker is not enabled, close the init channel immediately.
-		close(s.initCh)
+		close(w.initCh)
 
 		return nil
 	}
 
-	// Wait for all runtimes to terminate.
-	go func() {
-		defer close(s.quitCh)
-
-		for _, r := range s.runtimes {
-			<-r.Quit()
-		}
-		if s.fetchPool != nil {
-			<-s.fetchPool.Quit()
-		}
+	w.logger.Info("starting", "num_runtimes", len(w.runtimes))
+	defer func() {
+		close(w.quitCh)
+		w.logger.Info("stopped")
 	}()
 
-	// Start all runtimes and wait for initialization.
 	go func() {
-		s.logger.Info("starting storage sync services", "num_runtimes", len(s.runtimes))
-
-		for _, r := range s.runtimes {
-			_ = r.Start()
-		}
-
-		// Wait for runtimes to be initialized and the node to be registered.
-		for _, r := range s.runtimes {
+		for _, r := range w.runtimes {
 			<-r.Initialized()
 		}
-
-		<-s.registration.InitialRegistrationCh()
-
-		s.logger.Info("storage worker started")
-
-		close(s.initCh)
+		w.logger.Info("initialized")
+		close(w.initCh)
 	}()
 
-	return nil
+	return w.serve(ctx)
+}
+
+func (w *Worker) serve(ctx context.Context) error {
+	g, ctx := errgroup.WithContext(ctx)
+	for id, r := range w.runtimes {
+		g.Go(func() error {
+			if err := r.Serve(ctx); err != nil {
+				return fmt.Errorf("storage worker failed (runtimeID: %s): %w", id, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // Stop halts the service.
-func (s *Worker) Stop() {
-	if !s.enabled {
-		close(s.quitCh)
+func (w *Worker) Stop() {
+	if !w.enabled {
+		close(w.quitCh)
 		return
 	}
 
-	for _, r := range s.runtimes {
-		r.Stop()
-	}
-	if s.fetchPool != nil {
-		s.fetchPool.Stop()
-	}
-	if s.watchState != nil {
-		s.watchState.Close()
-	}
+	w.logger.Info("stopping")
+	w.cancel()
+	<-w.quitCh
 }
 
 // Quit returns a channel that will be closed when the service terminates.
-func (s *Worker) Quit() <-chan struct{} {
-	return s.quitCh
+func (w *Worker) Quit() <-chan struct{} {
+	return w.quitCh
 }
 
 // Cleanup performs the service specific post-termination cleanup.
-func (s *Worker) Cleanup() {
+func (w *Worker) Cleanup() {
 }
 
 // GetRuntime returns a storage committee node for the given runtime (if available).
 //
 // In case the runtime with the specified id was not configured for this node it returns nil.
-func (s *Worker) GetRuntime(id common.Namespace) *committee.Node {
-	return s.runtimes[id]
+func (w *Worker) GetRuntime(id common.Namespace) *committee.Worker {
+	return w.runtimes[id]
 }

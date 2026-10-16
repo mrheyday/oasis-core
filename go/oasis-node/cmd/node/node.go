@@ -3,49 +3,39 @@ package node
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 
-	"github.com/spf13/cobra"
-	flag "github.com/spf13/pflag"
-
-	"github.com/oasisprotocol/oasis-core/go/common"
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/crash"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/grpc"
 	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	"github.com/oasisprotocol/oasis-core/go/common/node"
 	"github.com/oasisprotocol/oasis-core/go/common/persistent"
-	"github.com/oasisprotocol/oasis-core/go/common/service"
 	"github.com/oasisprotocol/oasis-core/go/common/version"
+	"github.com/oasisprotocol/oasis-core/go/config"
 	consensusAPI "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint"
-	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/seed"
-	tendermintTestsGenesis "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/tests/genesis"
-	"github.com/oasisprotocol/oasis-core/go/control"
+	"github.com/oasisprotocol/oasis-core/go/consensus/cometbft"
+	cometbftAPI "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/api"
+	consensusLightP2P "github.com/oasisprotocol/oasis-core/go/consensus/p2p/light"
 	controlAPI "github.com/oasisprotocol/oasis-core/go/control/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesisAPI "github.com/oasisprotocol/oasis-core/go/genesis/api"
 	genesisFile "github.com/oasisprotocol/oasis-core/go/genesis/file"
-	genesisTestHelpers "github.com/oasisprotocol/oasis-core/go/genesis/tests"
-	"github.com/oasisprotocol/oasis-core/go/ias"
-	iasAPI "github.com/oasisprotocol/oasis-core/go/ias/api"
+	governanceAPI "github.com/oasisprotocol/oasis-core/go/governance/api"
 	keymanagerAPI "github.com/oasisprotocol/oasis-core/go/keymanager/api"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/background"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	cmdGrpc "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/grpc"
-	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/metrics"
-	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/pprof"
-	cmdSigner "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/signer"
-	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/tracing"
+	"github.com/oasisprotocol/oasis-core/go/p2p"
+	p2pAPI "github.com/oasisprotocol/oasis-core/go/p2p/api"
 	registryAPI "github.com/oasisprotocol/oasis-core/go/registry/api"
-	runtimeClient "github.com/oasisprotocol/oasis-core/go/runtime/client"
-	runtimeClientAPI "github.com/oasisprotocol/oasis-core/go/runtime/client/api"
-	enclaverpc "github.com/oasisprotocol/oasis-core/go/runtime/enclaverpc/api"
+	roothashAPI "github.com/oasisprotocol/oasis-core/go/roothash/api"
+	"github.com/oasisprotocol/oasis-core/go/runtime/host"
+	"github.com/oasisprotocol/oasis-core/go/runtime/host/provisioner"
 	runtimeRegistry "github.com/oasisprotocol/oasis-core/go/runtime/registry"
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	"github.com/oasisprotocol/oasis-core/go/sentry"
@@ -54,40 +44,16 @@ import (
 	storageAPI "github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/upgrade"
 	upgradeAPI "github.com/oasisprotocol/oasis-core/go/upgrade/api"
+	vaultAPI "github.com/oasisprotocol/oasis-core/go/vault/api"
+	workerBeacon "github.com/oasisprotocol/oasis-core/go/worker/beacon"
+	workerClient "github.com/oasisprotocol/oasis-core/go/worker/client"
 	workerCommon "github.com/oasisprotocol/oasis-core/go/worker/common"
-	"github.com/oasisprotocol/oasis-core/go/worker/common/p2p"
-	"github.com/oasisprotocol/oasis-core/go/worker/compute"
 	"github.com/oasisprotocol/oasis-core/go/worker/compute/executor"
-	workerConsensusRPC "github.com/oasisprotocol/oasis-core/go/worker/consensusrpc"
 	workerKeymanager "github.com/oasisprotocol/oasis-core/go/worker/keymanager"
-	"github.com/oasisprotocol/oasis-core/go/worker/registration"
+	workerRegistration "github.com/oasisprotocol/oasis-core/go/worker/registration"
 	workerSentry "github.com/oasisprotocol/oasis-core/go/worker/sentry"
-	"github.com/oasisprotocol/oasis-core/go/worker/storage"
 	workerStorage "github.com/oasisprotocol/oasis-core/go/worker/storage"
 )
-
-// Flags has the configuration flags.
-var Flags = flag.NewFlagSet("", flag.ContinueOnError)
-
-const exportsSubDir = "exports"
-
-// Run runs the Oasis node.
-func Run(cmd *cobra.Command, args []string) {
-	cmdCommon.SetIsNodeCmd(true)
-
-	node, err := NewNode()
-	switch {
-	case err == nil:
-	case errors.Is(err, context.Canceled):
-		// Shutdown requested during startup.
-		return
-	default:
-		os.Exit(1)
-	}
-	defer node.Cleanup()
-
-	node.Wait()
-}
 
 // Node is the Oasis node service.
 //
@@ -101,28 +67,29 @@ type Node struct {
 
 	commonStore *persistent.CommonStore
 
-	NodeController  controlAPI.NodeController
-	DebugController controlAPI.DebugController
+	Consensus    consensusAPI.Service
+	LightService consensusAPI.LightService
 
-	Consensus consensusAPI.Backend
+	dataDir      string
+	chainContext string
 
 	Upgrader upgradeAPI.Backend
-	Genesis  genesisAPI.Provider
 	Identity *identity.Identity
-	Sentry   sentryAPI.LocalBackend
-	IAS      iasAPI.Endpoint
+	EntityID *signature.PublicKey
+	Sentry   sentryAPI.Backend
 
 	RuntimeRegistry runtimeRegistry.Registry
-	RuntimeClient   runtimeClientAPI.RuntimeClient
+	Provisioner     host.Provisioner
 
 	CommonWorker       *workerCommon.Worker
 	ExecutorWorker     *executor.Worker
 	StorageWorker      *workerStorage.Worker
+	ClientWorker       *workerClient.Worker
 	SentryWorker       *workerSentry.Worker
-	P2P                *p2p.P2P
-	RegistrationWorker *registration.Worker
+	P2P                p2pAPI.Service
+	RegistrationWorker *workerRegistration.Worker
 	KeymanagerWorker   *workerKeymanager.Worker
-	ConsensusWorker    *workerConsensusRPC.Worker
+	BeaconWorker       *workerBeacon.Worker
 	readyCh            chan struct{}
 
 	logger *logging.Logger
@@ -153,14 +120,14 @@ func (n *Node) Wait() {
 }
 
 func (n *Node) waitReady() {
-	if n.NodeController == nil {
-		n.logger.Error("failed while waiting for node: node controller not initialized")
+	if err := n.WaitSync(context.Background()); err != nil {
+		n.logger.Error("failed while waiting for node consensus sync", "err", err)
 		return
 	}
 
-	if err := n.NodeController.WaitSync(context.Background()); err != nil {
-		n.logger.Error("failed while waiting for node consensus sync", "err", err)
-		return
+	// Wait for client worker.
+	if n.ClientWorker.Enabled() {
+		<-n.ClientWorker.Initialized()
 	}
 
 	// Wait for storage worker.
@@ -188,7 +155,7 @@ func (n *Node) waitReady() {
 
 // startRuntimeServices initializes and starts all the services that are required for runtime
 // support to work.
-func (n *Node) startRuntimeServices() error {
+func (n *Node) startRuntimeServices(genesisDoc *genesisAPI.Document) error {
 	var err error
 	if n.Sentry, err = sentry.New(n.Consensus, n.Identity); err != nil {
 		return err
@@ -196,66 +163,23 @@ func (n *Node) startRuntimeServices() error {
 
 	// Initialize and register the internal gRPC services.
 	grpcSrv := n.grpcInternal.Server()
+	beacon.RegisterService(grpcSrv, n.Consensus.Beacon())
 	scheduler.RegisterService(grpcSrv, n.Consensus.Scheduler())
 	registryAPI.RegisterService(grpcSrv, n.Consensus.Registry())
 	stakingAPI.RegisterService(grpcSrv, n.Consensus.Staking())
 	keymanagerAPI.RegisterService(grpcSrv, n.Consensus.KeyManager())
-
-	// Register dump genesis halt hook.
-	n.Consensus.RegisterHaltHook(func(ctx context.Context, blockHeight int64, epoch epochtime.EpochTime) {
-		n.logger.Info("Consensus halt hook: dumping genesis",
-			"epoch", epoch,
-			"block_height", blockHeight,
-		)
-		if err = n.dumpGenesis(ctx, blockHeight, epoch); err != nil {
-			n.logger.Error("halt hook: failed to dump genesis",
-				"err", err,
-			)
-			return
-		}
-		n.logger.Info("Consensus halt hook: genesis dumped",
-			"epoch", epoch,
-			"block_height", blockHeight,
-		)
-	})
-
-	// Initialize the node's runtime registry.
-	n.RuntimeRegistry, err = runtimeRegistry.New(n.svcMgr.Ctx, cmdCommon.DataDir(), n.Consensus, n.Identity)
-	if err != nil {
-		return err
-	}
-	n.svcMgr.RegisterCleanupOnly(n.RuntimeRegistry, "runtime registry")
-	storageAPI.RegisterService(n.grpcInternal.Server(), n.RuntimeRegistry.StorageRouter())
+	roothashAPI.RegisterService(grpcSrv, n.Consensus.RootHash())
+	governanceAPI.RegisterService(grpcSrv, n.Consensus.Governance())
+	vaultAPI.RegisterService(grpcSrv, n.Consensus.Vault())
 
 	// Initialize runtime workers.
-	if err = n.initRuntimeWorkers(); err != nil {
-		n.logger.Error("failed to initialize workers",
-			"err", err,
-		)
-		return err
+	if err = n.initRuntimeWorkers(genesisDoc); err != nil {
+		return fmt.Errorf("failed to initialize workers: %w", err)
 	}
-
-	// Initialize the runtime client.
-	n.RuntimeClient, err = runtimeClient.New(
-		n.svcMgr.Ctx,
-		cmdCommon.DataDir(),
-		n.Consensus,
-		n.RuntimeRegistry,
-		n.P2P,
-	)
-	if err != nil {
-		return err
-	}
-	n.svcMgr.RegisterCleanupOnly(n.RuntimeClient, "client service")
-	runtimeClientAPI.RegisterService(n.grpcInternal.Server(), n.RuntimeClient)
-	enclaverpc.RegisterService(n.grpcInternal.Server(), n.RuntimeClient)
 
 	// Start workers (requires NodeController for checking, if nodes are synced).
 	if err = n.startRuntimeWorkers(); err != nil {
-		n.logger.Error("failed to start workers",
-			"err", err,
-		)
-		return err
+		return fmt.Errorf("failed to start workers: %w", err)
 	}
 
 	n.logger.Debug("runtime services started")
@@ -263,117 +187,111 @@ func (n *Node) startRuntimeServices() error {
 	return nil
 }
 
-func (n *Node) initRuntimeWorkers() error {
-	dataDir := cmdCommon.DataDir()
+func (n *Node) initRuntimeWorkers(genesisDoc *genesisAPI.Document) error {
+	// Parse sentry configuration.
+	var sentryAddresses []node.TLSAddress
+	for _, v := range config.GlobalConfig.Runtime.SentryAddresses {
+		var tlsAddr node.TLSAddress
+		if err := tlsAddr.UnmarshalText([]byte(v)); err != nil {
+			return fmt.Errorf("bad sentry address (%s): %w", v, err)
+		}
+		sentryAddresses = append(sentryAddresses, tlsAddr)
+	}
 
+	// Initialize runtime provisioner.
+	policyProvider := &runtimeRegistry.QuotePolicyProvider{Consensus: n.Consensus}
 	var err error
-
-	genesisDoc, err := n.Genesis.GetGenesisDocument()
-	if err != nil {
-		return err
-	}
-
-	// Initialize the P2P worker if it's enabled or if compute worker is enabled.
-	// Since the P2P layer does not have a separate Start method and starts
-	// listening immediately when created, make sure that we don't start it if
-	// it is not needed.
-	//
-	// Currently, only executor and runtime client need P2P transport.
-	if p2p.Enabled() || compute.Enabled() {
-		p2pCtx, p2pSvc := service.NewContextCleanup(context.Background())
-		if genesisDoc.Registry.Parameters.DebugAllowUnroutableAddresses {
-			p2p.DebugForceAllowUnroutableAddresses()
-		}
-		n.P2P, err = p2p.New(p2pCtx, n.Identity, n.Consensus)
-		if err != nil {
-			return err
-		}
-		n.svcMgr.RegisterCleanupOnly(p2pSvc, "worker p2p")
-	}
-
-	// Initialize the IAS proxy client.
-	n.IAS, err = ias.New(n.Identity)
-	if err != nil {
-		n.logger.Error("failed to initialize IAS proxy client",
-			"err", err,
-		)
-		return err
-	}
-
-	// Initialize the common worker.
-	n.CommonWorker, err = workerCommon.New(
-		dataDir,
-		compute.Enabled() || workerStorage.Enabled() || workerKeymanager.Enabled(),
+	n.Provisioner, err = provisioner.New(
+		n.dataDir,
+		n.commonStore,
 		n.Identity,
-		n.Consensus,
-		n.P2P,
-		n.IAS,
-		n.Consensus.KeyManager(),
-		n.RuntimeRegistry,
 		genesisDoc,
+		policyProvider,
 	)
 	if err != nil {
-		n.logger.Error("failed to start common worker",
-			"err", err,
-		)
 		return err
 	}
-	n.svcMgr.Register(n.CommonWorker.Grpc)
-	n.svcMgr.Register(n.CommonWorker)
 
-	workerCommonCfg := n.CommonWorker.GetConfig()
+	// Initialize the node's runtime registry.
+	n.RuntimeRegistry, err = runtimeRegistry.New(n.dataDir, n.Consensus)
+	if err != nil {
+		return err
+	}
+	n.svcMgr.Register(n.RuntimeRegistry)
 
-	// Initialize the registration worker.
-	n.RegistrationWorker, err = registration.New(
-		dataDir,
-		n.Consensus.EpochTime(),
-		n.Consensus.Registry(),
+	// Initialize the common worker.
+	commonCfg := workerCommon.Config{
+		TxPool: config.GlobalConfig.Runtime.TxPool,
+	}
+	n.CommonWorker, err = workerCommon.New(
+		commonCfg,
+		n.chainContext,
 		n.Identity,
 		n.Consensus,
+		n.LightService,
 		n.P2P,
-		&workerCommonCfg,
+		n.Consensus.KeyManager(),
+		n.RuntimeRegistry,
+		n.Provisioner,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to initialize common worker: %w", err)
+	}
+	n.svcMgr.Register(n.CommonWorker)
+
+	// Initialize the registration worker.
+	n.RegistrationWorker, err = workerRegistration.New(
+		n.Consensus.Beacon(),
+		n.Consensus.Registry(),
+		n.Identity,
+		n.EntityID,
+		n.Consensus,
+		n.P2P,
+		sentryAddresses,
 		n.commonStore,
 		n, // the delegate to be called on registration shutdown
 		n.RuntimeRegistry,
 	)
 	if genesisDoc.Registry.Parameters.DebugAllowUnroutableAddresses {
-		registration.DebugForceAllowUnroutableAddresses()
+		workerRegistration.DebugForceAllowUnroutableAddresses()
 	}
-
 	if err != nil {
-		n.logger.Error("failed to initialize worker registration",
-			"err", err,
-		)
-		return err
+		return fmt.Errorf("failed to initialize worker registration: %w", err)
 	}
 	n.svcMgr.Register(n.RegistrationWorker)
 
+	// Initialize the beacon worker.
+	n.BeaconWorker, err = workerBeacon.New(
+		n.Identity,
+		n.Consensus,
+		n.EntityID != nil,
+	)
+	if err != nil {
+		return err
+	}
+	n.svcMgr.Register(n.BeaconWorker)
+
 	// Initialize the storage worker.
+	storageCfg := workerStorage.Config{
+		HasLocalStorage: config.GlobalConfig.Consensus.LocalStorage,
+	}
 	n.StorageWorker, err = workerStorage.New(
+		storageCfg,
 		n.grpcInternal,
 		n.CommonWorker,
 		n.RegistrationWorker,
-		n.Genesis,
-		n.commonStore,
 	)
 	if err != nil {
 		return err
 	}
 	n.svcMgr.Register(n.StorageWorker)
 
-	// Commit storage settings to the registered runtimes.
-	err = n.RuntimeRegistry.FinishInitialization(n.svcMgr.Ctx)
-	if err != nil {
-		return err
-	}
-
 	// Initialize the key manager worker.
 	n.KeymanagerWorker, err = workerKeymanager.New(
-		dataDir,
 		n.CommonWorker,
-		n.IAS,
 		n.RegistrationWorker,
 		n.Consensus.KeyManager(),
+		n.Provisioner,
 	)
 	if err != nil {
 		return err
@@ -382,7 +300,6 @@ func (n *Node) initRuntimeWorkers() error {
 
 	// Initialize the executor worker.
 	n.ExecutorWorker, err = executor.New(
-		dataDir,
 		n.CommonWorker,
 		n.RegistrationWorker,
 	)
@@ -390,6 +307,23 @@ func (n *Node) initRuntimeWorkers() error {
 		return err
 	}
 	n.svcMgr.Register(n.ExecutorWorker)
+
+	// Initialize the client worker.
+	n.ClientWorker, err = workerClient.New(
+		n.grpcInternal,
+		n.CommonWorker,
+		n.RegistrationWorker,
+	)
+	if err != nil {
+		return err
+	}
+	n.svcMgr.Register(n.ClientWorker)
+
+	// Commit storage settings to the registered runtimes.
+	err = n.RuntimeRegistry.FinishInitialization()
+	if err != nil {
+		return err
+	}
 
 	// Initialize the sentry worker.
 	n.SentryWorker, err = workerSentry.New(
@@ -401,17 +335,25 @@ func (n *Node) initRuntimeWorkers() error {
 	}
 	n.svcMgr.Register(n.SentryWorker)
 
-	// Initialize the public consensus services worker.
-	n.ConsensusWorker, err = workerConsensusRPC.New(n.CommonWorker, n.RegistrationWorker)
-	if err != nil {
-		return err
-	}
-	n.svcMgr.Register(n.ConsensusWorker)
-
 	return nil
 }
 
 func (n *Node) startRuntimeWorkers() error {
+	// Start the runtime registry.
+	if err := n.RuntimeRegistry.Start(); err != nil {
+		return err
+	}
+
+	// Start the common worker.
+	if err := n.CommonWorker.Start(); err != nil {
+		return err
+	}
+
+	// Start the runtime client worker.
+	if err := n.ClientWorker.Start(); err != nil {
+		return err
+	}
+
 	// Start the storage worker.
 	if err := n.StorageWorker.Start(); err != nil {
 		return err
@@ -419,11 +361,6 @@ func (n *Node) startRuntimeWorkers() error {
 
 	// Start the executor worker.
 	if err := n.ExecutorWorker.Start(); err != nil {
-		return err
-	}
-
-	// Start the common worker.
-	if err := n.CommonWorker.Start(); err != nil {
 		return err
 	}
 
@@ -437,26 +374,14 @@ func (n *Node) startRuntimeWorkers() error {
 		return err
 	}
 
-	// Start the sentry worker.
-	if err := n.SentryWorker.Start(); err != nil {
+	// Start the beacon worker.
+	if err := n.BeaconWorker.Start(); err != nil {
 		return err
 	}
 
-	// Start the public consensus services worker.
-	if err := n.ConsensusWorker.Start(); err != nil {
-		return fmt.Errorf("consensus worker: %w", err)
-	}
-
-	// Only start the external gRPC server if any workers are enabled.
-	if n.StorageWorker.Enabled() ||
-		n.KeymanagerWorker.Enabled() ||
-		n.ConsensusWorker.Enabled() {
-		if err := n.CommonWorker.Grpc.Start(); err != nil {
-			n.logger.Error("failed to start external gRPC server",
-				"err", err,
-			)
-			return err
-		}
+	// Start the sentry worker.
+	if err := n.SentryWorker.Start(); err != nil {
+		return err
 	}
 
 	// Close readyCh once all workers and runtimes are initialized.
@@ -465,76 +390,14 @@ func (n *Node) startRuntimeWorkers() error {
 	return nil
 }
 
-func (n *Node) initGenesis(testNode bool) error {
-	var err error
-	n.Genesis, err = genesisFile.DefaultFileProvider()
-	if err != nil {
-		if os.IsNotExist(err) && testNode {
-			// Well, there wasn't a genesis document and we're running unit tests,
-			// so use a test node one.
-			if n.Genesis, err = tendermintTestsGenesis.NewTestNodeGenesisProvider(n.Identity); err != nil {
-				return fmt.Errorf("initGenesis: failed to create test node genesis: %w", err)
-			}
-
-			// In case of a test node, always use the test chain context.
-			genesisTestHelpers.SetTestChainContext()
-			return nil
-		}
-		return fmt.Errorf("initGenesis: failed to create local genesis file provider: %w", err)
-	}
-
-	// Retrieve the genesis document and use it to configure the ChainID for
-	// signature domain separation. We do this as early as possible.
-	genesisDoc, err := n.Genesis.GetGenesisDocument()
-	if err != nil {
-		return fmt.Errorf("initGenesis: failed to get genesis: %w", err)
-	}
-	genesisDoc.SetChainContext()
-
-	return nil
-}
-
-func (n *Node) dumpGenesis(ctx context.Context, blockHeight int64, epoch epochtime.EpochTime) error {
-	doc, err := n.Consensus.StateToGenesis(ctx, blockHeight)
-	if err != nil {
-		return fmt.Errorf("dumpGenesis: failed to get genesis: %w", err)
-	}
-
-	exportsDir := filepath.Join(cmdCommon.DataDir(), exportsSubDir)
-
-	if err := common.Mkdir(exportsDir); err != nil {
-		return fmt.Errorf("dumpGenesis: failed to create exports dir: %w", err)
-	}
-
-	filename := filepath.Join(exportsDir, fmt.Sprintf("genesis-%s-at-%d.json", doc.ChainID, doc.Height))
-	if nerr := doc.WriteFileJSON(filename); nerr != nil {
-		if err := common.Mkdir(exportsDir); err != nil {
-			return fmt.Errorf("dumpGenesis: failed to dump write genesis %w", err)
-		}
-	}
-
-	return nil
-}
-
 // NewNode initializes and launches the Oasis node service.
 //
 // WARNING: This will misbehave iff cmd != RootCommand().  This is exposed
 // for the benefit of tests and the interface is not guaranteed to be stable.
-func NewNode() (*Node, error) {
-	return newNode(false)
-}
-
-// NewTestNode initializes and launches the (test) Oasis node service.
 //
-// The test node uses a test genesis block and should only be used in
-// unit tests.
-func NewTestNode() (*Node, error) {
-	return newNode(true)
-}
-
 // Note: the reason for having the named err return value here is for the
 // deferred func below to propagate the error.
-func newNode(testNode bool) (node *Node, err error) { // nolint: gocyclo
+func NewNode() (node *Node, err error) { // nolint: gocyclo
 	logger := cmdCommon.Logger()
 
 	node = &Node{
@@ -543,245 +406,203 @@ func newNode(testNode bool) (node *Node, err error) { // nolint: gocyclo
 		logger:  logger,
 	}
 
-	var startOk bool
+	// Cleanup on error.
 	defer func(node *Node) {
-		if !startOk {
-			if cErr := node.svcMgr.Ctx.Err(); cErr != nil {
-				err = cErr
-			}
-
-			node.Stop()
-			node.Cleanup()
+		if err == nil {
+			return
 		}
+		if cErr := node.svcMgr.Ctx.Err(); cErr != nil {
+			err = cErr
+		}
+		node.Stop()
+		node.Cleanup()
 	}(node)
 
-	if err = cmdCommon.Init(); err != nil {
-		// Common stuff like logger not correctly initialized. Print to stderr
-		_, _ = fmt.Fprintln(os.Stderr, err)
+	// Initialize the common environment.
+	if err = initCommon(); err != nil {
 		return nil, err
 	}
 
 	// Log the version of the binary so that we can figure out what the
 	// binary is from the logs.
 	logger.Info("Starting oasis-node",
-		"Version", version.SoftwareVersion,
+		"version", version.SoftwareVersion,
+		"mode", config.GlobalConfig.Mode,
 	)
 
-	dataDir := cmdCommon.DataDir()
-	if dataDir == "" {
-		logger.Error("data directory not configured")
-		return nil, errors.New("data directory not configured")
+	if err = verifyElevatedPrivileges(logger); err != nil {
+		return nil, err
+	}
+
+	// Initialize the genesis provider.
+	genesis := genesisFile.DefaultProvider()
+	genesisDoc, err := genesis.GetGenesisDocument()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get genesis document: %w", err)
+	}
+	genesisDoc.SetChainContext()
+	node.chainContext = genesisDoc.ChainContext()
+
+	// Configure a directory for the node to work in.
+	node.dataDir, err = configureDataDir(logger)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate or load the node's identity.
+	node.Identity, err = loadOrGenerateIdentity(node.dataDir, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	// Load the owning node's entity ID.
+	var entityID *signature.PublicKey
+	if flags.DebugTestEntity() {
+		testEntity, _, _ := entity.TestEntity()
+		entityID = &testEntity.ID
+	} else {
+		entityID, err = config.GlobalConfig.Registration.ResolveEntityID()
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve entity ID: %w", err)
+		}
+	}
+	if entityID != nil && !entityID.IsValid() {
+		return nil, fmt.Errorf("invalid entity ID")
+	}
+	node.EntityID = entityID
+
+	requiresEntity := config.GlobalConfig.Consensus.Validator
+	switch config.GlobalConfig.Mode {
+	case config.ModeValidator, config.ModeCompute, config.ModeKeyManager, config.ModeObserver:
+		requiresEntity = true
+	}
+
+	if requiresEntity && entityID == nil {
+		return nil, fmt.Errorf("node has no entity configured but expects one")
+	}
+
+	if config.GlobalConfig.Mode == config.ModeClient && !config.GlobalConfig.Consensus.Validator && entityID != nil {
+		return nil, fmt.Errorf("client node must not have entity configured, try using observer mode instead")
 	}
 
 	// Load configured values for all registered crash points.
 	crash.LoadViperArgValues()
 
-	// Open the common node store.
-	node.commonStore, err = persistent.NewCommonStore(dataDir)
-	if err != nil {
-		logger.Error("failed to open common node store",
-			"err", err,
-		)
+	// Initialize and start the metrics reporting server.
+	if _, err = startMetricServer(node.svcMgr, logger); err != nil {
 		return nil, err
 	}
 
-	// Initialize upgrader backend and check if we can even launch.
-	node.Upgrader, err = upgrade.New(node.commonStore, cmdCommon.DataDir())
-	if err != nil {
-		logger.Error("failed to initialize upgrade backend",
-			"err", err,
-		)
+	// Initialize and start the profiling server.
+	if _, err = startProfilingServer(node.svcMgr, logger); err != nil {
 		return nil, err
 	}
-	if err = node.Upgrader.StartupUpgrade(); err != nil {
-		logger.Error("error occurred during startup upgrade",
-			"err", err,
-		)
-		return nil, err
-	}
-
-	// Generate/Load the node identity.
-	signerFactory, err := cmdSigner.NewFactory(cmdSigner.Backend(), dataDir, signature.SignerNode, signature.SignerP2P, signature.SignerConsensus)
-	if err != nil {
-		logger.Error("failed to initialize signer backend",
-			"err", err,
-		)
-		return nil, err
-	}
-	node.Identity, err = identity.LoadOrGenerate(dataDir, signerFactory, false)
-	if err != nil {
-		logger.Error("failed to load/generate identity",
-			"err", err,
-		)
-		return nil, err
-	}
-
-	logger.Info("loaded/generated node identity",
-		"node_pk", node.Identity.NodeSigner.Public(),
-		"p2p_pk", node.Identity.P2PSigner.Public(),
-		"consensus_pk", node.Identity.ConsensusSigner.Public(),
-		"tls_pk", node.Identity.GetTLSSigner().Public(),
-	)
-
-	// Initialize the tracing client.
-	tracingSvc, err := tracing.New("oasis-node")
-	if err != nil {
-		logger.Error("failed to initialize tracing",
-			"err", err,
-		)
-		return nil, err
-	}
-	node.svcMgr.RegisterCleanupOnly(tracingSvc, "tracing")
 
 	// Initialize the internal gRPC server.
-	// Depends on global tracer.
 	node.grpcInternal, err = cmdGrpc.NewServerLocal(false)
 	if err != nil {
-		logger.Error("failed to initialize internal gRPC server",
-			"err", err,
-		)
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize internal gRPC server: %w", err)
 	}
 	node.svcMgr.Register(node.grpcInternal)
 
-	// Initialize the metrics server.
-	metrics, err := metrics.New(node.svcMgr.Ctx)
+	// Register the node as a node controller.
+	controlAPI.RegisterService(node.grpcInternal.Server(), node)
+
+	// Open the common node store.
+	node.commonStore, err = persistent.NewCommonStore(node.dataDir)
 	if err != nil {
-		logger.Error("failed to initialize metrics server",
-			"err", err,
-		)
-		return nil, err
-	}
-	node.svcMgr.Register(metrics)
-
-	// Start the metrics reporting server.
-	if err = metrics.Start(); err != nil {
-		logger.Error("failed to start metrics reporting server",
-			"err", err,
-		)
-		return nil, err
+		return nil, fmt.Errorf("failed to open common node store: %w", err)
 	}
 
-	// Initialize the profiling server.
-	profiling, err := pprof.New(node.svcMgr.Ctx)
+	// Initialize P2P network. Since libp2p host starts listening immediately when created, make
+	// sure that we don't start it if it is not needed.
+	if genesisDoc.Registry.Parameters.DebugAllowUnroutableAddresses {
+		p2p.DebugForceAllowUnroutableAddresses()
+	}
+
+	isArchive := config.GlobalConfig.Mode == config.ModeArchive
+	if isArchive {
+		node.P2P = p2p.NewNop()
+	} else {
+		node.P2P, err = p2p.New(node.Identity, node.chainContext, node.commonStore)
+		if err != nil {
+			return nil, err
+		}
+	}
+	node.svcMgr.Register(node.P2P)
+
+	if err = node.P2P.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start P2P service: %w", err)
+	}
+
+	// Initialize upgrader backend.
+	node.Upgrader, err = upgrade.New(node.commonStore, node.dataDir, !isArchive)
 	if err != nil {
-		logger.Error("failed to initialize pprof server",
-			"err", err,
-		)
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize upgrade backend: %w", err)
 	}
-	node.svcMgr.Register(profiling)
-
-	// Start the profiling server.
-	if err = profiling.Start(); err != nil {
-		logger.Error("failed to start pprof server",
-			"err", err,
-		)
-		return nil, err
+	// If not an archive mode, check if we can even launch.
+	if !isArchive {
+		if err = node.Upgrader.StartupUpgrade(); err != nil {
+			return nil, fmt.Errorf("error occurred during startup upgrade: %w", err)
+		}
 	}
 
-	// Initialize the genesis provider.
-	if err = node.initGenesis(testNode); err != nil {
-		logger.Error("failed to initialize the genesis provider",
-			"err", err,
-		)
-		return nil, err
-	}
-
-	logger.Info("starting Oasis node")
-
-	// Initialize Tendermint consensus backend.
-	node.Consensus, err = tendermint.New(node.svcMgr.Ctx, dataDir, node.Identity, node.Upgrader, node.Genesis)
-	if err != nil {
-		logger.Error("failed to initialize tendermint service",
-			"err", err,
-		)
-		return nil, err
+	// Initialize consensus backend.
+	switch backend := genesisDoc.Consensus.Backend; backend {
+	case cometbftAPI.BackendName:
+		node.Consensus, err = cometbft.New(node.svcMgr.Ctx, node.dataDir, node.Identity, node.Upgrader, genesis, genesisDoc, node.P2P)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize cometbft consensus backend: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported consensus backend: %s", backend)
 	}
 	node.svcMgr.Register(node.Consensus)
 	consensusAPI.RegisterService(node.grpcInternal.Server(), node.Consensus)
 
-	// Initialize the node controller.
-	node.NodeController = control.New(node, node.Consensus, node.Upgrader)
-	controlAPI.RegisterService(node.grpcInternal.Server(), node.NodeController)
+	// Initialize CometBFT light client.
+	node.LightService, err = cometbft.NewLightService(node.svcMgr.Ctx, genesisDoc, node.P2P)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize cometbft light client service: %w", err)
+	}
+
+	// Register consensus light client P2P protocol server.
+	node.P2P.RegisterProtocolServer(consensusLightP2P.NewServer(node.P2P, node.chainContext, node.Consensus.Core()))
+
+	// Register the consensus service with the peer registry.
+	if mgr := node.P2P.PeerManager(); mgr != nil {
+		if err = mgr.PeerRegistry().RegisterConsensus(node.chainContext, node.Consensus); err != nil {
+			return nil, fmt.Errorf("failed to register consensus with peer registry: %w", err)
+		}
+	}
 
 	// If the consensus backend supports communicating with consensus services, we can also start
 	// all services required for runtime operation.
 	if node.Consensus.SupportedFeatures().Has(consensusAPI.FeatureServices) {
-		if err = node.startRuntimeServices(); err != nil {
-			logger.Error("failed to initialize runtime services",
-				"err", err,
-			)
-			return nil, err
+		if err = node.startRuntimeServices(genesisDoc); err != nil {
+			return nil, fmt.Errorf("failed to initialize runtime services: %w", err)
 		}
 
 		if flags.DebugDontBlameOasis() {
-			// Initialize and start the debug controller if we are in debug mode.
-			node.DebugController = control.NewDebug(node.Consensus)
-			controlAPI.RegisterDebugService(node.grpcInternal.Server(), node.DebugController)
+			// Register the node as a debug controller if we are in debug mode.
+			controlAPI.RegisterDebugService(node.grpcInternal.Server(), node)
+
+			// Enable direct storage access if we are in debug mode.
+			storageAPI.RegisterService(node.grpcInternal.Server(), &debugStorage{node})
 		}
 	}
 
 	// Start the internal gRPC server.
 	if err = node.grpcInternal.Start(); err != nil {
-		logger.Error("failed to start internal gRPC server",
-			"err", err,
-		)
-		return nil, err
+		return nil, fmt.Errorf("failed to start internal gRPC server: %w", err)
 	}
 
 	// Start the consensus backend service.
 	if err = node.Consensus.Start(); err != nil {
-		logger.Error("failed to start consensus backend service",
-			"err", err,
-		)
-		return nil, err
+		return nil, fmt.Errorf("failed to start consensus backend service: %w", err)
 	}
 
 	logger.Info("initialization complete: ready to serve")
-	startOk = true
 
 	return node, nil
-}
-
-// Register registers the node maintenance sub-commands and all of it's
-// children.
-func Register(parentCmd *cobra.Command) {
-	unsafeResetCmd.Flags().AddFlagSet(flags.DryRunFlag)
-	unsafeResetCmd.Flags().AddFlagSet(unsafeResetFlags)
-
-	parentCmd.AddCommand(unsafeResetCmd)
-}
-
-func init() {
-	Flags.AddFlagSet(flags.DebugTestEntityFlags)
-	Flags.AddFlagSet(flags.ConsensusValidatorFlag)
-	Flags.AddFlagSet(flags.GenesisFileFlags)
-
-	// Backend initialization flags.
-	for _, v := range []*flag.FlagSet{
-		metrics.Flags,
-		tracing.Flags,
-		cmdGrpc.ServerLocalFlags,
-		cmdSigner.Flags,
-		pprof.Flags,
-		storage.Flags,
-		tendermint.Flags,
-		seed.Flags,
-		ias.Flags,
-		workerKeymanager.Flags,
-		runtimeRegistry.Flags,
-		compute.Flags,
-		p2p.Flags,
-		registration.Flags,
-		runtimeClient.Flags,
-		executor.Flags,
-		workerCommon.Flags,
-		workerStorage.Flags,
-		workerSentry.Flags,
-		workerConsensusRPC.Flags,
-		crash.InitFlags(),
-	} {
-		Flags.AddFlagSet(v)
-	}
 }

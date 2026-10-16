@@ -1,62 +1,64 @@
-#[macro_use]
-extern crate clap;
-
 use std::path::Path;
 
-use clap::{App, Arg};
+use clap::{Arg, ArgAction, Command};
 
-use oasis_core_runtime_loader::{ElfLoader, Loader, SgxsLoader};
+use oasis_core_runtime_loader::Loader;
+#[cfg(target_os = "linux")]
+use oasis_core_runtime_loader::SgxsLoader;
 
 fn main() {
-    let matches = App::new("Oasis runtime loader")
+    let matches = Command::new("Oasis Core Runtime Loader")
         .arg(
-            Arg::with_name("type")
+            Arg::new("type")
                 .long("type")
                 .help("Runtime type")
-                .possible_values(&["sgxs", "elf"])
-                .takes_value(true)
-                .required(true)
+                .value_parser(["sgxs"])
                 .default_value("sgxs"),
         )
         .arg(
-            Arg::with_name("runtime")
+            Arg::new("runtime")
                 .value_name("RUNTIME")
                 .help("Runtime filename")
-                .takes_value(true)
                 .required(true),
         )
         .arg(
-            Arg::with_name("signature")
+            Arg::new("signature")
                 .long("signature")
-                .help("Signature filename")
-                .takes_value(true),
+                .help("Signature filename"),
         )
         .arg(
-            Arg::with_name("host-socket")
-                .long("host-socket")
-                .takes_value(true)
-                .required(true),
+            Arg::new("allow-network")
+                .long("allow-network")
+                .action(ArgAction::SetTrue),
         )
+        .arg(Arg::new("host-socket").long("host-socket").required(true))
         .get_matches();
 
     // Check if passed runtime exists.
-    let filename = matches.value_of("runtime").unwrap().to_owned();
-    if !Path::new(&filename).exists() {
-        panic!("Could not find runtime: {}", filename);
-    }
+    let filename = matches.get_one::<String>("runtime").unwrap();
+    assert!(
+        Path::new(filename).exists(),
+        "Could not find runtime: {}",
+        filename
+    );
 
     // Decode arguments.
-    let host_socket = value_t!(matches, "host-socket", String).unwrap_or_else(|e| e.exit());
-    let mode = matches.value_of("type").unwrap();
-    let signature = matches.value_of("signature");
+    let host_socket = matches.get_one::<String>("host-socket").unwrap();
+    let mode = matches.get_one::<String>("type").unwrap();
+    let signature = matches
+        .get_one::<String>("signature")
+        .map(|sig| sig.as_ref());
+    let allow_network = matches.get_one::<bool>("allow-network").copied().unwrap();
 
     // Create appropriate loader and run the runtime.
-    let loader: Box<dyn Loader> = match mode {
+    let loader: Box<dyn Loader> = match mode.as_ref() {
+        #[cfg(target_os = "linux")]
         "sgxs" => Box::new(SgxsLoader),
-        "elf" => Box::new(ElfLoader),
+        #[cfg(not(target_os = "linux"))]
+        "sgxs" => panic!("SGXS loader is only supported on Linux"),
         _ => panic!("Invalid runtime type specified"),
     };
     loader
-        .run(filename, signature, host_socket)
+        .run(filename, signature, host_socket, allow_network)
         .expect("runtime execution failed");
 }

@@ -5,12 +5,14 @@ import (
 	"strconv"
 	"strings"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/sgx"
-	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
+	"github.com/oasisprotocol/oasis-core/go/keymanager/secrets"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdConsensus "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/consensus"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
+	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/keymanager"
 	cmdKM "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/keymanager"
 )
 
@@ -20,18 +22,20 @@ type KeymanagerHelpers struct {
 }
 
 // InitPolicy generates the KM policy file.
-func (k *KeymanagerHelpers) InitPolicy(runtimeID common.Namespace, serial uint32, policies map[sgx.EnclaveIdentity]*keymanager.EnclavePolicySGX, polPath string) error {
+func (k *KeymanagerHelpers) InitPolicy(runtimeID common.Namespace, serial uint32, rotationInterval beacon.EpochTime, policies map[sgx.EnclaveIdentity]*secrets.EnclavePolicySGX, polPath string) error {
 	k.logger.Info("initing KM policy",
 		"policy_path", polPath,
 		"serial", serial,
+		"rotation_interval", rotationInterval,
 		"num_policies", len(policies),
 	)
 
 	args := []string{
-		"keymanager", "init_policy",
+		keymanager.CmdKeymanager, keymanager.CmdInitPolicy,
 		"--" + cmdKM.CfgPolicyFile, polPath,
 		"--" + cmdKM.CfgPolicyID, runtimeID.String(),
 		"--" + cmdKM.CfgPolicySerial, strconv.FormatUint(uint64(serial), 10),
+		"--" + cmdKM.CfgPolicyMasterSecretRotationInterval, strconv.FormatUint(uint64(rotationInterval), 10),
 	}
 	for enclave, policy := range policies {
 		args = append(args, "--"+cmdKM.CfgPolicyEnclaveID)
@@ -70,7 +74,7 @@ func (k *KeymanagerHelpers) SignPolicy(testKey, polPath, polSigPath string) erro
 	)
 
 	args := []string{
-		"keymanager", "sign_policy",
+		keymanager.CmdKeymanager, keymanager.CmdSignPolicy,
 		"--" + flags.CfgDebugDontBlameOasis,
 		"--" + cmdCommon.CfgDebugAllowTestKeys,
 		"--" + cmdKM.CfgPolicyFile, polPath,
@@ -92,7 +96,7 @@ func (k *KeymanagerHelpers) GenUpdate(nonce uint64, polPath string, polSigPaths 
 	)
 
 	args := []string{
-		"keymanager", "gen_update",
+		keymanager.CmdKeymanager, keymanager.CmdGenUpdate,
 		"--" + cmdConsensus.CfgTxNonce, strconv.FormatUint(nonce, 10),
 		"--" + cmdConsensus.CfgTxFile, txPath,
 		"--" + cmdConsensus.CfgTxFeeAmount, strconv.Itoa(0), // TODO: Make fee configurable.

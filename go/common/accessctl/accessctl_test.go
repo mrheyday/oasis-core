@@ -2,7 +2,6 @@ package accessctl
 
 import (
 	"crypto/x509"
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -40,20 +39,33 @@ func TestPolicy(t *testing.T) {
 
 	// Remove nonexisting rule from a non-empty policy.
 	policy.Deny("anne", "write")
+
+	// Wildcard rules.
+	policy.Allow("anne", "read")
+	require.False(policy.IsAllowed("anne", "write"), "Anne should not have write access")
+	require.False(policy.IsAllowed("bob", "write"), "Bob should not have write access")
+	policy.AllowAll("write")
+	require.True(policy.IsAllowed("anne", "write"), "Anne should have write access")
+	require.True(policy.IsAllowed("bob", "write"), "Bob should have write access")
+	policy.Allow("bob", "write")
+	require.True(policy.IsAllowed("bob", "write"), "Bob should have write access")
+	policy.Deny(AnySubject, "write")
+	require.False(policy.IsAllowed("anne", "write"), "Anne should not have write access")
+	require.True(policy.IsAllowed("bob", "write"), "Bob should have write access")
 }
 
 func TestSubjectFromCertificate(t *testing.T) {
 	require := require.New(t)
 
-	dataDir, err := ioutil.TempDir("", "oasis-storage-grpc-test_")
+	dataDir, err := os.MkdirTemp("", "oasis-storage-grpc-test_")
 	require.NoError(err, "Failed to create a temporary directory")
 	defer os.RemoveAll(dataDir)
 
-	ident, err := identity.LoadOrGenerate(dataDir, memorySigner.NewFactory(), false)
+	ident, err := identity.LoadOrGenerate(dataDir, memorySigner.NewFactory())
 	require.NoError(err, "Failed to generate a new identity")
-	require.Len(ident.GetTLSCertificate().Certificate, 1, "The generated identity contains more than 1 certificate in the chain")
+	require.Len(ident.TLSCertificate.Certificate, 1, "The generated identity contains more than 1 certificate in the chain")
 
-	x509Cert, err := x509.ParseCertificate(ident.GetTLSCertificate().Certificate[0])
+	x509Cert, err := x509.ParseCertificate(ident.TLSCertificate.Certificate[0])
 	require.NoError(err, "Failed to parse X.509 certificate from TLS certificate")
 
 	sub := SubjectFromX509Certificate(x509Cert)

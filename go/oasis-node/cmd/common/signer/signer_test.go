@@ -2,7 +2,6 @@ package signer
 
 import (
 	"crypto/rand"
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -17,7 +16,7 @@ import (
 func TestCompositeCtor(t *testing.T) {
 	require := require.New(t)
 
-	dataDir, err := ioutil.TempDir("", "oasis-node-test_signer_")
+	dataDir, err := os.MkdirTemp("", "oasis-node-test_signer_")
 	require.NoError(err, "TempDir")
 	defer os.RemoveAll(dataDir)
 
@@ -37,6 +36,9 @@ func TestCompositeCtor(t *testing.T) {
 
 	err = sf.EnsureRole(signature.SignerP2P)
 	require.Equal(signature.ErrRoleMismatch, err, "EnsureRole: not configured (p2p)")
+
+	err = sf.EnsureRole(signature.SignerVRF)
+	require.Equal(signature.ErrRoleMismatch, err, "EnsureRole: not configured (VRF)")
 
 	err = sf.EnsureRole(signature.SignerConsensus)
 	require.NoError(err, "EnsureRole: memory")

@@ -17,12 +17,6 @@ WORKDIR=$PWD
 #################
 # Run test suite.
 #################
-# Determine correct runtime to use for SGX.
-runtime_target="default"
-if [[ "${OASIS_TEE_HARDWARE:-""}" == "intel-sgx" ]]; then
-    runtime_target="sgx/x86_64-fortanix-unknown-sgx"
-fi
-
 # We need a directory in the workdir so that Buildkite can fetch artifacts.
 if [[ "${BUILDKITE:-""}" != "" ]]; then
     mkdir -p ${TEST_BASE_DIR:-$PWD}/e2e
@@ -54,15 +48,17 @@ ${test_runner_binary} \
     ${BUILDKITE:+--basedir ${TEST_BASE_DIR:-$PWD}/e2e} \
     --basedir.no_cleanup \
     --e2e.node.binary ${node_binary} \
-    --e2e/runtime.client.binary_dir ${WORKDIR}/target/default/debug \
-    --e2e/runtime.runtime.binary_dir ${WORKDIR}/target/${runtime_target}/debug \
-    --e2e/runtime.runtime.loader ${WORKDIR}/target/default/debug/oasis-core-runtime-loader \
+    --e2e/runtime.runtime.binary_dir.default ${WORKDIR}/target/default/release \
+    --e2e/runtime.runtime.binary_dir.intel-sgx ${WORKDIR}/target/sgx/x86_64-fortanix-unknown-sgx/release \
+    --e2e/runtime.runtime.source_dir ${WORKDIR}/tests/runtimes \
+    --e2e/runtime.runtime.target_dir ${WORKDIR}/target \
+    --e2e/runtime.runtime.loader ${WORKDIR}/target/default/release/oasis-core-runtime-loader \
     --e2e/runtime.tee_hardware ${OASIS_TEE_HARDWARE:-""} \
     --e2e/runtime.ias.mock=${ias_mock} \
     --remote-signer.binary ${WORKDIR}/go/oasis-remote-signer/oasis-remote-signer \
     --plugin-signer.name example \
     --plugin-signer.binary ${WORKDIR}/go/oasis-test-runner/scenario/pluginsigner/example_signer_plugin/example_signer_plugin \
-    --log.level info \
+    --log.level debug \
     ${BUILDKITE_PARALLEL_JOB_COUNT:+--parallel.job_count ${BUILDKITE_PARALLEL_JOB_COUNT}} \
     ${BUILDKITE_PARALLEL_JOB:+--parallel.job_index ${BUILDKITE_PARALLEL_JOB}} \
     "$@"

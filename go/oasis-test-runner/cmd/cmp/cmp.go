@@ -21,6 +21,8 @@ import (
 
 const (
 	cfgMetrics                = "metrics"
+	cfgMetricsAddr            = "metrics.address"
+	cfgMetricsLabels          = "metrics.labels"
 	cfgMetricsP               = "m"
 	cfgMetricsTargetGitBranch = "metrics.target.git_branch"
 	cfgMetricsSourceGitBranch = "metrics.source.git_branch"
@@ -121,7 +123,7 @@ func getDuration(
 	// obtained time series corresponds to one run.
 	v1api := prometheusAPI.NewAPI(client)
 	r := prometheusAPI.Range{
-		Start: bi.Values[0].Timestamp.Time().Add(-1 * time.Minute),
+		Start: bi.Values[0].Timestamp.Time().Add(-time.Minute),
 		End:   bi.Values[len(bi.Values)-1].Timestamp.Time().Add(time.Minute),
 		Step:  time.Second,
 	}
@@ -256,16 +258,14 @@ func getSummableMetric(
 
 	// Compute average and max values.
 	avg := 0.0
-	max := 0.0
+	maximum := 0.0
 	for _, s := range result.(model.Vector) {
 		avg += float64(s.Value)
-		if max < float64(s.Value) {
-			max = float64(s.Value)
-		}
+		maximum = max(maximum, float64(s.Value))
 	}
 	avg /= float64(len(result.(model.Vector)))
 
-	return avg, max, nil
+	return avg, maximum, nil
 }
 
 // getNetwork returns average and maximum amount of network activity for all
@@ -287,7 +287,7 @@ func getNetwork(
 
 	v1api := prometheusAPI.NewAPI(client)
 	r := prometheusAPI.Range{
-		Start: bi.Values[0].Timestamp.Time().Add(-1 * time.Minute),
+		Start: bi.Values[0].Timestamp.Time().Add(-time.Minute),
 		End:   bi.Values[len(bi.Values)-1].Timestamp.Time().Add(time.Minute),
 		Step:  time.Second,
 	}
@@ -313,18 +313,16 @@ func getNetwork(
 
 		// Compute average and max values.
 		avg := 0.0
-		max := 0.0
+		maximum := 0.0
 		for _, s := range result.(model.Matrix) {
 			// Network traffic is difference between last and first reading.
 			avg += float64(s.Values[len(s.Values)-1].Value - s.Values[0].Value)
-			if max < float64(s.Values[len(s.Values)-1].Value-s.Values[0].Value) {
-				max = float64(s.Values[len(s.Values)-1].Value - s.Values[0].Value)
-			}
+			maximum = max(maximum, float64(s.Values[len(s.Values)-1].Value-s.Values[0].Value))
 		}
 		avg /= float64(len(result.(model.Matrix)))
 
 		bytesTotalAvg[rxtx] = avg
-		bytesTotalMax[rxtx] = max
+		bytesTotalMax[rxtx] = maximum
 	}
 
 	return (bytesTotalAvg[metrics.MetricNetReceiveBytesTotal] + bytesTotalAvg[metrics.MetricNetTransmitBytesTotal]) / 2.0,
@@ -364,7 +362,8 @@ func getCoarseBenchmarkInstances(
 		ls[model.LabelName(k)] = model.LabelValue(v)
 	}
 
-	query := fmt.Sprintf("max(%s %s) by (%s) == 1.0",
+	query := fmt.Sprintf(
+		"max(%s %s) by (%s) == 1.0",
 		metrics.MetricUp, ls.String(), metrics.MetricsLabelInstance,
 	)
 	result, warnings, err := v1api.QueryRange(ctx, query, r)
@@ -406,13 +405,14 @@ func fetchAndCompare(
 	ctx context.Context,
 	m, scenario string,
 	sInstance, tInstance *model.SampleStream,
-) (succ bool) {
+) bool {
 	getMetric := allMetrics[m].getter
-	succ = true
+	succ := true
 
 	sAvg, sMax, err := getMetric(ctx, scenario, sInstance)
 	if err != nil {
-		cmpLogger.Error("error fetching source benchmark instance",
+		cmpLogger.Error(
+			"error fetching source benchmark instance",
 			"metric", m,
 			"scenario", scenario,
 			"instance", instanceName(sInstance),
@@ -423,7 +423,8 @@ func fetchAndCompare(
 
 	tAvg, tMax, err := getMetric(ctx, scenario, tInstance)
 	if err != nil {
-		cmpLogger.Error("error fetching target scenario instance",
+		cmpLogger.Error(
+			"error fetching target scenario instance",
 			"metric", m,
 			"scenario", scenario,
 			"instance", instanceName(sInstance),
@@ -438,7 +439,8 @@ func fetchAndCompare(
 	maxMaxRatio := allMetrics[m].maxThresholdMaxRatio
 	minAvgRatio := allMetrics[m].minThresholdAvgRatio
 	minMaxRatio := allMetrics[m].minThresholdMaxRatio
-	cmpLogger.Info("obtained average ratio",
+	cmpLogger.Info(
+		"obtained average ratio",
 		"metric", m,
 		"scenario", scenario,
 		"source_avg", sAvg,
@@ -446,7 +448,8 @@ func fetchAndCompare(
 		"ratio", sAvg/tAvg,
 	)
 	if maxAvgRatio != 0 && sAvg/tAvg > maxAvgRatio {
-		cmpLogger.Error("average metric value exceeds max allowed ratio",
+		cmpLogger.Error(
+			"average metric value exceeds max allowed ratio",
 			"metric", m,
 			"scenario", scenario,
 			"source_avg", sAvg,
@@ -457,7 +460,8 @@ func fetchAndCompare(
 		succ = false
 	}
 	if minAvgRatio != 0 && sAvg/tAvg < minAvgRatio {
-		cmpLogger.Error("average metric value doesn't reach min required ratio",
+		cmpLogger.Error(
+			"average metric value doesn't reach min required ratio",
 			"metric", m,
 			"scenario", scenario,
 			"source_avg", sAvg,
@@ -467,7 +471,8 @@ func fetchAndCompare(
 		)
 		succ = false
 	}
-	cmpLogger.Info("obtained max ratio",
+	cmpLogger.Info(
+		"obtained max ratio",
 		"metric", m,
 		"scenario", scenario,
 		"source_max", sMax,
@@ -475,7 +480,8 @@ func fetchAndCompare(
 		"ratio", sMax/tMax,
 	)
 	if maxMaxRatio != 0 && sMax/tMax > maxMaxRatio {
-		cmpLogger.Error("maximum metric value exceeds max ratio",
+		cmpLogger.Error(
+			"maximum metric value exceeds max ratio",
 			"metric", m,
 			"scenario", scenario,
 			"source_max", sMax,
@@ -486,7 +492,8 @@ func fetchAndCompare(
 		succ = false
 	}
 	if minMaxRatio != 0 && sMax/tMax < maxMaxRatio {
-		cmpLogger.Error("maximum metric value doesn't reach min required ratio",
+		cmpLogger.Error(
+			"maximum metric value doesn't reach min required ratio",
 			"metric", m,
 			"scenario", scenario,
 			"source_max", sMax,
@@ -497,22 +504,22 @@ func fetchAndCompare(
 		succ = false
 	}
 
-	return
+	return succ
 }
 
 func initCmpLogger() error {
 	var logFmt logging.Format
 	if err := logFmt.Set(viper.GetString(common.CfgLogFmt)); err != nil {
-		return fmt.Errorf("root: failed to set log format: %w", err)
+		return fmt.Errorf("cmp/root: failed to set log format: %w", err)
 	}
 
 	var logLevel logging.Level
 	if err := logLevel.Set(viper.GetString(common.CfgLogLevel)); err != nil {
-		return fmt.Errorf("root: failed to set log level: %w", err)
+		return fmt.Errorf("cmp/root: failed to set log level: %w", err)
 	}
 
 	if err := logging.Initialize(os.Stdout, logFmt, logLevel, nil); err != nil {
-		return fmt.Errorf("root: failed to initialize logging: %w", err)
+		return fmt.Errorf("cmp/root: failed to initialize logging: %w", err)
 	}
 
 	cmpLogger = logging.GetLogger("cmd/cmp")
@@ -520,15 +527,19 @@ func initCmpLogger() error {
 	return nil
 }
 
-func runCmp(cmd *cobra.Command, args []string) {
+func runCmp(cmd *cobra.Command, _ []string) {
 	if err := initCmpLogger(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 
+	// Workaround for viper bug: https://github.com/spf13/viper/issues/233
+	_ = viper.BindPFlag(cfgMetricsAddr, cmd.Flags().Lookup(cfgMetricsAddr))
+	_ = viper.BindPFlag(cfgMetricsLabels, cmd.Flags().Lookup(cfgMetricsLabels))
+
 	var err error
 	client, err = api.NewClient(api.Config{
-		Address: viper.GetString(metrics.CfgMetricsAddr),
+		Address: viper.GetString(cfgMetricsAddr),
 	})
 	if err != nil {
 		cmpLogger.Error("error creating client", "err", err)
@@ -555,7 +566,7 @@ func runCmp(cmd *cobra.Command, args []string) {
 		// Set other required Prometheus labels, if passed.
 		// TODO: Integrate scenario parameters and parameter set combinations if
 		// multiple values are provided like we do in oasis-test-runner.
-		for k, v := range viper.GetStringMapString(metrics.CfgMetricsLabels) {
+		for k, v := range viper.GetStringMapString(cfgMetricsLabels) {
 			srcLabels[k] = v
 			tgtLabels[k] = v
 		}
@@ -597,7 +608,8 @@ func runCmp(cmd *cobra.Command, args []string) {
 			// Last benchmark instances are equal, pick the pre-last one from
 			// the target instances.
 			if len(tgtScNames) < 2 {
-				cmpLogger.Info("scenario only has one benchmark instance, ignoring",
+				cmpLogger.Info(
+					"scenario only has one benchmark instance, ignoring",
 					"scenario", sc,
 					"source_instances", srcScNames,
 					"target_instances", tgtScNames,
@@ -607,7 +619,8 @@ func runCmp(cmd *cobra.Command, args []string) {
 			srcInstance = srcScInstances[len(srcScInstances)-1]
 			tgtInstance = tgtScInstances[len(tgtScInstances)-2]
 		}
-		cmpLogger.Info("obtained source and target instance",
+		cmpLogger.Info(
+			"obtained source and target instance",
 			"scenario", sc,
 			"source_instance", instanceName(srcInstance),
 			"target_instance", instanceName(tgtInstance),
@@ -673,6 +686,9 @@ func Register(parentCmd *cobra.Command) {
 		"(optional) git_branch label for the target benchmark instance",
 	)
 	cmpFlags.String(cfgMetricsNetDevice, "lo", "network device traffic to compare")
+
+	cmpFlags.String(cfgMetricsAddr, "http://127.0.0.1:3000", "metrics pull address")
+	cmpFlags.StringToString(cfgMetricsLabels, map[string]string{}, "metrics push instance label")
 
 	_ = viper.BindPFlags(cmpFlags)
 	cmpCmd.Flags().AddFlagSet(cmpFlags)

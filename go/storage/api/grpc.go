@@ -21,75 +21,44 @@ var (
 	ServiceName = cmnGrpc.NewServiceName("Storage")
 
 	// MethodSyncGet is the SyncGet method.
-	MethodSyncGet = ServiceName.NewMethod("SyncGet", GetRequest{})
+	MethodSyncGet = ServiceName.NewMethod("SyncGet", GetRequest{}).
+			WithNamespaceExtractor(func(_ context.Context, req any) (common.Namespace, error) {
+			r, ok := req.(*GetRequest)
+			if !ok {
+				return common.Namespace{}, errInvalidRequestType
+			}
+			return r.Tree.Root.Namespace, nil
+		}).
+		WithAccessControl(cmnGrpc.AccessControlAlways)
 	// MethodSyncGetPrefixes is the SyncGetPrefixes method.
-	MethodSyncGetPrefixes = ServiceName.NewMethod("SyncGetPrefixes", GetPrefixesRequest{})
+	MethodSyncGetPrefixes = ServiceName.NewMethod("SyncGetPrefixes", GetPrefixesRequest{}).
+				WithNamespaceExtractor(func(_ context.Context, req any) (common.Namespace, error) {
+			r, ok := req.(*GetPrefixesRequest)
+			if !ok {
+				return common.Namespace{}, errInvalidRequestType
+			}
+			return r.Tree.Root.Namespace, nil
+		}).
+		WithAccessControl(cmnGrpc.AccessControlAlways)
 	// MethodSyncIterate is the SyncIterate method.
-	MethodSyncIterate = ServiceName.NewMethod("SyncIterate", IterateRequest{})
-	// MethodApply is the Apply method.
-	MethodApply = ServiceName.NewMethod("Apply", ApplyRequest{}).
-			WithNamespaceExtractor(func(ctx context.Context, req interface{}) (common.Namespace, error) {
-			r, ok := req.(*ApplyRequest)
+	MethodSyncIterate = ServiceName.NewMethod("SyncIterate", IterateRequest{}).
+				WithNamespaceExtractor(func(_ context.Context, req any) (common.Namespace, error) {
+			r, ok := req.(*IterateRequest)
 			if !ok {
 				return common.Namespace{}, errInvalidRequestType
 			}
-			return r.Namespace, nil
+			return r.Tree.Root.Namespace, nil
 		}).
-		WithAccessControl(func(ctx context.Context, req interface{}) (bool, error) {
-			return true, nil
-		})
-
-	// MethodApplyBatch is the ApplyBatch method.
-	MethodApplyBatch = ServiceName.NewMethod("ApplyBatch", ApplyBatchRequest{}).
-				WithNamespaceExtractor(func(ctx context.Context, req interface{}) (common.Namespace, error) {
-			r, ok := req.(*ApplyBatchRequest)
-			if !ok {
-				return common.Namespace{}, errInvalidRequestType
-			}
-			return r.Namespace, nil
-		}).
-		WithAccessControl(func(ctx context.Context, req interface{}) (bool, error) {
-			return true, nil
-		})
+		WithAccessControl(cmnGrpc.AccessControlAlways)
 
 	// MethodGetDiff is the GetDiff method.
-	MethodGetDiff = ServiceName.NewMethod("GetDiff", GetDiffRequest{}).
-			WithNamespaceExtractor(func(ctx context.Context, req interface{}) (common.Namespace, error) {
-			r, ok := req.(*GetDiffRequest)
-			if !ok {
-				return common.Namespace{}, errInvalidRequestType
-			}
-			return r.StartRoot.Namespace, nil
-		}).
-		WithAccessControl(func(ctx context.Context, req interface{}) (bool, error) {
-			return true, nil
-		})
+	MethodGetDiff = ServiceName.NewMethod("GetDiff", GetDiffRequest{})
 
 	// MethodGetCheckpoints is the GetCheckpoints method.
-	MethodGetCheckpoints = ServiceName.NewMethod("GetCheckpoints", checkpoint.GetCheckpointsRequest{}).
-				WithNamespaceExtractor(func(ctx context.Context, req interface{}) (common.Namespace, error) {
-			r, ok := req.(*checkpoint.GetCheckpointsRequest)
-			if !ok {
-				return common.Namespace{}, errInvalidRequestType
-			}
-			return r.Namespace, nil
-		}).
-		WithAccessControl(func(ctx context.Context, req interface{}) (bool, error) {
-			return true, nil
-		})
+	MethodGetCheckpoints = ServiceName.NewMethod("GetCheckpoints", checkpoint.GetCheckpointsRequest{})
 
 	// MethodGetCheckpointChunk is the GetCheckpointChunk method.
-	MethodGetCheckpointChunk = ServiceName.NewMethod("GetCheckpointChunk", checkpoint.ChunkMetadata{}).
-					WithNamespaceExtractor(func(ctx context.Context, req interface{}) (common.Namespace, error) {
-			cm, ok := req.(*checkpoint.ChunkMetadata)
-			if !ok {
-				return common.Namespace{}, errInvalidRequestType
-			}
-			return cm.Root.Namespace, nil
-		}).
-		WithAccessControl(func(ctx context.Context, req interface{}) (bool, error) {
-			return true, nil
-		})
+	MethodGetCheckpointChunk = ServiceName.NewMethod("GetCheckpointChunk", checkpoint.ChunkMetadata{})
 
 	// serviceDesc is the gRPC service descriptor.
 	serviceDesc = grpc.ServiceDesc{
@@ -107,14 +76,6 @@ var (
 			{
 				MethodName: MethodSyncIterate.ShortName(),
 				Handler:    handlerSyncIterate,
-			},
-			{
-				MethodName: MethodApply.ShortName(),
-				Handler:    handlerApply,
-			},
-			{
-				MethodName: MethodApplyBatch.ShortName(),
-				Handler:    handlerApplyBatch,
 			},
 			{
 				MethodName: MethodGetCheckpoints.ShortName(),
@@ -136,12 +97,12 @@ var (
 	}
 )
 
-func handlerSyncGet( // nolint: golint
-	srv interface{},
+func handlerSyncGet(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var req GetRequest
 	if err := dec(&req); err != nil {
 		return nil, err
@@ -153,18 +114,18 @@ func handlerSyncGet( // nolint: golint
 		Server:     srv,
 		FullMethod: MethodSyncGet.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).SyncGet(ctx, req.(*GetRequest))
 	}
 	return interceptor(ctx, &req, info, handler)
 }
 
-func handlerSyncGetPrefixes( // nolint: golint
-	srv interface{},
+func handlerSyncGetPrefixes(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var req GetPrefixesRequest
 	if err := dec(&req); err != nil {
 		return nil, err
@@ -176,18 +137,18 @@ func handlerSyncGetPrefixes( // nolint: golint
 		Server:     srv,
 		FullMethod: MethodSyncGetPrefixes.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).SyncGetPrefixes(ctx, req.(*GetPrefixesRequest))
 	}
 	return interceptor(ctx, &req, info, handler)
 }
 
-func handlerSyncIterate( // nolint: golint
-	srv interface{},
+func handlerSyncIterate(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var req IterateRequest
 	if err := dec(&req); err != nil {
 		return nil, err
@@ -199,64 +160,18 @@ func handlerSyncIterate( // nolint: golint
 		Server:     srv,
 		FullMethod: MethodSyncIterate.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).SyncIterate(ctx, req.(*IterateRequest))
 	}
 	return interceptor(ctx, &req, info, handler)
 }
 
-func handlerApply( // nolint: golint
-	srv interface{},
+func handlerGetCheckpoints(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
-	var req ApplyRequest
-	if err := dec(&req); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(Backend).Apply(ctx, &req)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: MethodApply.FullName(),
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(Backend).Apply(ctx, req.(*ApplyRequest))
-	}
-	return interceptor(ctx, &req, info, handler)
-}
-
-func handlerApplyBatch( // nolint: golint
-	srv interface{},
-	ctx context.Context,
-	dec func(interface{}) error,
-	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
-	var req ApplyBatchRequest
-	if err := dec(&req); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(Backend).ApplyBatch(ctx, &req)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: MethodApplyBatch.FullName(),
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(Backend).ApplyBatch(ctx, req.(*ApplyBatchRequest))
-	}
-	return interceptor(ctx, &req, info, handler)
-}
-
-func handlerGetCheckpoints( // nolint: golint
-	srv interface{},
-	ctx context.Context,
-	dec func(interface{}) error,
-	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var req checkpoint.GetCheckpointsRequest
 	if err := dec(&req); err != nil {
 		return nil, err
@@ -268,7 +183,7 @@ func handlerGetCheckpoints( // nolint: golint
 		Server:     srv,
 		FullMethod: MethodGetCheckpoints.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetCheckpoints(ctx, req.(*checkpoint.GetCheckpointsRequest))
 	}
 	return interceptor(ctx, &req, info, handler)
@@ -336,7 +251,7 @@ func sendWriteLogIterator(it WriteLogIterator, opts *SyncOptions, stream grpc.Se
 	return nil
 }
 
-func handlerGetDiff(srv interface{}, stream grpc.ServerStream) error {
+func handlerGetDiff(srv any, stream grpc.ServerStream) error {
 	var req GetDiffRequest
 	if err := stream.RecvMsg(&req); err != nil {
 		return err
@@ -351,7 +266,7 @@ func handlerGetDiff(srv interface{}, stream grpc.ServerStream) error {
 	return sendWriteLogIterator(it, &req.Options, stream)
 }
 
-func handlerGetCheckpointChunk(srv interface{}, stream grpc.ServerStream) error {
+func handlerGetCheckpointChunk(srv any, stream grpc.ServerStream) error {
 	var md checkpoint.ChunkMetadata
 	if err := stream.RecvMsg(&md); err != nil {
 		return err
@@ -365,11 +280,19 @@ func RegisterService(server *grpc.Server, service Backend) {
 	server.RegisterService(&serviceDesc, service)
 }
 
-type storageClient struct {
+// Client is a gRPC storage client.
+type Client struct {
 	conn *grpc.ClientConn
 }
 
-func (c *storageClient) SyncGet(ctx context.Context, request *GetRequest) (*ProofResponse, error) {
+// NewClient creates a new gRPC storage client.
+func NewClient(c *grpc.ClientConn) *Client {
+	return &Client{
+		conn: c,
+	}
+}
+
+func (c *Client) SyncGet(ctx context.Context, request *GetRequest) (*ProofResponse, error) {
 	var rsp ProofResponse
 	if err := c.conn.Invoke(ctx, MethodSyncGet.FullName(), request, &rsp); err != nil {
 		return nil, err
@@ -377,7 +300,7 @@ func (c *storageClient) SyncGet(ctx context.Context, request *GetRequest) (*Proo
 	return &rsp, nil
 }
 
-func (c *storageClient) SyncGetPrefixes(ctx context.Context, request *GetPrefixesRequest) (*ProofResponse, error) {
+func (c *Client) SyncGetPrefixes(ctx context.Context, request *GetPrefixesRequest) (*ProofResponse, error) {
 	var rsp ProofResponse
 	if err := c.conn.Invoke(ctx, MethodSyncGetPrefixes.FullName(), request, &rsp); err != nil {
 		return nil, err
@@ -385,7 +308,7 @@ func (c *storageClient) SyncGetPrefixes(ctx context.Context, request *GetPrefixe
 	return &rsp, nil
 }
 
-func (c *storageClient) SyncIterate(ctx context.Context, request *IterateRequest) (*ProofResponse, error) {
+func (c *Client) SyncIterate(ctx context.Context, request *IterateRequest) (*ProofResponse, error) {
 	var rsp ProofResponse
 	if err := c.conn.Invoke(ctx, MethodSyncIterate.FullName(), request, &rsp); err != nil {
 		return nil, err
@@ -393,23 +316,7 @@ func (c *storageClient) SyncIterate(ctx context.Context, request *IterateRequest
 	return &rsp, nil
 }
 
-func (c *storageClient) Apply(ctx context.Context, request *ApplyRequest) ([]*Receipt, error) {
-	var rsp []*Receipt
-	if err := c.conn.Invoke(ctx, MethodApply.FullName(), request, &rsp); err != nil {
-		return nil, err
-	}
-	return rsp, nil
-}
-
-func (c *storageClient) ApplyBatch(ctx context.Context, request *ApplyBatchRequest) ([]*Receipt, error) {
-	var rsp []*Receipt
-	if err := c.conn.Invoke(ctx, MethodApplyBatch.FullName(), request, &rsp); err != nil {
-		return nil, err
-	}
-	return rsp, nil
-}
-
-func (c *storageClient) GetCheckpoints(ctx context.Context, request *checkpoint.GetCheckpointsRequest) ([]*checkpoint.Metadata, error) {
+func (c *Client) GetCheckpoints(ctx context.Context, request *checkpoint.GetCheckpointsRequest) ([]*checkpoint.Metadata, error) {
 	var rsp []*checkpoint.Metadata
 	if err := c.conn.Invoke(ctx, MethodGetCheckpoints.FullName(), request, &rsp); err != nil {
 		return nil, err
@@ -426,17 +333,19 @@ func receiveWriteLogIterator(ctx context.Context, stream grpc.ClientStream) Writ
 		for {
 			var chunk SyncChunk
 			err := stream.RecvMsg(&chunk)
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
+			switch err {
+			case nil:
+			case io.EOF:
+				return
+			default:
 				_ = pipe.PutError(err)
-				continue
+				return
 			}
 
 			for i := range chunk.WriteLog {
 				if err := pipe.Put(&chunk.WriteLog[i]); err != nil {
-					_ = pipe.PutError(err)
+					// Context cancelled.
+					return
 				}
 			}
 
@@ -449,7 +358,7 @@ func receiveWriteLogIterator(ctx context.Context, stream grpc.ClientStream) Writ
 	return &pipe
 }
 
-func (c *storageClient) GetDiff(ctx context.Context, request *GetDiffRequest) (WriteLogIterator, error) {
+func (c *Client) GetDiff(ctx context.Context, request *GetDiffRequest) (WriteLogIterator, error) {
 	stream, err := c.conn.NewStream(ctx, &serviceDesc.Streams[0], MethodGetDiff.FullName())
 	if err != nil {
 		return nil, err
@@ -464,7 +373,7 @@ func (c *storageClient) GetDiff(ctx context.Context, request *GetDiffRequest) (W
 	return receiveWriteLogIterator(ctx, stream), nil
 }
 
-func (c *storageClient) GetCheckpointChunk(ctx context.Context, chunk *checkpoint.ChunkMetadata, w io.Writer) error {
+func (c *Client) GetCheckpointChunk(ctx context.Context, chunk *checkpoint.ChunkMetadata, w io.Writer) error {
 	stream, err := c.conn.NewStream(ctx, &serviceDesc.Streams[1], MethodGetCheckpointChunk.FullName())
 	if err != nil {
 		return err
@@ -492,16 +401,11 @@ func (c *storageClient) GetCheckpointChunk(ctx context.Context, chunk *checkpoin
 	}
 }
 
-func (c *storageClient) Cleanup() {
+func (c *Client) Cleanup() {
 }
 
-func (c *storageClient) Initialized() <-chan struct{} {
+func (c *Client) Initialized() <-chan struct{} {
 	ch := make(chan struct{})
 	close(ch)
 	return ch
-}
-
-// NewStorageClient creates a new gRPC storage client service.
-func NewStorageClient(c *grpc.ClientConn) Backend {
-	return &storageClient{c}
 }

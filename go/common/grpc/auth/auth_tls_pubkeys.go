@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"google.golang.org/grpc/codes"
@@ -25,7 +24,7 @@ type PeerPubkeyAuthenticator struct {
 }
 
 // AuthFunc is an AuthenticationFunction backed by the PeerPubkeyAuthenticator.
-func (auth *PeerPubkeyAuthenticator) AuthFunc(ctx context.Context, fullMethodName string, req interface{}) error {
+func (auth *PeerPubkeyAuthenticator) AuthFunc(ctx context.Context, _ any) error {
 	peer, ok := peer.FromContext(ctx)
 	if !ok {
 		return status.Errorf(codes.PermissionDenied, "grpc: failed to obtain connection peer from context")
@@ -34,19 +33,15 @@ func (auth *PeerPubkeyAuthenticator) AuthFunc(ctx context.Context, fullMethodNam
 	if !ok {
 		return status.Errorf(codes.PermissionDenied, "grpc: unexpected peer authentication credentials")
 	}
-	if nPeerCerts := len(tlsAuth.State.PeerCertificates); nPeerCerts != 1 {
-		return status.Errorf(codes.PermissionDenied, fmt.Sprintf("grpc: unexpected number of peer certificates: %d", nPeerCerts))
-	}
-	peerCertRaw := tlsAuth.State.PeerCertificates[0].Raw
 
 	auth.RLock()
 	defer auth.RUnlock()
-	err := cmnTLS.VerifyCertificate([][]byte{peerCertRaw}, cmnTLS.VerifyOptions{
+	err := cmnTLS.VerifyCertificates(tlsAuth.State.PeerCertificates, cmnTLS.VerifyOptions{
 		CommonName: identity.CommonName,
 		Keys:       auth.whitelist,
 	})
 	if err != nil {
-		return status.Errorf(codes.PermissionDenied, err.Error())
+		return status.Errorf(codes.PermissionDenied, "%s", err.Error())
 	}
 
 	return nil

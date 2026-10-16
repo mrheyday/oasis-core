@@ -16,21 +16,20 @@ func TestLRUCapacityEntries(t *testing.T) {
 
 	var (
 		nrEvictCallbacks         int
-		evictedKey, evictedValue interface{}
+		evictedKey, evictedValue any
 	)
 
-	cache, err := New(
+	cache := New(
 		Capacity(uint64(cacheSize), false),
-		OnEvict(func(k, v interface{}) {
+		OnEvict(func(k, v any) {
 			evictedKey, evictedValue = k, v
 			nrEvictCallbacks++
 		}),
 	)
-	require.NoError(err, "New")
 
 	entries := makeEntries(cacheSize)
 	for _, ent := range entries {
-		err = cache.Put(ent.key, ent)
+		err := cache.Put(ent.key, ent)
 		require.NoError(err, "Put")
 	}
 
@@ -61,7 +60,7 @@ func TestLRUCapacityEntries(t *testing.T) {
 	evictEnt := makeEntry("evictionTest")
 	entries = append(entries, evictEnt)
 
-	err = cache.Put(evictEnt.key, evictEnt)
+	err := cache.Put(evictEnt.key, evictEnt)
 	require.NoError(err, "Put - will evict")
 	require.Equal(1, nrEvictCallbacks, "Put - OnEvict called")
 	require.Equal(entries[order[0]].key, evictedKey, "Evict - key")
@@ -95,14 +94,13 @@ func TestLRUCapacityBytes(t *testing.T) {
 
 	const cacheSize = 5
 
-	cache, err := New(
+	cache := New(
 		Capacity(uint64(cacheSize*sha256.Size), true),
 	)
-	require.NoError(err, "New")
 
 	entries := makeEntries(cacheSize)
 	for _, ent := range entries {
-		err = cache.Put(ent.key, ent)
+		err := cache.Put(ent.key, ent)
 		require.NoError(err, "Put")
 	}
 
@@ -110,7 +108,7 @@ func TestLRUCapacityBytes(t *testing.T) {
 		key:   "huge entry - should fail",
 		value: make([]byte, 1024768),
 	}
-	err = cache.Put(hugeEnt.key, hugeEnt)
+	err := cache.Put(hugeEnt.key, hugeEnt)
 	require.Error(err, "Put - huge entry")
 
 	newEnt := makeEntry("new entry")
@@ -126,14 +124,13 @@ func TestLRURemoval(t *testing.T) {
 
 	const cacheSize = 5
 
-	cache, err := New(
+	cache := New(
 		Capacity(uint64(cacheSize*sha256.Size), true),
 	)
-	require.NoError(err, "New")
 
 	entries := makeEntries(cacheSize)
 	for _, ent := range entries {
-		err = cache.Put(ent.key, ent)
+		err := cache.Put(ent.key, ent)
 		require.NoError(err, "Put")
 	}
 
@@ -160,7 +157,7 @@ func (e *testEntry) Size() uint64 {
 
 func makeEntries(nr int) []*testEntry {
 	vec := make([]*testEntry, 0, nr)
-	for i := 0; i < nr; i++ {
+	for i := range nr {
 		vec = append(vec, makeEntry(fmt.Sprintf("key-%d", i)))
 	}
 

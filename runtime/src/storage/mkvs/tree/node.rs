@@ -1,10 +1,11 @@
 use std::{cell::RefCell, rc::Rc};
 
-use serde::{Deserialize, Serialize};
-
 use crate::{
-    common::{crypto::hash::Hash, roothash::Namespace},
-    storage::mkvs::{cache::*, marshal::*},
+    common::{crypto::hash::Hash, namespace::Namespace},
+    storage::mkvs::{
+        cache::{CacheExtra, CacheItem},
+        marshal::Marshal,
+    },
 };
 
 /// Common interface for node-like objects in the tree.
@@ -16,17 +17,33 @@ pub trait Node {
     /// Recompute the node's hash.
     fn update_hash(&mut self);
     /// Duplicate the node but include only hash references.
+    #[allow(dead_code)]
     fn extract(&self) -> NodeRef;
 }
 
+/// Storage root type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, cbor::Encode, cbor::Decode)]
+#[repr(u8)]
+pub enum RootType {
+    /// Invalid or uninitialized storage root type.
+    #[default]
+    Invalid = 0,
+    /// Storage root for runtime state.
+    State = 1,
+    /// Storage root for transaction IO.
+    IO = 2,
+}
+
 /// Storage root.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, cbor::Encode, cbor::Decode)]
 pub struct Root {
     /// Namespace under which the root is stored.
-    #[serde(rename = "ns")]
+    #[cbor(rename = "ns")]
     pub namespace: Namespace,
     /// Monotonically increasing version number in which the root is stored.
     pub version: u64,
+    /// The storage type that this root has data for.
+    pub root_type: RootType,
     /// Merkle root hash.
     pub hash: Hash,
 }
@@ -118,7 +135,7 @@ impl NodePointer {
         Rc::new(RefCell::new(NodePointer {
             node: None,
             clean: true,
-            hash: hash,
+            hash,
             ..Default::default()
         }))
     }
@@ -140,7 +157,7 @@ impl NodePointer {
 
     /// Check if the pointer has a resolved reference to a concrete node.
     pub fn has_node(&self) -> bool {
-        !self.is_null() && !self.node.is_none()
+        !self.is_null() && self.node.is_some()
     }
 
     /// Get a reference to the node the pointer is pointing to.
@@ -153,9 +170,8 @@ impl NodePointer {
 
     /// Return a copy of this pointer containing only hash references.
     pub fn extract(&self) -> NodePtrRef {
-        if !self.clean {
-            panic!("mkvs: extract called on dirty pointer");
-        }
+        assert!(self.clean, "mkvs: extract called on dirty pointer");
+
         Rc::new(RefCell::new(NodePointer {
             clean: true,
             hash: self.hash,
@@ -166,14 +182,14 @@ impl NodePointer {
     // Make deep copy of the Pointer to LeafNode excluding LRU and DBInternal.
     //
     // Panics, if it's called on non-leaf node pointer.
+    #[allow(dead_code)]
     fn copy_leaf_ptr(&self) -> NodePtrRef {
         if !self.has_node() {
             return NodePointer::null_ptr();
         }
 
-        if !self.clean {
-            panic!("mkvs: copy_leaf_ptr called on dirty pointer");
-        }
+        assert!(self.clean, "mkvs: copy_leaf_ptr called on dirty pointer");
+
         if let Some(ref some_node) = self.node {
             let nyoo = noderef_as!(some_node, Leaf).copy();
             Rc::new(RefCell::new(NodePointer {
@@ -207,7 +223,7 @@ impl PartialEq for NodePointer {
         if self.clean && other.clean {
             self.hash == other.hash
         } else {
-            self.node != None && self.node == other.node
+            self.node.is_some() && self.node == other.node
         }
     }
 }
@@ -218,7 +234,6 @@ impl Eq for NodePointer {}
 #[derive(Debug, Default)]
 pub struct InternalNode {
     pub clean: bool,
-    pub version: u64,
     pub hash: Hash,
     pub label: Key,              // label on the incoming edge
     pub label_bit_length: Depth, // length of the label in bits
@@ -243,7 +258,6 @@ impl Node for InternalNode {
 
         self.hash = Hash::digest_bytes_list(&[
             &[NodeKind::Internal as u8],
-            &self.version.marshal_binary().unwrap(),
             &self.label_bit_length.marshal_binary().unwrap(),
             self.label.as_ref(),
             leaf_node_hash.as_ref(),
@@ -253,12 +267,10 @@ impl Node for InternalNode {
     }
 
     fn extract(&self) -> NodeRef {
-        if !self.clean {
-            panic!("mkvs: extract called on dirty node");
-        }
+        assert!(self.clean, "mkvs: extract called on dirty node");
+
         Rc::new(RefCell::new(NodeBox::Internal(InternalNode {
             clean: true,
-            version: self.version,
             hash: self.hash,
             label: self.label.clone(),
             label_bit_length: self.label_bit_length,
@@ -274,8 +286,7 @@ impl PartialEq for InternalNode {
         if self.clean && other.clean {
             self.hash == other.hash
         } else {
-            self.version == other.version
-                && self.leaf_node == other.leaf_node
+            self.leaf_node == other.leaf_node
                 && self.left == other.left
                 && self.right == other.right
         }
@@ -288,7 +299,6 @@ impl Eq for InternalNode {}
 #[derive(Debug, Default)]
 pub struct LeafNode {
     pub clean: bool,
-    pub version: u64,
     pub hash: Hash,
     pub key: Key,
     pub value: Value,
@@ -296,15 +306,12 @@ pub struct LeafNode {
 
 impl LeafNode {
     pub fn copy(&self) -> LeafNode {
-        let node = LeafNode {
+        LeafNode {
             clean: self.clean,
-            version: self.version,
-            hash: self.hash.clone(),
+            hash: self.hash,
             key: self.key.to_owned(),
             value: self.value.clone(),
-        };
-
-        return node;
+        }
     }
 }
 
@@ -320,19 +327,17 @@ impl Node for LeafNode {
     fn update_hash(&mut self) {
         self.hash = Hash::digest_bytes_list(&[
             &[NodeKind::Leaf as u8],
-            &self.version.marshal_binary().unwrap(),
+            &(self.key.len() as u32).marshal_binary().unwrap(),
             self.key.as_ref(),
+            &(self.value.len() as u32).marshal_binary().unwrap(),
             self.value.as_ref(),
         ]);
     }
 
     fn extract(&self) -> NodeRef {
-        if !self.clean {
-            panic!("mkvs: extract called on dirty node");
-        }
+        assert!(self.clean, "mkvs: extract called on dirty node");
         Rc::new(RefCell::new(NodeBox::Leaf(LeafNode {
             clean: true,
-            version: self.version,
             hash: self.hash,
             key: self.key.clone(),
             value: self.value.clone(),
@@ -345,7 +350,7 @@ impl PartialEq for LeafNode {
         if self.clean && other.clean {
             self.hash == other.hash
         } else {
-            self.version == other.version && self.key == other.key && self.value == other.value
+            self.key == other.key && self.value == other.value
         }
     }
 }
@@ -365,7 +370,7 @@ pub trait DepthTrait {
 impl DepthTrait for Depth {
     fn to_bytes(&self) -> usize {
         let size = self / 8;
-        if self % 8 != 0 {
+        if !self.is_multiple_of(8) {
             (size + 1) as usize
         } else {
             size as usize
@@ -379,8 +384,6 @@ pub type Key = Vec<u8>;
 pub trait KeyTrait {
     /// Get a single bit from the given hash.
     fn get_bit(&self, bit: Depth) -> bool;
-    /// Set a single bit in the given hash and return the result. If bit>self, it resizes new Key.
-    fn set_bit(&self, bit: Depth, val: bool) -> Key;
     /// Returns the length of the key in bits.
     fn bit_length(&self) -> Depth;
     /// Bit-wise splits of the key.
@@ -398,35 +401,17 @@ impl KeyTrait for Key {
         (self[(bit / 8) as usize] & (1 << (7 - (bit % 8)))) != 0
     }
 
-    fn set_bit(&self, bit: Depth, val: bool) -> Key {
-        let mut k: Key;
-        if bit as usize >= self.len() * 8 {
-            k = vec![0; bit as usize / 8 + 1];
-            k[0..self.len()].clone_from_slice(&self);
-        } else {
-            k = self.clone();
-        }
-
-        let mask = (1 << (7 - (bit % 8))) as u8;
-        if val {
-            k[(bit / 8) as usize] |= mask;
-        } else {
-            k[(bit / 8) as usize] &= !mask;
-        }
-        k
-    }
-
     fn bit_length(&self) -> Depth {
         (self.len() * 8) as Depth
     }
 
     fn split(&self, split_point: Depth, key_len: Depth) -> (Key, Key) {
-        if split_point > key_len {
-            panic!(
-                "mkvs: split_point {} greater than key_len {}",
-                split_point, key_len
-            );
-        }
+        assert!(
+            split_point <= key_len,
+            "mkvs: split_point {} greater than key_len {}",
+            split_point,
+            key_len
+        );
 
         let prefix_len = split_point.to_bytes();
         let suffix_len = (key_len - split_point).to_bytes();
@@ -436,7 +421,7 @@ impl KeyTrait for Key {
         prefix.clone_from_slice(&self[0..split_point.to_bytes()]);
 
         // Clean the remainder of the byte.
-        if split_point % 8 != 0 {
+        if !split_point.is_multiple_of(8) {
             prefix[prefix_len - 1] &= 0xff << (8 - split_point % 8)
         }
 
@@ -444,7 +429,7 @@ impl KeyTrait for Key {
             // First set the left chunk of the byte
             suffix[i] = self[i + split_point as usize / 8] << (split_point % 8);
             // ...and the right chunk, if we haven't reached the end of k yet.
-            if split_point % 8 != 0 && i + split_point as usize / 8 + 1 != self.len() {
+            if !split_point.is_multiple_of(8) && i + split_point as usize / 8 + 1 != self.len() {
                 suffix[i] |=
                     self[i + split_point as usize / 8 + 1] >> (8 - split_point as usize % 8);
             }
@@ -455,16 +440,16 @@ impl KeyTrait for Key {
 
     fn merge(&self, key_len: Depth, k2: &Key, k2_len: Depth) -> Key {
         let mut key_len_bytes = (key_len as usize) / 8;
-        if key_len % 8 != 0 {
+        if !key_len.is_multiple_of(8) {
             key_len_bytes += 1;
         }
 
         let mut new_key: Key = vec![0; (key_len + k2_len).to_bytes()];
         new_key[..key_len_bytes].clone_from_slice(&self[..key_len_bytes]);
 
-        for i in 0..k2.len() as usize {
+        for i in 0..k2.len() {
             // First set the right chunk of the previous byte
-            if key_len % 8 != 0 && key_len_bytes > 0 {
+            if !key_len.is_multiple_of(8) && key_len_bytes > 0 {
                 new_key[key_len_bytes + i - 1] |= k2[i] >> (key_len % 8);
             }
             // ...and the next left chunk, if we haven't reached the end of newKey

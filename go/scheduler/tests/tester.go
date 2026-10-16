@@ -9,11 +9,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	beaconTests "github.com/oasisprotocol/oasis-core/go/beacon/tests"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
 	consensusAPI "github.com/oasisprotocol/oasis-core/go/consensus/api"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
-	epochtimeTests "github.com/oasisprotocol/oasis-core/go/epochtime/tests"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
 	registryTests "github.com/oasisprotocol/oasis-core/go/registry/tests"
 	"github.com/oasisprotocol/oasis-core/go/scheduler/api"
@@ -23,7 +23,8 @@ const recvTimeout = 5 * time.Second
 
 // SchedulerImplementationTests exercises the basic functionality of a
 // scheduler backend.
-func SchedulerImplementationTests(t *testing.T, name string, backend api.Backend, consensus consensusAPI.Backend) {
+func SchedulerImplementationTests(t *testing.T, name string, identity *identity.Identity, scheduler api.Backend, consensus consensusAPI.Service) {
+	ctx := context.Background()
 	seed := []byte("SchedulerImplementationTests/" + name)
 
 	require := require.New(t)
@@ -34,18 +35,21 @@ func SchedulerImplementationTests(t *testing.T, name string, backend api.Backend
 	// Populate the registry with an entity and nodes.
 	nodes := rt.Populate(t, consensus.Registry(), consensus, seed)
 
-	ch, sub, err := backend.WatchCommittees(context.Background())
+	// Query genesis parameters.
+	_, err = scheduler.ConsensusParameters(ctx, consensusAPI.HeightLatest)
+	require.NoError(err, "ConsensusParameters")
+
+	ch, sub, err := scheduler.WatchCommittees(ctx)
 	require.NoError(err, "WatchCommittees")
 	defer sub.Close()
 
 	// Advance the epoch.
-	epochtime := consensus.EpochTime().(epochtime.SetableBackend)
-	epoch := epochtimeTests.MustAdvanceEpoch(t, epochtime, 1)
+	epoch := beaconTests.MustAdvanceEpoch(t, consensus)
 
-	ensureValidCommittees := func(expectedExecutor, expectedStorage int) {
-		var executor, storage *api.Committee
+	ensureValidCommittees := func(expectedExecutor int) {
+		var executor *api.Committee
 		var seen int
-		for seen < 2 {
+		for seen < 1 {
 			select {
 			case committee := <-ch:
 				if committee.ValidFor < epoch {
@@ -60,10 +64,6 @@ func SchedulerImplementationTests(t *testing.T, name string, backend api.Backend
 					require.Nil(executor, "haven't seen an executor committee yet")
 					executor = committee
 					require.Len(committee.Members, expectedExecutor, "committee has all executor nodes")
-				case api.KindStorage:
-					require.Nil(storage, "haven't seen a storage committee yet")
-					require.Len(committee.Members, expectedStorage, "committee has all storage nodes")
-					storage = committee
 				}
 
 				requireValidCommitteeMembers(t, committee, rt.Runtime, nodes)
@@ -77,7 +77,7 @@ func SchedulerImplementationTests(t *testing.T, name string, backend api.Backend
 		}
 
 		var committees []*api.Committee
-		committees, err = backend.GetCommittees(context.Background(), &api.GetCommitteesRequest{
+		committees, err = scheduler.GetCommittees(context.Background(), &api.GetCommitteesRequest{
 			RuntimeID: rt.Runtime.ID,
 			Height:    consensusAPI.HeightLatest,
 		})
@@ -87,55 +87,43 @@ func SchedulerImplementationTests(t *testing.T, name string, backend api.Backend
 			case api.KindComputeExecutor:
 				require.EqualValues(executor, committee, "fetched executor committee is identical")
 				executor = nil
-			case api.KindStorage:
-				require.EqualValues(storage, committee, "fetched storage committee is identical")
-				storage = nil
 			}
 		}
 
 		require.Nil(executor, "fetched an executor committee")
-		require.Nil(storage, "fetched a storage committee")
 	}
 
-	var nExecutor, nStorage int
+	var nExecutor int
 	for _, n := range nodes {
 		if n.HasRoles(node.RoleComputeWorker) {
 			nExecutor++
 		}
-		if n.HasRoles(node.RoleStorageWorker) {
-			nStorage++
-		}
 	}
 	ensureValidCommittees(
 		nExecutor,
-		nStorage,
 	)
 
 	// Re-register the runtime with less nodes.
 	rt.Runtime.Executor.GroupSize = 2
 	rt.Runtime.Executor.GroupBackupSize = 1
-	rt.Runtime.Storage.GroupSize = 1
-	rt.Runtime.Storage.MinWriteReplication = 1
+	rt.Runtime.Constraints[api.KindComputeExecutor][api.RoleWorker].MinPoolSize.Limit = 2
+	rt.Runtime.Constraints[api.KindComputeExecutor][api.RoleBackupWorker].MinPoolSize.Limit = 1
 	rt.MustRegister(t, consensus.Registry(), consensus)
 
-	epoch = epochtimeTests.MustAdvanceEpoch(t, epochtime, 1)
+	epoch = beaconTests.MustAdvanceEpoch(t, consensus)
 
 	ensureValidCommittees(
 		3,
-		1,
 	)
 
 	// Cleanup the registry.
 	rt.Cleanup(t, consensus.Registry(), consensus)
 
-	// Since the integration tests run with validator elections disabled,
-	// the GetValidator query is special cased to return the node's consensus
-	// identity instead of node identities.
-	validators, err := backend.GetValidators(context.Background(), consensusAPI.HeightLatest)
+	validators, err := scheduler.GetValidators(context.Background(), consensusAPI.HeightLatest)
 	require.NoError(err, "GetValidators")
 
-	require.Len(validators, 1, "should be only one static validator")
-	require.Equal(consensus.ConsensusKey(), validators[0].ID)
+	require.Len(validators, 1, "should be only one validator")
+	require.Equal(identity.NodeSigner.Public(), validators[0].ID)
 	require.EqualValues(1, validators[0].VotingPower)
 }
 
@@ -148,12 +136,9 @@ func requireValidCommitteeMembers(t *testing.T, committee *api.Committee, runtim
 	}
 
 	var workers, backups int
-	seenMap := make(map[signature.PublicKey]bool)
 	for _, member := range committee.Members {
 		id := member.PublicKey
 		require.NotNil(nodeMap[id], "member is a node")
-		require.False(seenMap[id], "member is unique")
-		seenMap[id] = true
 
 		switch member.Role {
 		case api.RoleWorker:
@@ -167,9 +152,6 @@ func requireValidCommitteeMembers(t *testing.T, committee *api.Committee, runtim
 	case api.KindComputeExecutor:
 		require.EqualValues(runtime.Executor.GroupSize, workers, "executor committee should have the correct number of workers")
 		require.EqualValues(runtime.Executor.GroupBackupSize, backups, "executor committee should have the correct number of backup workers")
-	case api.KindStorage:
-		require.EqualValues(runtime.Storage.GroupSize, workers, "storage committee should have the correct number of workers")
-		require.EqualValues(0, backups, "storage committee shouldn't have a backup workers")
 	default:
 		require.FailNow(fmt.Sprintf("unknown committee kind: %s", committee.Kind))
 	}

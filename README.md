@@ -6,7 +6,7 @@
 [![Docker status][github-docker-badge]][github-docker-link]
 [![Release status][github-release-badge]][github-release-link]
 [![GoDev][godev-badge]][godev-link]
-[![GitBook][gitbook-badge]][gitbook-link]
+[![Docusaurus][docusaurus-badge]][docs-link]
 
 <!-- NOTE: Markdown doesn't support tables without headers, so we need to
 work around that and make the second (non-header) row also bold. -->
@@ -17,11 +17,11 @@ work around that and make the second (non-header) row also bold. -->
 <!-- markdownlint-disable line-length -->
 [buildkite-badge]: https://badge.buildkite.com/16896a68bd8fba45d7b41fd608f26f87c726da10f7f24694a0.svg?branch=master
 [buildkite-link]: https://buildkite.com/oasisprotocol/oasis-core-ci
-[github-ci-lint-badge]: https://github.com/oasisprotocol/oasis-core/workflows/ci-lint/badge.svg
+[github-ci-lint-badge]: https://github.com/oasisprotocol/oasis-core/actions/workflows/ci-lint.yml/badge.svg?branch=master
 [github-ci-lint-link]: https://github.com/oasisprotocol/oasis-core/actions?query=workflow:ci-lint+branch:master
-[github-ci-repr-badge]: https://github.com/oasisprotocol/oasis-core/workflows/ci-reproducibility/badge.svg
+[github-ci-repr-badge]: https://github.com/oasisprotocol/oasis-core/actions/workflows/ci-reproducibility.yml/badge.svg?branch=master
 [github-ci-repr-link]: https://github.com/oasisprotocol/oasis-core/actions?query=workflow:ci-reproducibility
-[github-docker-badge]: https://github.com/oasisprotocol/oasis-core/workflows/docker/badge.svg
+[github-docker-badge]: https://github.com/oasisprotocol/oasis-core/actions/workflows/docker.yml/badge.svg?branch=master
 [github-docker-link]: https://github.com/oasisprotocol/oasis-core/actions?query=workflow:docker
 [github-release-badge]: https://github.com/oasisprotocol/oasis-core/workflows/release/badge.svg
 [github-release-link]: https://github.com/oasisprotocol/oasis-core/actions?query=workflow:release
@@ -31,8 +31,8 @@ work around that and make the second (non-header) row also bold. -->
 [coveralls-link]: https://coveralls.io/github/oasisprotocol/oasis-core
 [godev-badge]: https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white
 [godev-link]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go?tab=subdirectories
-[gitbook-badge]: https://img.shields.io/badge/gitbook-docs-007d9c?logo=read-the-docs&logoColor=white
-[gitbook-link]: https://docs.oasis.dev/oasis-core
+[docusaurus-badge]: https://img.shields.io/badge/docusaurus-docs-007d9c?logo=read-the-docs&logoColor=white
+[docs-link]: https://docs.oasis.io/core
 <!-- markdownlint-enable line-length -->
 
 ## Note
@@ -48,13 +48,13 @@ See our [Contributing Guidelines](CONTRIBUTING.md).
 
 ## Security
 
-Read our [Security](SECURITY.md) document.
+Read our [Security](docs/SECURITY.md) document.
 
 ## Developer Documentation
 
 See our [developer documentation index].
 
-[developer documentation index]: https://docs.oasis.dev/oasis-core
+[developer documentation index]: docs/README.md
 
 ## Developing and Building the System
 
@@ -62,9 +62,9 @@ See [a list of prerequisites] followed by [build instructions] and an example
 of [setting up a local test network with a simple runtime].
 
 <!-- markdownlint-disable line-length -->
-[a list of prerequisites]: https://docs.oasis.dev/oasis-core/development-setup/build-environment-setup-and-building/prerequisites
-[build instructions]: https://docs.oasis.dev/oasis-core/development-setup/build-environment-setup-and-building/building
-[setting up a local test network with a simple runtime]: https://docs.oasis.dev/oasis-core/development-setup/running-tests-and-development-networks/oasis-net-runner
+[a list of prerequisites]: docs/development-setup/prerequisites.md
+[build instructions]: docs/development-setup/building.md
+[setting up a local test network with a simple runtime]: docs/development-setup/oasis-net-runner.md
 <!-- markdownlint-enable line-length -->
 
 ## Directories
@@ -81,3 +81,11 @@ of [setting up a local test network with a simple runtime].
 * `scripts`: Bash scripts for development.
 * `tests`: Runtimes, clients and resources used for E2E tests.
 * `tools`: Build tools.
+
+## License
+
+This software is licensed under [Apache 2.0](./LICENSE).
+
+The content of the documentation (the `/docs` folder) including the media (e.g.
+images and diagrams) is licensed under [Creative Commons Attribution 4.0
+International](./LICENSE-docs).

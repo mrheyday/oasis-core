@@ -11,6 +11,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	cmdSigner "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/signer"
+	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/registry"
 	cmdEntity "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/registry/entity"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 )
@@ -45,6 +46,19 @@ type EntityCfg struct {
 // Inner returns the actual Oasis entity and it's signer.
 func (ent *Entity) Inner() (*entity.Entity, signature.Signer) {
 	return ent.entity, ent.entitySigner
+}
+
+// ID returns the entity's ID.
+func (ent *Entity) ID() signature.PublicKey {
+	return ent.entity.ID
+}
+
+// Dir returns the path to the entity directory.
+func (ent *Entity) Dir() string {
+	if ent.isDebugTestEntity {
+		return ""
+	}
+	return ent.dir.String()
 }
 
 // EntityKeyPath returns the path to the entity private key.
@@ -94,7 +108,7 @@ func (ent *Entity) update() error {
 	}
 
 	args := []string{
-		"registry", "entity", "update",
+		registry.CmdRegistry, registry.CmdEntity, registry.CmdUpdate,
 		"--" + cmdSigner.CfgSigner, fileSigner.SignerName,
 		"--" + cmdSigner.CfgCLISignerDir, ent.dir.String(),
 	}
@@ -162,7 +176,7 @@ func (net *Network) NewEntity(cfg *EntityCfg) (*Entity, error) {
 		default:
 			// Generate a fresh new entity.
 			args := []string{
-				"registry", "entity", "init",
+				registry.CmdRegistry, registry.CmdEntity, registry.CmdInit,
 				"--" + cmdSigner.CfgSigner, fileSigner.SignerName,
 				"--" + cmdSigner.CfgCLISignerDir, entityDir.String(),
 			}

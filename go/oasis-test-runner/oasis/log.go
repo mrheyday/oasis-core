@@ -2,13 +2,13 @@ package oasis
 
 import (
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
-	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/abci"
-	tendermint "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
+	"github.com/oasisprotocol/oasis-core/go/consensus/cometbft/abci"
+	cmt "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/api"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/log"
 	roothash "github.com/oasisprotocol/oasis-core/go/roothash/api"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/commitment"
 	upgrade "github.com/oasisprotocol/oasis-core/go/upgrade/api"
-	workerStorage "github.com/oasisprotocol/oasis-core/go/worker/storage/committee"
+	storageWorker "github.com/oasisprotocol/oasis-core/go/worker/storage/committee"
 )
 
 // LogAssertEvent returns a handler which checks whether a specific log event was
@@ -62,7 +62,13 @@ func LogAssertNoExecutionDiscrepancyDetected() log.WatcherHandlerFactory {
 // LogAssertPeerExchangeDisabled returns a handler which checks whether a peer
 // exchange disabled event was detected based on JSON log output.
 func LogAssertPeerExchangeDisabled() log.WatcherHandlerFactory {
-	return LogAssertEvent(tendermint.LogEventPeerExchangeDisabled, "peer exchange not disabled")
+	return LogAssertEvent(cmt.LogEventPeerExchangeDisabled, "peer exchange not disabled")
+}
+
+// LogAssertUpgradeIncompatibleBinary returns a handler which checks whether the binary was deemed
+// incompatible with the upgrade based on JSON log output.
+func LogAssertUpgradeIncompatibleBinary() log.WatcherHandlerFactory {
+	return LogAssertEvent(upgrade.LogEventIncompatibleBinary, "expected binary to be incompatible")
 }
 
 // LogAssertUpgradeStartup returns a handler which checks whether a startup migration
@@ -75,6 +81,18 @@ func LogAssertUpgradeStartup() log.WatcherHandlerFactory {
 // handler was run based on JSON log output.
 func LogAssertUpgradeConsensus() log.WatcherHandlerFactory {
 	return LogAssertEvent(upgrade.LogEventConsensusUpgrade, "expected consensus upgrade did not run")
+}
+
+// LogAssertNoUpgradeStartup returns a handler which checks that no startup migration
+// handler was run based on JSON log output.
+func LogAssertNoUpgradeStartup() log.WatcherHandlerFactory {
+	return LogAssertNotEvent(upgrade.LogEventStartupUpgrade, "unexpected startup upgrade was run")
+}
+
+// LogAssertNoUpgradeConsensus returns a handler which checks that no consensus migration
+// handler was run based on JSON log output.
+func LogAssertNoUpgradeConsensus() log.WatcherHandlerFactory {
+	return LogAssertNotEvent(upgrade.LogEventConsensusUpgrade, "unexpected consensus upgrade was run")
 }
 
 // LogEventABCIPruneDelete returns a handler which checks whether a ABCI pruning delete
@@ -98,7 +116,7 @@ func LogAssertRoothashRoothashReindexing() log.WatcherHandlerFactory {
 // LogAssertCheckpointSync returns a handler which checks whether initial storage sync from
 // a checkpoint was successful or not.
 func LogAssertCheckpointSync() log.WatcherHandlerFactory {
-	return LogAssertEvent(workerStorage.LogEventCheckpointSyncSuccess, "checkpoint sync did not succeed")
+	return LogAssertEvent(storageWorker.LogEventCheckpointSyncSuccess, "checkpoint sync did not succeed")
 }
 
 // LogAssertDiscrepancyMajorityFailure returns a handler which checks whether a discrepancy resolution

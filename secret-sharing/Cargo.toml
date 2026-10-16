@@ -1,0 +1,26 @@
+[package]
+name = "secret-sharing"
+version = "0.1.0"
+authors = ["Oasis Protocol Foundation <info@oasisprotocol.org>"]
+edition = "2018"
+
+[dependencies]
+anyhow = { version = "1.0" }
+group = { version = "0.14.0", default-features = false }
+hex-literal = "1.1.0"
+honggfuzz = { version = "0.5" }
+p384 = { version = "0.14.0", default-features = false, features = [
+    "std",
+    "hash2curve",
+    "arithmetic",
+    "group-digest",
+] }
+rand = { version = "0.10.3" }
+sha3 = { version = "0.12.0" }
+subtle = { version = "2.6", default-features = false }
+thiserror = { version = "2.0" }
+zeroize = { version = "1.7" }
+
+[[bin]]
+name = "fuzz-vss"
+path = "src/vss/fuzz/main.rs"

@@ -1,6 +1,7 @@
 package pluginsigner
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 
@@ -30,7 +31,15 @@ func (sc *basicImpl) Clone() scenario.Scenario {
 	}
 }
 
-func (sc *basicImpl) Run(childEnv *env.Env) error {
+func (sc *basicImpl) Run(_ context.Context, _ *env.Env) error {
+	roles := []signature.SignerRole{
+		signature.SignerEntity,
+		signature.SignerNode,
+		signature.SignerP2P,
+		signature.SignerConsensus,
+		// signature.SignerVRF not supported because HSMs are potato
+	}
+
 	// Initialize the plugin signer.
 	pluginName, _ := sc.flags.GetString(cfgPluginName)
 	pluginBinary, _ := sc.flags.GetString(cfgPluginBinary)
@@ -41,23 +50,19 @@ func (sc *basicImpl) Run(childEnv *env.Env) error {
 			Path:   pluginBinary,
 			Config: pluginConfig,
 		},
-		signature.SignerRoles...,
+		roles...,
 	)
 	if err != nil {
 		return err
 	}
 
 	// Generate keys using the new factory.
-	for _, v := range signature.SignerRoles {
+	for _, v := range roles {
 		if _, err = sf.Generate(v, rand.Reader); err != nil {
 			return fmt.Errorf("Generate(%v) failed: %w", v, err)
 		}
 	}
 
 	// Run basic common signer tests.
-	if err = signerTests.BasicTests(sf, sc.logger); err != nil {
-		return err
-	}
-
-	return nil
+	return signerTests.BasicTests(sf, sc.logger, roles)
 }

@@ -9,8 +9,8 @@ transactions lives in [`go/consensus/api/transaction`]. For more information
 you can also check out the [consensus backend API documentation].
 
 <!-- markdownlint-disable line-length -->
-[consensus backend]: index.md
-[`go/consensus/api/transaction`]: ../../go/consensus/api/transaction/transaction.go
+[consensus backend]: README.md
+[`go/consensus/api/transaction`]: https://github.com/oasisprotocol/oasis-core/tree/master/go/consensus/api/transaction/transaction.go
 [consensus backend API documentation]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/consensus/api/transaction?tab=doc
 <!-- markdownlint-enable line-length -->
 
@@ -23,8 +23,8 @@ type Transaction struct {
     Nonce uint64 `json:"nonce"`
     Fee   *Fee   `json:"fee,omitempty"`
 
-    Method string      `json:"method"`
-    Body   interface{} `json:"body,omitempty"`
+    Method string `json:"method"`
+    Body   any    `json:"body,omitempty"`
 }
 ```
 
@@ -49,7 +49,7 @@ oasis-core/consensus: tx
 ```
 
 [encoded]: ../encoding.md
-[signed envelope]: ../crypto.md#signed-envelope
+[signed envelope]: ../crypto.md#envelopes
 [Domain separation]: ../crypto.md#domain-separation
 [chain domain separation]: ../crypto.md#chain-domain-separation
 
@@ -107,7 +107,7 @@ consumed by execution.
 
 <!-- markdownlint-disable line-length -->
 [`EstimateGas`]: https://pkg.go.dev/github.com/oasisprotocol/oasis-core/go/consensus/api?tab=doc#ClientBackend.EstimateGas
-[backend-specific]: index.md
+[backend-specific]: README.md
 <!-- markdownlint-enable line-length -->
 
 ## Submission

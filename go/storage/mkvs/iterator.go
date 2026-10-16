@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/node"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/syncer"
 )
@@ -25,17 +24,26 @@ func (t *tree) SyncIterate(ctx context.Context, request *syncer.IterateRequest) 
 	if !t.cache.pendingRoot.IsClean() {
 		return nil, syncer.ErrDirtyRoot
 	}
+	pb, err := syncer.NewProofBuilderForVersion(request.Tree.Root.Hash, request.Tree.Root.Hash, request.ProofVersion)
+	if err != nil {
+		return nil, err
+	}
 
 	// Create an iterator which generates proofs. Always anchor the proof at the
 	// root as an iterator may encompass many subtrees. Make sure to propagate
 	// prefetching to any upstream remote syncers.
 	it := t.NewIterator(ctx,
-		WithProof(request.Tree.Root.Hash),
+		WithProofBuilder(pb),
 		IteratorPrefetch(request.Prefetch),
 	)
 	defer it.Close()
 
-	it.Seek(request.Key)
+	key := node.Key(request.Key)
+	if err := key.Validate(); err != nil {
+		return nil, err
+	}
+
+	it.Seek(key)
 	if it.Err() != nil {
 		return nil, it.Err()
 	}
@@ -64,8 +72,9 @@ func (t *tree) newFetcherSyncIterate(key node.Key, prefetch uint16) readSyncFetc
 				Root:     t.cache.syncRoot,
 				Position: ptr.Hash,
 			},
-			Key:      key,
-			Prefetch: prefetch,
+			Key:          key,
+			Prefetch:     prefetch,
+			ProofVersion: syncProofsVersion,
 		})
 		if err != nil {
 			return nil, err
@@ -146,11 +155,11 @@ func IteratorPrefetch(prefetch uint16) IteratorOption {
 	}
 }
 
-// WithProof configures the iterator for generating proofs of all
-// visited nodes.
-func WithProof(root hash.Hash) IteratorOption {
+// WithProofBuilder configures the iterator for generating proofs of all
+// visited nodes with the given proof builder.
+func WithProofBuilder(pb *syncer.ProofBuilder) IteratorOption {
 	return func(it Iterator) {
-		it.(*treeIterator).proofBuilder = syncer.NewProofBuilder(root)
+		it.(*treeIterator).proofBuilder = pb
 	}
 }
 
@@ -251,81 +260,89 @@ func (it *treeIterator) doNext(ptr *node.Pointer, bitDepth node.Depth, path, key
 
 	// Include nodes in proof if we have a proof builder.
 	if pb := it.proofBuilder; pb != nil && ptr != nil {
-		proofRoot := pb.GetRoot()
-		if pb.HasRoot() || proofRoot.Equal(&ptr.Hash) {
-			pb.Include(nd)
-		}
+		pb.Include(nd)
 	}
 
 	switch n := nd.(type) {
 	case nil:
-		// Reached a nil node, there is nothing here.
 		return nil
 	case *node.InternalNode:
-		// Internal node.
-		bitLength := bitDepth + n.LabelBitLength
-		newPath := path.Merge(bitDepth, n.Label, n.LabelBitLength)
+		newBitDepth := bitDepth + n.LabelBitLength
+		newPath, err := path.Merge(bitDepth, n.Label, n.LabelBitLength)
+		if err != nil {
+			return err
+		}
+
+		tryNext := func(next *node.Pointer, nextKey node.Key, parentState visitState) (bool, error) {
+			if err := it.doNext(next, newBitDepth, newPath, nextKey, visitBefore); err != nil {
+				return false, err
+			}
+			if it.key != nil { // Key has been found.
+				it.pos = append(it.pos, pathAtom{state: parentState, ptr: ptr, bitDepth: bitDepth, path: path})
+				return true, nil
+			}
+			return false, nil
+		}
+
+		advanceKeyToRight := func(k node.Key) (node.Key, error) {
+			keyBitLength, err := k.BitLength()
+			if err != nil {
+				return nil, err
+			}
+			k, _ = k.MustSplit(newBitDepth, keyBitLength)
+			return k.AppendBit(newBitDepth, true)
+		}
 
 		// Check if the key is longer than the current path but lexicographically smaller. In this
 		// case everything in this subtree will be larger so we need to take the first value.
-		var takeFirst bool
-		if bitLength > 0 && key.BitLength() >= bitLength && key.Compare(newPath) < 0 {
-			takeFirst = true
+		keyBitLength, err := key.BitLength()
+		if err != nil {
+			return err
 		}
 
-		// Does lookup key end here? Look into LeafNode.
-		if (state == visitBefore && (key.BitLength() <= bitLength || takeFirst)) || state == visitAt {
-			if state == visitBefore {
-				err := it.doNext(n.LeafNode, bitLength, path, key, visitBefore)
+		takeFirst := newBitDepth > 0 && keyBitLength >= newBitDepth && key.Compare(newPath) < 0
+		keyNotLonger := keyBitLength <= newBitDepth
+
+		switch state {
+		case visitBefore:
+			if keyNotLonger || takeFirst {
+				// Try leaf first, since it is lexicographically smallest.
+				if ok, err := tryNext(n.LeafNode, key, visitAt); ok || err != nil {
+					return err
+				}
+			}
+			fallthrough
+		case visitAt:
+			if keyNotLonger {
+				key, err = key.AppendBit(newBitDepth, false)
 				if err != nil {
 					return err
 				}
-				if it.key != nil {
-					// Key has been found.
-					it.pos = append(it.pos, pathAtom{state: visitAt, ptr: ptr, bitDepth: bitDepth, path: path})
-					return nil
+			}
+
+			if !key.MustGetBit(newBitDepth) || takeFirst {
+				if ok, err := tryNext(n.Left, key, visitAtLeft); ok || err != nil {
+					return err
 				}
-			}
-			// Key has not been found, continue with search for next key.
-			if key.BitLength() <= bitLength {
-				key = key.AppendBit(bitLength, false)
-			}
-		}
-
-		if state == visitBefore {
-			state = visitAt
-		}
-
-		// Continue recursively based on a bit value.
-		if (state == visitAt && (!key.GetBit(bitLength) || takeFirst)) || state == visitAtLeft {
-			if state == visitAt {
-				err := it.doNext(n.Left, bitLength, newPath.AppendBit(bitLength, false), key, visitBefore)
+				key, err = advanceKeyToRight(key)
 				if err != nil {
 					return err
 				}
-				if it.key != nil {
-					// Key has been found.
-					it.pos = append(it.pos, pathAtom{state: visitAtLeft, ptr: ptr, bitDepth: bitDepth, path: path})
-					return nil
-				}
 			}
-			// Key has not been found, continue with search for next key.
-			key, _ = key.Split(bitLength, key.BitLength())
-			key = key.AppendBit(bitLength, true)
-		}
 
-		if state == visitAt || state == visitAtLeft {
-			err := it.doNext(n.Right, bitLength, newPath.AppendBit(bitLength, true), key, visitBefore)
+			if ok, err := tryNext(n.Right, key, visitAfter); ok || err != nil {
+				return err
+			}
+		case visitAtLeft:
+			key, err = advanceKeyToRight(key)
 			if err != nil {
 				return err
 			}
-			if it.key != nil {
-				// Key has been found.
-				it.pos = append(it.pos, pathAtom{state: visitAfter, ptr: ptr, bitDepth: bitDepth, path: path})
+			if ok, err := tryNext(n.Right, key, visitAfter); ok || err != nil {
+				return err
 			}
 		}
 	case *node.LeafNode:
-		// Reached a leaf node.
 		if n.Key.Compare(key) >= 0 {
 			it.key = n.Key
 			it.value = n.Value

@@ -43,9 +43,11 @@ type ClientOptions struct {
 // NewClientCreds creates new client TLS transport credentials.
 func NewClientCreds(opts *ClientOptions) (credentials.TransportCredentials, error) {
 	return advancedtls.NewClientCreds(&advancedtls.ClientOptions{
-		Certificates:         opts.Certificates,
-		GetClientCertificate: opts.GetClientCertificate,
-		VType:                advancedtls.SkipVerification,
+		IdentityOptions: advancedtls.IdentityCertificateOptions{
+			Certificates:                     opts.Certificates,
+			GetIdentityCertificatesForClient: opts.GetClientCertificate,
+		},
+		VType: advancedtls.SkipVerification,
 		VerifyPeer: func(params *advancedtls.VerificationFuncParams) (*advancedtls.VerificationResults, error) {
 			var err error
 			keys := opts.ServerPubKeys
@@ -55,7 +57,16 @@ func NewClientCreds(opts *ClientOptions) (credentials.TransportCredentials, erro
 				}
 			}
 
-			err = cmnTLS.VerifyCertificate(params.RawCerts, cmnTLS.VerifyOptions{
+			certs := make([]*x509.Certificate, 0, len(params.RawCerts))
+			for _, raw := range params.RawCerts {
+				cert, err := x509.ParseCertificate(raw)
+				if err != nil {
+					return nil, fmt.Errorf("tls: bad X509 certificate: %w", err)
+				}
+				certs = append(certs, cert)
+			}
+
+			err = cmnTLS.VerifyCertificates(certs, cmnTLS.VerifyOptions{
 				CommonName: opts.CommonName,
 				Keys:       keys,
 			})

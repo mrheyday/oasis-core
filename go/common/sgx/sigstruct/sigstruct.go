@@ -49,7 +49,7 @@ var (
 // The most recent version of the Intel documentation defines more fields
 // that were formerly reserved, however support for setting such things
 // is currently not implemented.
-type Sigstruct struct { //nolint: maligned
+type Sigstruct struct {
 	BuildDate      time.Time
 	SwDefined      [4]byte
 	MiscSelect     uint32
@@ -98,6 +98,46 @@ func (s *Sigstruct) Sign(privateKey *rsa.PrivateKey) ([]byte, error) {
 	return buf, nil
 }
 
+// HashForSignature returns the SHA-256 hash that is to be signed.
+//
+// This method can be used for offline signing.
+func (s *Sigstruct) HashForSignature() []byte {
+	return hashForSignature(s.toUnsigned())
+}
+
+// WithSignature combines the provided raw signature (which must be over the result of an earlier
+// call to HashForSignature) with the given SIGSTRUCT.
+//
+// The SIGSTRUCT that was signed MUST match this structure and an error will be returned otherwise
+// to prevent returning a malformed SIGSTRUCT.
+//
+// This method can be used after an offline signing process has produced a signature.
+func (s *Sigstruct) WithSignature(rawSig []byte, pubKey *rsa.PublicKey) ([]byte, error) {
+	// Marshal the sigstruct to binary.
+	buf := s.toUnsigned()
+
+	// Generate the pre-computed bullshit.
+	sigBytes, q1Bytes, q2Bytes, err := postProcessSignature(rawSig, pubKey.N)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fill out the rest of the SIGSTRUCT.
+	modBytes, _ := sgx.To3072le(pubKey.N, false)                          // Can't fail.
+	copy(buf[modulusOffset:], modBytes)                                   // MODULUS
+	binary.LittleEndian.PutUint32(buf[exponentOffset:], uint32(pubKey.E)) // EXPONENT
+	copy(buf[signatureOffset:], sigBytes)                                 // SIGNATURE
+	copy(buf[q1Offset:], q1Bytes)                                         // Q1
+	copy(buf[q2Offset:], q2Bytes)                                         // Q2
+
+	// Verify signed SIGSTRUCT.
+	if _, _, err = Verify(buf); err != nil {
+		return nil, err
+	}
+
+	return buf, nil
+}
+
 func hashForSignature(buf []byte) []byte {
 	h := sha256.New()
 	_, _ = h.Write(buf[:modulusOffset])
@@ -121,7 +161,7 @@ func postProcessSignature(raw []byte, modulus *big.Int) (sigBytes, q1Bytes, q2By
 		return nil, nil, nil, fmt.Errorf("sgx/sigstruct: failed to serialize q2: %w", err)
 	}
 
-	return
+	return sigBytes, q1Bytes, q2Bytes, nil
 }
 
 func deriveQ1Q2(sig, modulus *big.Int) (*big.Int, *big.Int) {

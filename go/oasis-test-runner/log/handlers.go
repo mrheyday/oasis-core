@@ -29,7 +29,7 @@ func (a *assertBase) String() string {
 
 type assertBaseHandler assertBase
 
-func (h *assertBaseHandler) Line(line string) error {
+func (h *assertBaseHandler) Line(string) error {
 	return nil
 }
 
@@ -129,7 +129,7 @@ type assertJSONContainsHandler struct {
 }
 
 func (h *assertJSONContainsHandler) Line(line string) error {
-	var kvs map[string]interface{}
+	var kvs map[string]any
 	if err := json.Unmarshal([]byte(line), &kvs); err != nil {
 		return nil
 	}

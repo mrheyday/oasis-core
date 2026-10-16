@@ -1,58 +1,35 @@
-use std::sync::Arc;
-
 use anyhow::Result;
-use io_context::Context;
 
 use crate::{
-    common::{crypto::hash::Hash, roothash::Namespace},
-    storage::mkvs::{cache::*, tree::*, LogEntry, WriteLog},
+    common::{crypto::hash::Hash, namespace::Namespace},
+    storage::mkvs::{
+        cache::{Cache, LRUCache, UpdateList},
+        tree::{Node, NodeBox, NodeKind, NodePtrRef, Root, Tree},
+    },
 };
 
 impl Tree {
     /// Commit tree updates to the underlying database and return
     /// the write log and new merkle root.
-    pub fn commit(
-        &mut self,
-        ctx: Context,
-        namespace: Namespace,
-        version: u64,
-    ) -> Result<(WriteLog, Hash)> {
-        let ctx = ctx.freeze();
+    pub fn commit(&mut self, namespace: Namespace, version: u64) -> Result<Hash> {
         let mut update_list: UpdateList<LRUCache> = UpdateList::new();
         let pending_root = self.cache.borrow().get_pending_root();
-        let new_hash = _commit(&ctx, pending_root.clone(), &mut update_list, Some(version))?;
+        let new_hash = _commit(pending_root, &mut update_list)?;
 
         update_list.commit(&mut self.cache.borrow_mut());
 
-        let mut log: WriteLog = Vec::new();
-        for (_, entry) in self.pending_write_log.iter() {
-            // Skip all entries that do not exist after all the updates and
-            // did not exist before.
-            if entry.value.is_none() && !entry.existed {
-                continue;
-            }
-            log.push(LogEntry {
-                key: entry.key.clone(),
-                value: entry.value.clone(),
-            });
-        }
-        self.pending_write_log.clear();
         self.cache.borrow_mut().set_sync_root(Root {
             namespace,
             version,
+            root_type: self.root_type,
             hash: new_hash,
         });
 
-        Ok((log, new_hash))
+        Ok(new_hash)
     }
 }
 
-pub fn _commit<C: Cache>(
-    ctx: &Arc<Context>,
-    ptr: NodePtrRef,
-    update_list: &mut UpdateList<C>,
-    version: Option<u64>,
-) -> Result<Hash> {
+pub fn _commit<C: Cache>(ptr: NodePtrRef, update_list: &mut UpdateList<C>) -> Result<Hash> {
     if ptr.borrow().clean {
         return Ok(ptr.borrow().hash);
     }
@@ -70,19 +47,15 @@ pub fn _commit<C: Cache>(
                 let int_left = noderef_as!(some_node_ref, Internal).left.clone();
                 let int_right = noderef_as!(some_node_ref, Internal).right.clone();
 
-                _commit(ctx, int_leaf_node.clone(), update_list, version)?;
-                _commit(ctx, int_left.clone(), update_list, version)?;
-                _commit(ctx, int_right.clone(), update_list, version)?;
+                _commit(int_leaf_node, update_list)?;
+                _commit(int_left, update_list)?;
+                _commit(int_right, update_list)?;
 
-                if let Some(version) = version {
-                    noderef_as_mut!(some_node_ref, Internal).version = version;
-                }
                 some_node_ref.borrow_mut().update_hash();
                 ptr.borrow_mut().hash = some_node_ref.borrow().get_hash();
 
-                let closure_node_ref = some_node_ref.clone();
                 update_list.push(Box::new(move |_| {
-                    noderef_as_mut!(closure_node_ref, Internal).clean = true
+                    noderef_as_mut!(some_node_ref, Internal).clean = true
                 }));
             }
         }
@@ -91,15 +64,11 @@ pub fn _commit<C: Cache>(
             if node_ref.borrow().is_clean() {
                 ptr.borrow_mut().hash = node_ref.borrow().get_hash();
             } else {
-                if let Some(version) = version {
-                    noderef_as_mut!(node_ref, Leaf).version = version;
-                }
                 node_ref.borrow_mut().update_hash();
                 ptr.borrow_mut().hash = node_ref.borrow().get_hash();
 
-                let closure_node_ref = node_ref.clone();
                 update_list.push(Box::new(move |_| {
-                    noderef_as_mut!(closure_node_ref, Leaf).clean = true
+                    noderef_as_mut!(node_ref, Leaf).clean = true
                 }));
             }
         }

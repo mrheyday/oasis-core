@@ -22,8 +22,14 @@ pushd go
   make generate
   if [ -n "$(git status --porcelain)" ]; then
     echo -e "${RED}ERROR: go/ directory is dirty after 'go generate'${OFF}"
+    git diff
     exit 1
   fi
 
   make all GO_BUILD_E2E_COVERAGE=1
+popd
+
+pushd tests/upgrade
+  make -C pre
+  make -C post
 popd

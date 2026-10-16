@@ -21,7 +21,7 @@ func (c *ConsensusHelpers) SubmitTx(txPath string) error {
 	c.logger.Info("submitting tx", consensus.CfgTxFile, txPath)
 
 	args := []string{
-		"consensus", "submit_tx",
+		cmdConsensus.CmdConsensus, cmdConsensus.CmdSubmitTx,
 		"--" + consensus.CfgTxFile, txPath,
 		"--" + grpc.CfgAddress, "unix:" + c.cfg.NodeSocketPath,
 		"--" + common.CfgDebugAllowTestKeys,
@@ -41,7 +41,7 @@ func (c *ConsensusHelpers) EstimateGas(txPath string, signerPub signature.Public
 		return 0, fmt.Errorf("marshal signerPub: %w", err)
 	}
 	args := []string{
-		"consensus", "estimate_gas",
+		cmdConsensus.CmdConsensus, cmdConsensus.CmdEstimateGas,
 		"--" + consensus.CfgTxFile, txPath,
 		"--" + grpc.CfgAddress, "unix:" + c.cfg.NodeSocketPath,
 		"--" + cmdConsensus.CfgSignerPub, string(signerPubStr),

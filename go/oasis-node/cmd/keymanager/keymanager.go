@@ -3,12 +3,9 @@ package keymanager
 
 import (
 	"bytes"
-	"context"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -16,6 +13,7 @@ import (
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
+	"github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
@@ -23,31 +21,47 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/sgx"
 	kmApi "github.com/oasisprotocol/oasis-core/go/keymanager/api"
+	"github.com/oasisprotocol/oasis-core/go/keymanager/secrets"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdConsensus "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/consensus"
+	cmdContext "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/context"
 	cmdFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 )
 
 const (
-	CfgPolicySerial       = "keymanager.policy.serial"
-	CfgPolicyID           = "keymanager.policy.id"
-	CfgPolicyFile         = "keymanager.policy.file"
-	CfgPolicyEnclaveID    = "keymanager.policy.enclave.id"
-	CfgPolicyMayQuery     = "keymanager.policy.may.query"
-	CfgPolicyMayReplicate = "keymanager.policy.may.replicate"
-	CfgPolicyKeyFile      = "keymanager.policy.key.file"
-	CfgPolicyTestKey      = "keymanager.policy.testkey"
-	CfgPolicySigFile      = "keymanager.policy.signature.file"
-	CfgPolicyIgnoreSig    = "keymanager.policy.ignore.signature"
+	CfgPolicySerial                       = "keymanager.policy.serial"
+	CfgPolicyID                           = "keymanager.policy.id"
+	CfgPolicyFile                         = "keymanager.policy.file"
+	CfgPolicyEnclaveID                    = "keymanager.policy.enclave.id"
+	CfgPolicyMayQuery                     = "keymanager.policy.may.query"
+	CfgPolicyMayReplicate                 = "keymanager.policy.may.replicate"
+	CfgPolicyKeyFile                      = "keymanager.policy.key.file"
+	CfgPolicyTestKey                      = "keymanager.policy.testkey"
+	CfgPolicySigFile                      = "keymanager.policy.signature.file"
+	CfgPolicyIgnoreSig                    = "keymanager.policy.ignore.signature"
+	CfgPolicyMasterSecretRotationInterval = "keymanager.policy.master_secret_rotation_interval"
 
 	CfgStatusFile        = "keymanager.status.file"
 	CfgStatusID          = "keymanager.status.id"
 	CfgStatusInitialized = "keymanager.status.initialized"
 	CfgStatusSecure      = "keymanager.status.secure"
 	CfgStatusChecksum    = "keymanager.status.checksum"
+	CfgStatusRSK         = "keymanager.status.rsk"
 
-	policyFilename = "km_policy.cbor"
 	statusFilename = "km_status.json"
+
+	// CmdKeymanager is the keymanager subcommand.
+	CmdKeymanager = "keymanager"
+	// CmdInitPolicy is the init_policy subcommand.
+	CmdInitPolicy = "init_policy"
+	// CmdSignPolicy is the sign_policy subcommand.
+	CmdSignPolicy = "sign_policy"
+	// CmdVerifyPolicy is the verify_policy subcommand.
+	CmdVerifyPolicy = "verify_policy"
+	// CmdInitStatus is the init_status subcommand.
+	CmdInitStatus = "init_status"
+	// CmdGenUpdate is the gen_update subcommand.
+	CmdGenUpdate = "gen_update"
 )
 
 var (
@@ -55,44 +69,50 @@ var (
 	policySigFileFlag = flag.NewFlagSet("", flag.ContinueOnError)
 
 	keyManagerCmd = &cobra.Command{
-		Use:   "keymanager",
-		Short: "keymanager utilities",
+		Use:        CmdKeymanager,
+		Short:      "keymanager utilities",
+		Deprecated: "use the `oasis` CLI instead.", //nolint:goconst
 	}
 
 	initPolicyCmd = &cobra.Command{
-		Use:   "init_policy",
-		Short: "generate keymanager policy file",
-		Run:   doInitPolicy,
+		Use:        CmdInitPolicy,
+		Short:      "generate keymanager policy file",
+		Run:        doInitPolicy,
+		Deprecated: "use the `oasis` CLI instead.", //nolint:goconst
 	}
 
 	signPolicyCmd = &cobra.Command{
-		Use:   "sign_policy",
-		Short: "sign keymanager policy file",
-		Run:   doSignPolicy,
+		Use:        CmdSignPolicy,
+		Short:      "sign keymanager policy file",
+		Run:        doSignPolicy,
+		Deprecated: "use the `oasis` CLI instead.", //nolint:goconst
 	}
 
 	verifyPolicyCmd = &cobra.Command{
-		Use:   "verify_policy",
-		Short: "verify keymanager policy file and (optionally) its signature",
-		Run:   doVerifyPolicy,
+		Use:        CmdVerifyPolicy,
+		Short:      "verify keymanager policy file and (optionally) its signature",
+		Run:        doVerifyPolicy,
+		Deprecated: "use the `oasis` CLI instead.", //nolint:goconst
 	}
 
 	initStatusCmd = &cobra.Command{
-		Use:   "init_status",
-		Short: "generate keymanager status file",
-		Run:   doInitStatus,
+		Use:        CmdInitStatus,
+		Short:      "generate keymanager status file",
+		Run:        doInitStatus,
+		Deprecated: "use the `oasis` CLI instead.", //nolint:goconst
 	}
 
 	genUpdateCmd = &cobra.Command{
-		Use:   "gen_update",
-		Short: "generate a update transaction",
-		Run:   doGenUpdate,
+		Use:        CmdGenUpdate,
+		Short:      "generate a update transaction",
+		Run:        doGenUpdate,
+		Deprecated: "use the `oasis` CLI instead.", //nolint:goconst
 	}
 
 	logger = logging.GetLogger("cmd/keymanager")
 )
 
-func doInitPolicy(cmd *cobra.Command, args []string) {
+func doInitPolicy(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -103,7 +123,7 @@ func doInitPolicy(cmd *cobra.Command, args []string) {
 	}
 
 	c := cbor.Marshal(p)
-	if err = ioutil.WriteFile(viper.GetString(CfgPolicyFile), c, 0o644); err != nil { // nolint: gosec
+	if err = os.WriteFile(viper.GetString(CfgPolicyFile), c, 0o644); err != nil { // nolint: gosec
 		logger.Error("failed to write key manager policy cbor file",
 			"err", err,
 			"CfgPolicyFile", viper.GetString(CfgPolicyFile),
@@ -116,7 +136,7 @@ func doInitPolicy(cmd *cobra.Command, args []string) {
 	)
 }
 
-func policyFromFlags() (*kmApi.PolicySGX, error) {
+func policyFromFlags() (*secrets.PolicySGX, error) {
 	var id common.Namespace
 	if err := id.UnmarshalHex(viper.GetString(CfgPolicyID)); err != nil {
 		logger.Error("failed to parse key manager runtime ID",
@@ -128,7 +148,7 @@ func policyFromFlags() (*kmApi.PolicySGX, error) {
 
 	serial := viper.GetUint32(CfgPolicySerial)
 
-	enclaves := make(map[sgx.EnclaveIdentity]*kmApi.EnclavePolicySGX)
+	enclaves := make(map[sgx.EnclaveIdentity]*secrets.EnclavePolicySGX)
 
 	// Replicate and query permissions are set per-key manager enclave ID.
 	// Since viper doesn't store order of arguments, go through os.Args by hand,
@@ -144,7 +164,7 @@ func policyFromFlags() (*kmApi.PolicySGX, error) {
 				return nil, err
 			}
 
-			enclaves[kmEnclaveID] = &kmApi.EnclavePolicySGX{
+			enclaves[kmEnclaveID] = &secrets.EnclavePolicySGX{
 				MayReplicate: []sgx.EnclaveIdentity{},
 				MayQuery:     make(map[common.Namespace][]sgx.EnclaveIdentity),
 			}
@@ -203,14 +223,17 @@ func policyFromFlags() (*kmApi.PolicySGX, error) {
 		}
 	}
 
-	return &kmApi.PolicySGX{
-		Serial:   serial,
-		ID:       id,
-		Enclaves: enclaves,
+	rotationInterval := api.EpochTime(viper.GetUint64(CfgPolicyMasterSecretRotationInterval))
+
+	return &secrets.PolicySGX{
+		Serial:                       serial,
+		ID:                           id,
+		Enclaves:                     enclaves,
+		MasterSecretRotationInterval: rotationInterval,
 	}, nil
 }
 
-func doSignPolicy(cmd *cobra.Command, args []string) {
+func doSignPolicy(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -231,7 +254,7 @@ func doSignPolicy(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	if err = ioutil.WriteFile(viper.GetStringSlice(CfgPolicySigFile)[0], sigBytes, 0o600); err != nil {
+	if err = os.WriteFile(viper.GetStringSlice(CfgPolicySigFile)[0], sigBytes, 0o600); err != nil {
 		logger.Error("failed to write policy file signature",
 			"err", err,
 			"CfgPolicySigFile", viper.GetStringSlice(CfgPolicySigFile),
@@ -265,7 +288,7 @@ func signPolicyFromFlags() (*signature.Signature, error) {
 		return nil, errors.New("no private key file or test key provided")
 	}
 
-	policyBytes, err := ioutil.ReadFile(viper.GetString(CfgPolicyFile))
+	policyBytes, err := os.ReadFile(viper.GetString(CfgPolicyFile))
 	if err != nil {
 		return nil, err
 	}
@@ -275,21 +298,15 @@ func signPolicyFromFlags() (*signature.Signature, error) {
 		return nil, err
 	}
 
-	rawSigBytes, err := signer.ContextSign(kmApi.PolicySGXSignatureContext, policyBytes)
+	sig, err := signature.Sign(signer, secrets.PolicySGXSignatureContext, policyBytes)
 	if err != nil {
 		return nil, err
 	}
 
-	rawSig := signature.RawSignature{}
-	copy(rawSig[:], rawSigBytes)
-
-	return &signature.Signature{
-		PublicKey: signer.Public(),
-		Signature: rawSig,
-	}, nil
+	return sig, nil
 }
 
-func doVerifyPolicy(cmd *cobra.Command, args []string) {
+func doVerifyPolicy(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -303,7 +320,7 @@ func doVerifyPolicy(cmd *cobra.Command, args []string) {
 }
 
 func verifyPolicyFromFlags() error {
-	policyBytes, err := ioutil.ReadFile(viper.GetString(CfgPolicyFile))
+	policyBytes, err := os.ReadFile(viper.GetString(CfgPolicyFile))
 	if err != nil {
 		return err
 	}
@@ -316,15 +333,21 @@ func verifyPolicyFromFlags() error {
 
 	// Output policy content in JSON, if verbose switch given.
 	if cmdFlags.Verbose() {
-		c, _ := json.Marshal(policy)
-		fmt.Printf("%s\n", string(c))
+		prettyPolicy, err := cmdCommon.PrettyJSONMarshal(policy)
+		if err != nil {
+			logger.Error("failed to get pretty JSON of policy",
+				"err", err,
+			)
+			os.Exit(1)
+		}
+		fmt.Println(string(prettyPolicy))
 	}
 
 	// Check the signatures of the policy. Public key is taken from the PEM
 	// signature file.
 	if !viper.GetBool(CfgPolicyIgnoreSig) {
 		for _, sigFile := range viper.GetStringSlice(CfgPolicySigFile) {
-			policySigBytes, err := ioutil.ReadFile(sigFile)
+			policySigBytes, err := os.ReadFile(sigFile)
 			if err != nil {
 				return err
 			}
@@ -334,7 +357,7 @@ func verifyPolicyFromFlags() error {
 				return err
 			}
 
-			if !s.Verify(kmApi.PolicySGXSignatureContext, policyBytes) {
+			if !s.Verify(secrets.PolicySGXSignatureContext, policyBytes) {
 				return errors.New("signature is not valid for given policy")
 			}
 		}
@@ -343,9 +366,9 @@ func verifyPolicyFromFlags() error {
 	return nil
 }
 
-/// unmarshalPolicyChor checks whether given CBOR is a valid kmApi.PolicySGX struct.
-func unmarshalPolicyCBOR(pb []byte) (*kmApi.PolicySGX, error) {
-	var p *kmApi.PolicySGX = &kmApi.PolicySGX{}
+// unmarshalPolicyCBOR checks whether given CBOR is a valid secrets.PolicySGX struct.
+func unmarshalPolicyCBOR(pb []byte) (*secrets.PolicySGX, error) {
+	p := &secrets.PolicySGX{}
 	if err := cbor.Unmarshal(pb, p); err != nil {
 		return nil, err
 	}
@@ -359,12 +382,12 @@ func unmarshalPolicyCBOR(pb []byte) (*kmApi.PolicySGX, error) {
 	return p, nil
 }
 
-func doInitStatus(cmd *cobra.Command, args []string) {
+func doInitStatus(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
 
-	s, err := statusFromFlags()
+	status, err := statusFromFlags()
 	if err != nil {
 		logger.Error("failed to generate status",
 			"err", err,
@@ -372,8 +395,14 @@ func doInitStatus(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	c, _ := json.Marshal(s)
-	if err = ioutil.WriteFile(viper.GetString(CfgStatusFile), c, 0o644); err != nil { // nolint: gosec
+	prettyStatus, err := cmdCommon.PrettyJSONMarshal(status)
+	if err != nil {
+		logger.Error("failed to get pretty JSON of key manager status",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	if err = os.WriteFile(viper.GetString(CfgStatusFile), prettyStatus, 0o644); err != nil { // nolint: gosec
 		logger.Error("failed to write key manager status json file",
 			"err", err,
 			"CfgStatusFile", viper.GetString(CfgStatusFile),
@@ -382,23 +411,23 @@ func doInitStatus(cmd *cobra.Command, args []string) {
 	}
 
 	logger.Info("generated key manager status file",
-		"Status.ID", s.ID,
+		"Status.ID", status.ID,
 	)
 }
 
-func doGenUpdate(cmd *cobra.Command, args []string) {
+func doGenUpdate(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
 
-	cmdConsensus.InitGenesis()
+	genesis := cmdConsensus.InitGenesis()
 	cmdConsensus.AssertTxFileOK()
 
 	// Assemble the SignedPolicySGX from the policy document and detached
 	// signatures.
-	var signedPolicy kmApi.SignedPolicySGX
+	var signedPolicy secrets.SignedPolicySGX
 
-	policyBytes, err := ioutil.ReadFile(viper.GetString(CfgPolicyFile))
+	policyBytes, err := os.ReadFile(viper.GetString(CfgPolicyFile))
 	if err != nil {
 		logger.Error("failed to read policy file",
 			"err", err,
@@ -414,7 +443,7 @@ func doGenUpdate(cmd *cobra.Command, args []string) {
 
 	for _, sigFile := range viper.GetStringSlice(CfgPolicySigFile) {
 		var policySigBytes []byte
-		if policySigBytes, err = ioutil.ReadFile(sigFile); err != nil {
+		if policySigBytes, err = os.ReadFile(sigFile); err != nil {
 			logger.Error("failed to read signature file",
 				"err", err,
 				"sig_file", sigFile,
@@ -434,7 +463,7 @@ func doGenUpdate(cmd *cobra.Command, args []string) {
 	}
 
 	// Validate the SignedPolicySGX.
-	if err = kmApi.SanityCheckSignedPolicySGX(nil, &signedPolicy); err != nil {
+	if err = secrets.SanityCheckSignedPolicySGX(nil, &signedPolicy); err != nil {
 		logger.Error("failed to validate SignedPolicySGX",
 			"err", err,
 		)
@@ -443,11 +472,11 @@ func doGenUpdate(cmd *cobra.Command, args []string) {
 
 	// Build, sign, and write the UpdatePolicy transaction.
 	nonce, fee := cmdConsensus.GetTxNonceAndFee()
-	tx := kmApi.NewUpdatePolicyTx(nonce, fee, &signedPolicy)
-	cmdConsensus.SignAndSaveTx(context.Background(), tx)
+	tx := secrets.NewUpdatePolicyTx(nonce, fee, &signedPolicy)
+	cmdConsensus.SignAndSaveTx(cmdContext.GetCtxWithGenesisInfo(genesis), tx, nil)
 }
 
-func statusFromFlags() (*kmApi.Status, error) {
+func statusFromFlags() (*secrets.Status, error) {
 	var id common.Namespace
 	if err := id.UnmarshalHex(viper.GetString(CfgStatusID)); err != nil {
 		logger.Error("failed to parse key manager status ID",
@@ -458,9 +487,9 @@ func statusFromFlags() (*kmApi.Status, error) {
 	}
 
 	// Unmarshal KM policy and its signatures.
-	var signedPolicy *kmApi.SignedPolicySGX
+	var signedPolicy *secrets.SignedPolicySGX
 	if viper.GetString(CfgPolicyFile) != "" {
-		pb, err := ioutil.ReadFile(viper.GetString(CfgPolicyFile))
+		pb, err := os.ReadFile(viper.GetString(CfgPolicyFile))
 		if err != nil {
 			return nil, err
 		}
@@ -469,12 +498,12 @@ func statusFromFlags() (*kmApi.Status, error) {
 		if err != nil {
 			return nil, err
 		}
-		signedPolicy = &kmApi.SignedPolicySGX{
+		signedPolicy = &secrets.SignedPolicySGX{
 			Policy: *p,
 		}
 
 		for _, sigFile := range viper.GetStringSlice(CfgPolicySigFile) {
-			sigBytes, err := ioutil.ReadFile(sigFile)
+			sigBytes, err := os.ReadFile(sigFile)
 			if err != nil {
 				return nil, err
 			}
@@ -495,8 +524,8 @@ func statusFromFlags() (*kmApi.Status, error) {
 		if err != nil {
 			return nil, err
 		}
-		if len(checksum) != kmApi.ChecksumSize {
-			return nil, fmt.Errorf("checksum %x is not %d bytes long", checksum, kmApi.ChecksumSize)
+		if len(checksum) != secrets.ChecksumSize {
+			return nil, fmt.Errorf("checksum %x is not %d bytes long", checksum, secrets.ChecksumSize)
 		}
 	}
 
@@ -508,12 +537,26 @@ func statusFromFlags() (*kmApi.Status, error) {
 		return nil, fmt.Errorf("%s is true, but %s is not provided", CfgStatusInitialized, CfgStatusChecksum)
 	}
 
-	return &kmApi.Status{
+	var rsk *signature.PublicKey
+	if viper.GetString(CfgStatusRSK) != "" {
+		var decodedRsk signature.PublicKey
+		if err := decodedRsk.UnmarshalText([]byte(viper.GetString(CfgStatusRSK))); err != nil {
+			return nil, err
+		}
+		rsk = &decodedRsk
+	}
+
+	if viper.GetString(CfgStatusRSK) != "" && !viper.GetBool(CfgStatusInitialized) {
+		return nil, fmt.Errorf("%s provided, but %s is false", CfgStatusRSK, CfgStatusInitialized)
+	}
+
+	return &secrets.Status{
 		ID:            id,
 		IsInitialized: viper.GetBool(CfgStatusInitialized),
 		IsSecure:      viper.GetBool(CfgStatusSecure),
 		Checksum:      checksum,
 		Policy:        signedPolicy,
+		RSK:           rsk,
 	}, nil
 }
 
@@ -524,6 +567,7 @@ func registerKMInitPolicyFlags(cmd *cobra.Command) {
 		cmd.Flags().String(CfgPolicyEnclaveID, "", "512-bit Key Manager Enclave ID in hex (concatenated MRENCLAVE and MRSIGNER). Multiple Enclave IDs with corresponding permissions can be provided respectively.")
 		cmd.Flags().StringSlice(CfgPolicyMayReplicate, []string{}, "enclave_id1,enclave_id2... list of new enclaves which are allowed to access the master secret. Requires "+CfgPolicyEnclaveID)
 		cmd.Flags().StringToString(CfgPolicyMayQuery, map[string]string{}, "runtime_id=enclave_id1,enclave_id2... sets enclave query permission for runtime_id. Requires "+CfgPolicyEnclaveID)
+		cmd.Flags().Uint64(CfgPolicyMasterSecretRotationInterval, 0, "master secret rotation interval")
 	}
 
 	cmd.Flags().AddFlagSet(policyFileFlag)
@@ -541,6 +585,7 @@ func registerKMInitPolicyFlags(cmd *cobra.Command) {
 		CfgPolicyEnclaveID,
 		CfgPolicyMayReplicate,
 		CfgPolicyMayQuery,
+		CfgPolicyMasterSecretRotationInterval,
 	} {
 		_ = viper.BindPFlag(v, cmd.Flags().Lookup(v))
 	}
@@ -588,6 +633,7 @@ func registerKMInitStatusFlags(cmd *cobra.Command) {
 		cmd.Flags().Bool(CfgStatusInitialized, false, "is key manager done initializing. Requires "+CfgStatusChecksum)
 		cmd.Flags().Bool(CfgStatusSecure, false, "is key manager secure")
 		cmd.Flags().String(CfgStatusChecksum, "", "key manager's master secret verification checksum in hex. Requires "+CfgStatusInitialized)
+		cmd.Flags().String(CfgStatusRSK, "", "key manager's runtime signing key in base64. Requires "+CfgStatusInitialized)
 	}
 
 	cmd.Flags().AddFlagSet(policyFileFlag)
@@ -605,6 +651,7 @@ func registerKMInitStatusFlags(cmd *cobra.Command) {
 		CfgStatusInitialized,
 		CfgStatusSecure,
 		CfgStatusChecksum,
+		CfgStatusRSK,
 	} {
 		_ = viper.BindPFlag(v, cmd.Flags().Lookup(v))
 	}
@@ -612,8 +659,8 @@ func registerKMInitStatusFlags(cmd *cobra.Command) {
 
 // Register registers the keymanager sub-command and all of it's children.
 func Register(parentCmd *cobra.Command) {
-	policyFileFlag.String(CfgPolicyFile, policyFilename, "file name of policy in CBOR format")
-	policySigFileFlag.StringSlice(CfgPolicySigFile, []string{policyFilename + ".sign"}, "file name(s) containing policy signature")
+	policyFileFlag.String(CfgPolicyFile, "", "file name of policy in CBOR format")
+	policySigFileFlag.StringSlice(CfgPolicySigFile, []string{}, "file name(s) containing policy signature")
 
 	_ = viper.BindPFlags(policyFileFlag)
 	_ = viper.BindPFlags(policySigFileFlag)

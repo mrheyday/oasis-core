@@ -11,34 +11,37 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
 )
 
+// labelCall is the label for the call method.
+const labelCall = "call"
+
 var (
 	storageFailures = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "oasis_storage_failures",
 			Help: "Number of storage failures.",
 		},
-		[]string{"call"},
+		[]string{labelCall},
 	)
 	storageCalls = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "oasis_storage_successes",
 			Help: "Number of storage successes.",
 		},
-		[]string{"call"},
+		[]string{labelCall},
 	)
 	storageLatency = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
 			Name: "oasis_storage_latency",
 			Help: "Storage call latency (seconds).",
 		},
-		[]string{"call"},
+		[]string{labelCall},
 	)
 	storageValueSize = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
 			Name: "oasis_storage_value_size",
 			Help: "Storage call value size (bytes).",
 		},
-		[]string{"call"},
+		[]string{labelCall},
 	)
 
 	storageCollectors = []prometheus.Collector{
@@ -48,14 +51,11 @@ var (
 		storageValueSize,
 	}
 
-	labelApply           = prometheus.Labels{"call": "apply"}
-	labelApplyBatch      = prometheus.Labels{"call": "apply_batch"}
-	labelSyncGet         = prometheus.Labels{"call": "sync_get"}
-	labelSyncGetPrefixes = prometheus.Labels{"call": "sync_get_prefixes"}
-	labelSyncIterate     = prometheus.Labels{"call": "sync_iterate"}
-
-	_ LocalBackend  = (*metricsWrapper)(nil)
-	_ ClientBackend = (*metricsWrapper)(nil)
+	labelApply           = prometheus.Labels{labelCall: "apply"}
+	labelSyncGet         = prometheus.Labels{labelCall: "sync_get"}
+	labelSyncGetPrefixes = prometheus.Labels{labelCall: "sync_get_prefixes"}
+	labelSyncIterate     = prometheus.Labels{labelCall: "sync_iterate"}
+	labelGetDiff         = prometheus.Labels{labelCall: "get_diff"}
 
 	metricsOnce sync.Once
 )
@@ -64,58 +64,17 @@ type metricsWrapper struct {
 	Backend
 }
 
-func (w *metricsWrapper) GetConnectedNodes() []*node.Node {
-	if clientBackend, ok := w.Backend.(ClientBackend); ok {
-		return clientBackend.GetConnectedNodes()
-	}
-	return []*node.Node{}
-}
-
-func (w *metricsWrapper) EnsureCommitteeVersion(ctx context.Context, version int64) error {
-	if clientBackend, ok := w.Backend.(ClientBackend); ok {
-		return clientBackend.EnsureCommitteeVersion(ctx, version)
-	}
-	return ErrUnsupported
-}
-
-func (w *metricsWrapper) Apply(ctx context.Context, request *ApplyRequest) ([]*Receipt, error) {
+func (w *metricsWrapper) GetDiff(ctx context.Context, request *GetDiffRequest) (WriteLogIterator, error) {
 	start := time.Now()
-	receipts, err := w.Backend.Apply(ctx, request)
-	storageLatency.With(labelApply).Observe(time.Since(start).Seconds())
-
-	var size int
-	for _, entry := range request.WriteLog {
-		size += len(entry.Key) + len(entry.Value)
-	}
-	storageValueSize.With(labelApply).Observe(float64(size))
+	it, err := w.Backend.GetDiff(ctx, request)
+	storageLatency.With(labelGetDiff).Observe(time.Since(start).Seconds())
 	if err != nil {
-		storageFailures.With(labelApply).Inc()
+		storageFailures.With(labelGetDiff).Inc()
 		return nil, err
 	}
 
-	storageCalls.With(labelApply).Inc()
-	return receipts, err
-}
-
-func (w *metricsWrapper) ApplyBatch(ctx context.Context, request *ApplyBatchRequest) ([]*Receipt, error) {
-	start := time.Now()
-	receipts, err := w.Backend.ApplyBatch(ctx, request)
-	storageLatency.With(labelApplyBatch).Observe(time.Since(start).Seconds())
-
-	var size int
-	for _, op := range request.Ops {
-		for _, entry := range op.WriteLog {
-			size += len(entry.Key) + len(entry.Value)
-		}
-	}
-	storageValueSize.With(labelApplyBatch).Observe(float64(size))
-	if err != nil {
-		storageFailures.With(labelApplyBatch).Inc()
-		return nil, err
-	}
-
-	storageCalls.With(labelApplyBatch).Inc()
-	return receipts, err
+	storageCalls.With(labelGetDiff).Inc()
+	return it, err
 }
 
 func (w *metricsWrapper) SyncGet(ctx context.Context, request *GetRequest) (*ProofResponse, error) {
@@ -157,28 +116,62 @@ func (w *metricsWrapper) SyncIterate(ctx context.Context, request *IterateReques
 	return res, err
 }
 
-func (w *metricsWrapper) Checkpointer() checkpoint.CreateRestorer {
-	localBackend, ok := w.Backend.(LocalBackend)
-	if !ok {
-		return nil
-	}
-	return localBackend.Checkpointer()
+type localMetricsWrapper struct {
+	metricsWrapper
 }
 
-func (w *metricsWrapper) NodeDB() NodeDB {
-	localBackend, ok := w.Backend.(LocalBackend)
-	if !ok {
-		return nil
+func (w *metricsWrapper) Apply(ctx context.Context, request *ApplyRequest) error {
+	start := time.Now()
+	err := w.Backend.(LocalBackend).Apply(ctx, request)
+	storageLatency.With(labelApply).Observe(time.Since(start).Seconds())
+
+	var size int
+	for _, entry := range request.WriteLog {
+		size += len(entry.Key) + len(entry.Value)
 	}
-	return localBackend.NodeDB()
+	storageValueSize.With(labelApply).Observe(float64(size))
+	if err != nil {
+		storageFailures.With(labelApply).Inc()
+		return err
+	}
+
+	storageCalls.With(labelApply).Inc()
+	return nil
 }
 
-func NewMetricsWrapper(base Backend) LocalBackend {
+func (w *localMetricsWrapper) Checkpointer() checkpoint.CreateRestorer {
+	return w.Backend.(LocalBackend).Checkpointer()
+}
+
+func (w *localMetricsWrapper) NodeDB() NodeDB {
+	return w.Backend.(LocalBackend).NodeDB()
+}
+
+type clientMetricsWrapper struct {
+	metricsWrapper
+}
+
+func (w *clientMetricsWrapper) GetConnectedNodes() []*node.Node {
+	return w.Backend.(ClientBackend).GetConnectedNodes()
+}
+
+func (w *clientMetricsWrapper) EnsureCommitteeVersion(ctx context.Context, version int64) error {
+	return w.Backend.(ClientBackend).EnsureCommitteeVersion(ctx, version)
+}
+
+func NewMetricsWrapper(base Backend) Backend {
 	metricsOnce.Do(func() {
 		prometheus.MustRegister(storageCollectors...)
 	})
 
-	w := &metricsWrapper{Backend: base}
+	w := metricsWrapper{Backend: base}
 
-	return w
+	switch base.(type) {
+	case LocalBackend:
+		return &localMetricsWrapper{w}
+	case ClientBackend:
+		return &clientMetricsWrapper{w}
+	default:
+		return &w
+	}
 }

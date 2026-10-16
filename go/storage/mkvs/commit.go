@@ -65,6 +65,7 @@ func (t *tree) commitWithHooks(
 	if oldRoot.IsEmpty() {
 		oldRoot.Namespace = namespace
 		oldRoot.Version = version
+		oldRoot.Type = t.rootType
 	}
 
 	var batch db.Batch
@@ -82,13 +83,8 @@ func (t *tree) commitWithHooks(
 	}
 	defer batch.Reset()
 
-	subtree := batch.MaybeStartSubtree(nil, 0, t.cache.pendingRoot)
-
-	rootHash, err := doCommit(ctx, t.cache, batch, subtree, 0, t.cache.pendingRoot, &version)
+	rootHash, err := doCommit(ctx, t.cache, batch, t.cache.pendingRoot, nil)
 	if err != nil {
-		return nil, hash.Hash{}, err
-	}
-	if err := subtree.Commit(); err != nil {
 		return nil, hash.Hash{}, err
 	}
 
@@ -110,7 +106,7 @@ func (t *tree) commitWithHooks(
 		}
 
 		log = append(log, writelog.LogEntry{Key: entry.key, Value: entry.value})
-		if len(entry.value) == 0 {
+		if entry.value == nil {
 			logAnns = append(logAnns, writelog.LogEntryAnnotation{InsertedNode: nil})
 		} else {
 			logAnns = append(logAnns, writelog.LogEntryAnnotation{InsertedNode: entry.insertedLeaf})
@@ -124,6 +120,7 @@ func (t *tree) commitWithHooks(
 	root := node.Root{
 		Namespace: namespace,
 		Version:   version,
+		Type:      oldRoot.Type,
 		Hash:      rootHash,
 	}
 	if err := batch.PutWriteLog(log, logAnns); err != nil {
@@ -154,20 +151,19 @@ func doCommit(
 	ctx context.Context,
 	cache *cache,
 	batch db.Batch,
-	subtree db.Subtree,
-	depth node.Depth,
 	ptr *node.Pointer,
-	version *uint64,
-) (h hash.Hash, err error) {
+	parent *node.Pointer,
+) (hash.Hash, error) {
 	if ptr == nil {
+		var h hash.Hash
 		h.Empty()
-		return
-	} else if ptr.Clean {
-		if err = subtree.VisitCleanNode(depth, ptr); err != nil {
-			return
+		return h, nil
+	}
+	if ptr.Clean {
+		if err := batch.VisitCleanNode(ptr, parent); err != nil {
+			return hash.Hash{}, err
 		}
-		h = ptr.Hash
-		return
+		return ptr.Hash, nil
 	}
 
 	// Pointer is not clean, we need to perform some hash computations.
@@ -187,31 +183,26 @@ func doCommit(
 			panic("mkvs: non-clean pointer has clean node")
 		}
 
+		if err := batch.VisitDirtyNode(ptr, parent); err != nil {
+			return hash.Hash{}, err
+		}
+
 		// Commit internal leaf (considered to be on the same depth as the internal node).
-		if _, err = doCommit(ctx, cache, batch, subtree, depth, n.LeafNode, version); err != nil {
-			return
+		if _, err := doCommit(ctx, cache, batch, n.LeafNode, ptr); err != nil {
+			return hash.Hash{}, err
 		}
 
 		for _, subNode := range []*node.Pointer{n.Left, n.Right} {
-			newSubtree := batch.MaybeStartSubtree(subtree, depth+1, subNode)
-			if _, err = doCommit(ctx, cache, batch, newSubtree, depth+1, subNode, version); err != nil {
-				return
-			}
-			if newSubtree != subtree {
-				if err = newSubtree.Commit(); err != nil {
-					return
-				}
+			if _, err := doCommit(ctx, cache, batch, subNode, ptr); err != nil {
+				return hash.Hash{}, err
 			}
 		}
 
-		if version != nil {
-			n.Version = *version
-		}
 		n.UpdateHash()
 
 		// Store the node.
-		if err = subtree.PutNode(depth, ptr); err != nil {
-			return
+		if err := batch.PutNode(ptr); err != nil {
+			return hash.Hash{}, err
 		}
 
 		batch.OnCommit(func() {
@@ -224,14 +215,15 @@ func doCommit(
 			panic("mkvs: non-clean pointer has clean node")
 		}
 
-		if version != nil {
-			n.Version = *version
+		if err := batch.VisitDirtyNode(ptr, parent); err != nil {
+			return hash.Hash{}, err
 		}
+
 		n.UpdateHash()
 
 		// Store the node.
-		if err = subtree.PutNode(depth, ptr); err != nil {
-			return
+		if err := batch.PutNode(ptr); err != nil {
+			return hash.Hash{}, err
 		}
 
 		batch.OnCommit(func() {
@@ -245,6 +237,6 @@ func doCommit(
 		// Make node eligible for eviction.
 		cache.commitNode(ptr)
 	})
-	h = ptr.Hash
-	return
+
+	return ptr.Hash, nil
 }

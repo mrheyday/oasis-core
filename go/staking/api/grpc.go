@@ -15,25 +15,37 @@ var (
 	serviceName = cmnGrpc.NewServiceName("Staking")
 
 	// methodTokenSymbol is the TokenSymbol method.
-	methodTokenSymbol = serviceName.NewMethod("TokenSymbol", nil)
+	methodTokenSymbol = serviceName.NewMethod("TokenSymbol", int64(0))
 	// methodTokenValueExponent is the TokenValueExponent method.
-	methodTokenValueExponent = serviceName.NewMethod("TokenValueExponent", nil)
+	methodTokenValueExponent = serviceName.NewMethod("TokenValueExponent", int64(0))
 	// methodTotalSupply is the TotalSupply method.
 	methodTotalSupply = serviceName.NewMethod("TotalSupply", int64(0))
 	// methodCommonPool is the CommonPool method.
 	methodCommonPool = serviceName.NewMethod("CommonPool", int64(0))
 	// methodLastBlockFees is the LastBlockFees method.
 	methodLastBlockFees = serviceName.NewMethod("LastBlockFees", int64(0))
+	// methodGovernanceDeposits is the GovernanceDeposits method.
+	methodGovernanceDeposits = serviceName.NewMethod("GovernanceDeposits", int64(0))
 	// methodThreshold is the Threshold method.
 	methodThreshold = serviceName.NewMethod("Threshold", ThresholdQuery{})
 	// methodAddresses is the Addresses method.
 	methodAddresses = serviceName.NewMethod("Addresses", int64(0))
+	// methodCommissionScheduleAddresses is the CommissionScheduleAddresses method.
+	methodCommissionScheduleAddresses = serviceName.NewMethod("CommissionScheduleAddresses", int64(0))
 	// methodAccount is the Account method.
 	methodAccount = serviceName.NewMethod("Account", OwnerQuery{})
-	// methodDelegations is the Delegations method.
-	methodDelegations = serviceName.NewMethod("Delegations", OwnerQuery{})
-	// methodDebondingDelegations is the DebondingDelegations method.
-	methodDebondingDelegations = serviceName.NewMethod("DebondingDelegations", OwnerQuery{})
+	// methodDelegationsFor is the DelegationsFor method.
+	methodDelegationsFor = serviceName.NewMethod("DelegationsFor", OwnerQuery{})
+	// methodDelegationInfosFor is the DelegationInfosFor method.
+	methodDelegationInfosFor = serviceName.NewMethod("DelegationInfosFor", OwnerQuery{})
+	// methodDelegationsTo is the DelegationsTo method.
+	methodDelegationsTo = serviceName.NewMethod("DelegationsTo", OwnerQuery{})
+	// methodDebondingDelegationsFor is the DebondingDelegationsFor method.
+	methodDebondingDelegationsFor = serviceName.NewMethod("DebondingDelegationsFor", OwnerQuery{})
+	// methodDebondingDelegationInfosFor is the DebondingDelegationInfosFor method.
+	methodDebondingDelegationInfosFor = serviceName.NewMethod("DebondingDelegationInfosFor", OwnerQuery{})
+	// methodDebondingDelegationsTo is the DebondingDelegationsTo method.
+	methodDebondingDelegationsTo = serviceName.NewMethod("DebondingDelegationsTo", OwnerQuery{})
 	// methodAllowance is the Allowance method.
 	methodAllowance = serviceName.NewMethod("Allowance", AllowanceQuery{})
 	// methodStateToGenesis is the StateToGenesis method.
@@ -72,6 +84,10 @@ var (
 				Handler:    handlerLastBlockFees,
 			},
 			{
+				MethodName: methodGovernanceDeposits.ShortName(),
+				Handler:    handlerGovernanceDeposits,
+			},
+			{
 				MethodName: methodThreshold.ShortName(),
 				Handler:    handlerThreshold,
 			},
@@ -80,16 +96,36 @@ var (
 				Handler:    handlerAddresses,
 			},
 			{
+				MethodName: methodCommissionScheduleAddresses.ShortName(),
+				Handler:    handlerCommissionScheduleAddresses,
+			},
+			{
 				MethodName: methodAccount.ShortName(),
 				Handler:    handlerAccount,
 			},
 			{
-				MethodName: methodDelegations.ShortName(),
-				Handler:    handlerDelegations,
+				MethodName: methodDelegationsFor.ShortName(),
+				Handler:    handlerDelegationsFor,
 			},
 			{
-				MethodName: methodDebondingDelegations.ShortName(),
-				Handler:    handlerDebondingDelegations,
+				MethodName: methodDelegationInfosFor.ShortName(),
+				Handler:    handlerDelegationInfosFor,
+			},
+			{
+				MethodName: methodDelegationsTo.ShortName(),
+				Handler:    handlerDelegationsTo,
+			},
+			{
+				MethodName: methodDebondingDelegationsFor.ShortName(),
+				Handler:    handlerDebondingDelegationsFor,
+			},
+			{
+				MethodName: methodDebondingDelegationInfosFor.ShortName(),
+				Handler:    handlerDebondingDelegationInfosFor,
+			},
+			{
+				MethodName: methodDebondingDelegationsTo.ShortName(),
+				Handler:    handlerDebondingDelegationsTo,
 			},
 			{
 				MethodName: methodAllowance.ShortName(),
@@ -118,50 +154,58 @@ var (
 	}
 )
 
-func handlerTokenSymbol( // nolint: golint
-	srv interface{},
+func handlerTokenSymbol(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
+	var height int64
+	if err := dec(&height); err != nil {
+		return nil, err
+	}
 	if interceptor == nil {
-		return srv.(Backend).TokenSymbol(ctx)
+		return srv.(Backend).TokenSymbol(ctx, height)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
 		FullMethod: methodTokenSymbol.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(Backend).TokenSymbol(ctx)
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).TokenSymbol(ctx, req.(int64))
 	}
-	return interceptor(ctx, nil, info, handler)
+	return interceptor(ctx, height, info, handler)
 }
 
-func handlerTokenValueExponent( // nolint: golint
-	srv interface{},
+func handlerTokenValueExponent(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
+	var height int64
+	if err := dec(&height); err != nil {
+		return nil, err
+	}
 	if interceptor == nil {
-		return srv.(Backend).TokenValueExponent(ctx)
+		return srv.(Backend).TokenValueExponent(ctx, height)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
 		FullMethod: methodTokenValueExponent.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(Backend).TokenValueExponent(ctx)
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).TokenValueExponent(ctx, req.(int64))
 	}
-	return interceptor(ctx, nil, info, handler)
+	return interceptor(ctx, height, info, handler)
 }
 
-func handlerTotalSupply( // nolint: golint
-	srv interface{},
+func handlerTotalSupply(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -173,18 +217,18 @@ func handlerTotalSupply( // nolint: golint
 		Server:     srv,
 		FullMethod: methodTotalSupply.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).TotalSupply(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerCommonPool( // nolint: golint
-	srv interface{},
+func handlerCommonPool(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -196,18 +240,18 @@ func handlerCommonPool( // nolint: golint
 		Server:     srv,
 		FullMethod: methodCommonPool.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).CommonPool(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerLastBlockFees( // nolint: golint
-	srv interface{},
+func handlerLastBlockFees(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -219,18 +263,41 @@ func handlerLastBlockFees( // nolint: golint
 		Server:     srv,
 		FullMethod: methodLastBlockFees.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).LastBlockFees(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerThreshold( // nolint: golint
-	srv interface{},
+func handlerGovernanceDeposits(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
+	var height int64
+	if err := dec(&height); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).GovernanceDeposits(ctx, height)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodGovernanceDeposits.FullName(),
+	}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).GovernanceDeposits(ctx, req.(int64))
+	}
+	return interceptor(ctx, height, info, handler)
+}
+
+func handlerThreshold(
+	srv any,
+	ctx context.Context,
+	dec func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
 	var query ThresholdQuery
 	if err := dec(&query); err != nil {
 		return nil, err
@@ -242,18 +309,18 @@ func handlerThreshold( // nolint: golint
 		Server:     srv,
 		FullMethod: methodThreshold.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).Threshold(ctx, req.(*ThresholdQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerAddresses( // nolint: golint
-	srv interface{},
+func handlerAddresses(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -265,18 +332,41 @@ func handlerAddresses( // nolint: golint
 		Server:     srv,
 		FullMethod: methodAddresses.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).Addresses(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerAccount( // nolint: golint
-	srv interface{},
+func handlerCommissionScheduleAddresses(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
+	var height int64
+	if err := dec(&height); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).CommissionScheduleAddresses(ctx, height)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodCommissionScheduleAddresses.FullName(),
+	}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).CommissionScheduleAddresses(ctx, req.(int64))
+	}
+	return interceptor(ctx, height, info, handler)
+}
+
+func handlerAccount(
+	srv any,
+	ctx context.Context,
+	dec func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
 	var query OwnerQuery
 	if err := dec(&query); err != nil {
 		return nil, err
@@ -288,64 +378,156 @@ func handlerAccount( // nolint: golint
 		Server:     srv,
 		FullMethod: methodAccount.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).Account(ctx, req.(*OwnerQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerDelegations( // nolint: golint
-	srv interface{},
+func handlerDelegationsFor(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var query OwnerQuery
 	if err := dec(&query); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(Backend).Delegations(ctx, &query)
+		return srv.(Backend).DelegationsFor(ctx, &query)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: methodDelegations.FullName(),
+		FullMethod: methodDelegationsFor.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(Backend).Delegations(ctx, req.(*OwnerQuery))
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).DelegationsFor(ctx, req.(*OwnerQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerDebondingDelegations( // nolint: golint
-	srv interface{},
+func handlerDelegationInfosFor(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var query OwnerQuery
 	if err := dec(&query); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(Backend).DebondingDelegations(ctx, &query)
+		return srv.(Backend).DelegationInfosFor(ctx, &query)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: methodDebondingDelegations.FullName(),
+		FullMethod: methodDelegationInfosFor.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(Backend).DebondingDelegations(ctx, req.(*OwnerQuery))
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).DelegationInfosFor(ctx, req.(*OwnerQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerAllowance( // nolint: golint
-	srv interface{},
+func handlerDelegationsTo(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
+	var query OwnerQuery
+	if err := dec(&query); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).DelegationsTo(ctx, &query)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodDelegationsTo.FullName(),
+	}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).DelegationsTo(ctx, req.(*OwnerQuery))
+	}
+	return interceptor(ctx, &query, info, handler)
+}
+
+func handlerDebondingDelegationsFor(
+	srv any,
+	ctx context.Context,
+	dec func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
+	var query OwnerQuery
+	if err := dec(&query); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).DebondingDelegationsFor(ctx, &query)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodDebondingDelegationsFor.FullName(),
+	}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).DebondingDelegationsFor(ctx, req.(*OwnerQuery))
+	}
+	return interceptor(ctx, &query, info, handler)
+}
+
+func handlerDebondingDelegationInfosFor(
+	srv any,
+	ctx context.Context,
+	dec func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
+	var query OwnerQuery
+	if err := dec(&query); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).DebondingDelegationInfosFor(ctx, &query)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodDebondingDelegationInfosFor.FullName(),
+	}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).DebondingDelegationInfosFor(ctx, req.(*OwnerQuery))
+	}
+	return interceptor(ctx, &query, info, handler)
+}
+
+func handlerDebondingDelegationsTo(
+	srv any,
+	ctx context.Context,
+	dec func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
+	var query OwnerQuery
+	if err := dec(&query); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).DebondingDelegationsTo(ctx, &query)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodDebondingDelegationsTo.FullName(),
+	}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).DebondingDelegationsTo(ctx, req.(*OwnerQuery))
+	}
+	return interceptor(ctx, &query, info, handler)
+}
+
+func handlerAllowance(
+	srv any,
+	ctx context.Context,
+	dec func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
 	var query AllowanceQuery
 	if err := dec(&query); err != nil {
 		return nil, err
@@ -357,18 +539,18 @@ func handlerAllowance( // nolint: golint
 		Server:     srv,
 		FullMethod: methodAllowance.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).Allowance(ctx, req.(*AllowanceQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerStateToGenesis( // nolint: golint
-	srv interface{},
+func handlerStateToGenesis(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -380,18 +562,18 @@ func handlerStateToGenesis( // nolint: golint
 		Server:     srv,
 		FullMethod: methodStateToGenesis.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).StateToGenesis(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerConsensusParameters( // nolint: golint
-	srv interface{},
+func handlerConsensusParameters(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -403,18 +585,18 @@ func handlerConsensusParameters( // nolint: golint
 		Server:     srv,
 		FullMethod: methodConsensusParameters.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).ConsensusParameters(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerGetEvents( // nolint: golint
-	srv interface{},
+func handlerGetEvents(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -426,13 +608,13 @@ func handlerGetEvents( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetEvents.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetEvents(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerWatchEvents(srv interface{}, stream grpc.ServerStream) error {
+func handlerWatchEvents(srv any, stream grpc.ServerStream) error {
 	if err := stream.RecvMsg(nil); err != nil {
 		return err
 	}
@@ -465,27 +647,35 @@ func RegisterService(server *grpc.Server, service Backend) {
 	server.RegisterService(&serviceDesc, service)
 }
 
-type stakingClient struct {
+// Client is a gRPC staking client.
+type Client struct {
 	conn *grpc.ClientConn
 }
 
-func (c *stakingClient) TokenSymbol(ctx context.Context) (string, error) {
+// NewClient creates a new gRPC staking client.
+func NewClient(c *grpc.ClientConn) *Client {
+	return &Client{
+		conn: c,
+	}
+}
+
+func (c *Client) TokenSymbol(ctx context.Context, height int64) (string, error) {
 	var rsp string
-	if err := c.conn.Invoke(ctx, methodTokenSymbol.FullName(), nil, &rsp); err != nil {
+	if err := c.conn.Invoke(ctx, methodTokenSymbol.FullName(), height, &rsp); err != nil {
 		return "", err
 	}
 	return rsp, nil
 }
 
-func (c *stakingClient) TokenValueExponent(ctx context.Context) (uint8, error) {
+func (c *Client) TokenValueExponent(ctx context.Context, height int64) (uint8, error) {
 	var rsp uint8
-	if err := c.conn.Invoke(ctx, methodTokenValueExponent.FullName(), nil, &rsp); err != nil {
+	if err := c.conn.Invoke(ctx, methodTokenValueExponent.FullName(), height, &rsp); err != nil {
 		return 0, err
 	}
 	return rsp, nil
 }
 
-func (c *stakingClient) TotalSupply(ctx context.Context, height int64) (*quantity.Quantity, error) {
+func (c *Client) TotalSupply(ctx context.Context, height int64) (*quantity.Quantity, error) {
 	var rsp quantity.Quantity
 	if err := c.conn.Invoke(ctx, methodTotalSupply.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -493,7 +683,7 @@ func (c *stakingClient) TotalSupply(ctx context.Context, height int64) (*quantit
 	return &rsp, nil
 }
 
-func (c *stakingClient) CommonPool(ctx context.Context, height int64) (*quantity.Quantity, error) {
+func (c *Client) CommonPool(ctx context.Context, height int64) (*quantity.Quantity, error) {
 	var rsp quantity.Quantity
 	if err := c.conn.Invoke(ctx, methodCommonPool.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -501,7 +691,7 @@ func (c *stakingClient) CommonPool(ctx context.Context, height int64) (*quantity
 	return &rsp, nil
 }
 
-func (c *stakingClient) LastBlockFees(ctx context.Context, height int64) (*quantity.Quantity, error) {
+func (c *Client) LastBlockFees(ctx context.Context, height int64) (*quantity.Quantity, error) {
 	var rsp quantity.Quantity
 	if err := c.conn.Invoke(ctx, methodLastBlockFees.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -509,7 +699,15 @@ func (c *stakingClient) LastBlockFees(ctx context.Context, height int64) (*quant
 	return &rsp, nil
 }
 
-func (c *stakingClient) Threshold(ctx context.Context, query *ThresholdQuery) (*quantity.Quantity, error) {
+func (c *Client) GovernanceDeposits(ctx context.Context, height int64) (*quantity.Quantity, error) {
+	var rsp quantity.Quantity
+	if err := c.conn.Invoke(ctx, methodGovernanceDeposits.FullName(), height, &rsp); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+func (c *Client) Threshold(ctx context.Context, query *ThresholdQuery) (*quantity.Quantity, error) {
 	var rsp quantity.Quantity
 	if err := c.conn.Invoke(ctx, methodThreshold.FullName(), query, &rsp); err != nil {
 		return nil, err
@@ -517,7 +715,7 @@ func (c *stakingClient) Threshold(ctx context.Context, query *ThresholdQuery) (*
 	return &rsp, nil
 }
 
-func (c *stakingClient) Addresses(ctx context.Context, height int64) ([]Address, error) {
+func (c *Client) Addresses(ctx context.Context, height int64) ([]Address, error) {
 	var rsp []Address
 	if err := c.conn.Invoke(ctx, methodAddresses.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -525,7 +723,15 @@ func (c *stakingClient) Addresses(ctx context.Context, height int64) ([]Address,
 	return rsp, nil
 }
 
-func (c *stakingClient) Account(ctx context.Context, query *OwnerQuery) (*Account, error) {
+func (c *Client) CommissionScheduleAddresses(ctx context.Context, height int64) ([]Address, error) {
+	var rsp []Address
+	if err := c.conn.Invoke(ctx, methodCommissionScheduleAddresses.FullName(), height, &rsp); err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *Client) Account(ctx context.Context, query *OwnerQuery) (*Account, error) {
 	var rsp Account
 	if err := c.conn.Invoke(ctx, methodAccount.FullName(), query, &rsp); err != nil {
 		return nil, err
@@ -533,23 +739,55 @@ func (c *stakingClient) Account(ctx context.Context, query *OwnerQuery) (*Accoun
 	return &rsp, nil
 }
 
-func (c *stakingClient) Delegations(ctx context.Context, query *OwnerQuery) (map[Address]*Delegation, error) {
+func (c *Client) DelegationsFor(ctx context.Context, query *OwnerQuery) (map[Address]*Delegation, error) {
 	var rsp map[Address]*Delegation
-	if err := c.conn.Invoke(ctx, methodDelegations.FullName(), query, &rsp); err != nil {
+	if err := c.conn.Invoke(ctx, methodDelegationsFor.FullName(), query, &rsp); err != nil {
 		return nil, err
 	}
 	return rsp, nil
 }
 
-func (c *stakingClient) DebondingDelegations(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegation, error) {
+func (c *Client) DelegationInfosFor(ctx context.Context, query *OwnerQuery) (map[Address]*DelegationInfo, error) {
+	var rsp map[Address]*DelegationInfo
+	if err := c.conn.Invoke(ctx, methodDelegationInfosFor.FullName(), query, &rsp); err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *Client) DelegationsTo(ctx context.Context, query *OwnerQuery) (map[Address]*Delegation, error) {
+	var rsp map[Address]*Delegation
+	if err := c.conn.Invoke(ctx, methodDelegationsTo.FullName(), query, &rsp); err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *Client) DebondingDelegationsFor(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegation, error) {
 	var rsp map[Address][]*DebondingDelegation
-	if err := c.conn.Invoke(ctx, methodDebondingDelegations.FullName(), query, &rsp); err != nil {
+	if err := c.conn.Invoke(ctx, methodDebondingDelegationsFor.FullName(), query, &rsp); err != nil {
 		return nil, err
 	}
 	return rsp, nil
 }
 
-func (c *stakingClient) Allowance(ctx context.Context, query *AllowanceQuery) (*quantity.Quantity, error) {
+func (c *Client) DebondingDelegationInfosFor(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegationInfo, error) {
+	var rsp map[Address][]*DebondingDelegationInfo
+	if err := c.conn.Invoke(ctx, methodDebondingDelegationInfosFor.FullName(), query, &rsp); err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *Client) DebondingDelegationsTo(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegation, error) {
+	var rsp map[Address][]*DebondingDelegation
+	if err := c.conn.Invoke(ctx, methodDebondingDelegationsTo.FullName(), query, &rsp); err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *Client) Allowance(ctx context.Context, query *AllowanceQuery) (*quantity.Quantity, error) {
 	var rsp quantity.Quantity
 	if err := c.conn.Invoke(ctx, methodAllowance.FullName(), query, &rsp); err != nil {
 		return nil, err
@@ -557,7 +795,7 @@ func (c *stakingClient) Allowance(ctx context.Context, query *AllowanceQuery) (*
 	return &rsp, nil
 }
 
-func (c *stakingClient) StateToGenesis(ctx context.Context, height int64) (*Genesis, error) {
+func (c *Client) StateToGenesis(ctx context.Context, height int64) (*Genesis, error) {
 	var rsp Genesis
 	if err := c.conn.Invoke(ctx, methodStateToGenesis.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -565,7 +803,7 @@ func (c *stakingClient) StateToGenesis(ctx context.Context, height int64) (*Gene
 	return &rsp, nil
 }
 
-func (c *stakingClient) ConsensusParameters(ctx context.Context, height int64) (*ConsensusParameters, error) {
+func (c *Client) ConsensusParameters(ctx context.Context, height int64) (*ConsensusParameters, error) {
 	var rsp ConsensusParameters
 	if err := c.conn.Invoke(ctx, methodConsensusParameters.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -573,7 +811,7 @@ func (c *stakingClient) ConsensusParameters(ctx context.Context, height int64) (
 	return &rsp, nil
 }
 
-func (c *stakingClient) GetEvents(ctx context.Context, height int64) ([]*Event, error) {
+func (c *Client) GetEvents(ctx context.Context, height int64) ([]*Event, error) {
 	var rsp []*Event
 	if err := c.conn.Invoke(ctx, methodGetEvents.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -581,7 +819,7 @@ func (c *stakingClient) GetEvents(ctx context.Context, height int64) ([]*Event, 
 	return rsp, nil
 }
 
-func (c *stakingClient) WatchEvents(ctx context.Context) (<-chan *Event, pubsub.ClosableSubscription, error) {
+func (c *Client) WatchEvents(ctx context.Context) (<-chan *Event, pubsub.ClosableSubscription, error) {
 	ctx, sub := pubsub.NewContextSubscription(ctx)
 
 	stream, err := c.conn.NewStream(ctx, &serviceDesc.Streams[0], methodWatchEvents.FullName())
@@ -616,10 +854,5 @@ func (c *stakingClient) WatchEvents(ctx context.Context) (<-chan *Event, pubsub.
 	return ch, sub, nil
 }
 
-func (c *stakingClient) Cleanup() {
-}
-
-// NewStakingClient creates a new gRPC staking client service.
-func NewStakingClient(c *grpc.ClientConn) Backend {
-	return &stakingClient{c}
+func (c *Client) Cleanup() {
 }

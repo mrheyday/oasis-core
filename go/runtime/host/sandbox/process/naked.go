@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+
+	cmnSyscall "github.com/oasisprotocol/oasis-core/go/common/syscall"
 )
 
 type naked struct {
@@ -30,22 +32,11 @@ func (n *naked) Wait() <-chan struct{} {
 }
 
 // Implements Process.
-func (n *naked) Error() (err error) {
+func (n *naked) Error() error {
 	n.Lock()
-	err = n.err
+	err := n.err
 	n.Unlock()
-	return
-}
-
-// Implements Process.
-func (n *naked) Kill() {
-	_ = n.cmd.Process.Kill()
-	<-n.waitCh
-
-	// Some environments (lolDocker) do not have something that
-	// reaps zombie processes by default.  Kill the process group
-	// as well.
-	_ = syscall.Kill(-n.cmd.Process.Pid, syscall.SIGKILL)
+	return err
 }
 
 func (n *naked) wait() error {
@@ -88,6 +79,7 @@ func NewNaked(cfg Config) (Process, error) {
 	}
 	cmd.Stderr = cfg.Stderr
 	cmd.ExtraFiles = cfg.extraFiles
+	cmd.SysProcAttr = cmnSyscall.CmdAttrs
 
 	// Write any bound data to respective files.
 	for path, reader := range cfg.BindData {

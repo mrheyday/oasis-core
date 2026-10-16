@@ -19,9 +19,9 @@ type jobDescriptor struct {
 // Pool is a pool of goroutine workers.
 //
 // Notes:
-//  * The pool is always constructed with one active worker goroutine.
-//  * Once closed, it can not be used anymore.
-type Pool struct { // nolint: maligned
+//   - The pool is always constructed with one active worker goroutine.
+//   - Once closed, it can not be used anymore.
+type Pool struct {
 	lock        sync.Mutex
 	workerGroup sync.WaitGroup
 
@@ -53,15 +53,16 @@ func (p *Pool) Resize(newCount uint) {
 	}
 
 	if newCount < p.currentCount {
-		for i := p.currentCount; i > newCount; i-- {
+		for range p.currentCount - newCount {
 			p.jobCh.In() <- &jobDescriptor{
 				terminate: true,
 			}
 		}
-	} else if newCount > p.currentCount {
-		for i := p.currentCount; i < newCount; i++ {
-			p.workerGroup.Add(1)
-			go p.worker()
+	}
+
+	if newCount > p.currentCount {
+		for range newCount - p.currentCount {
+			p.workerGroup.Go(p.worker)
 		}
 	}
 
@@ -79,6 +80,10 @@ func (p *Pool) Stop() {
 	p.stopOnce.Do(func() {
 		close(p.stopCh)
 	})
+
+	for range p.jobCh.Out() { //nolint:revive
+		// Clear the channel to close all go routines and prevent memory leaks.
+	}
 }
 
 // Quit returns a channel that will be closed when the pool stops.
@@ -89,6 +94,13 @@ func (p *Pool) Quit() <-chan struct{} {
 // Submit adds a task to the pool's queue and returns a channel that will be closed
 // once the task is complete.
 func (p *Pool) Submit(job func()) <-chan struct{} {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if p.currentCount == 0 {
+		return nil
+	}
+
 	desc := &jobDescriptor{
 		job:        job,
 		completeCh: make(chan struct{}),
@@ -105,8 +117,6 @@ func (p *Pool) lifetimeManager() {
 }
 
 func (p *Pool) worker() {
-	defer p.workerGroup.Done()
-
 	for {
 		select {
 		case <-p.stopCh:
@@ -136,8 +146,7 @@ func New(name string) *Pool {
 		logger:       logging.GetLogger(fmt.Sprintf("workerpool/%s", name)),
 	}
 
-	pool.workerGroup.Add(1)
-	go pool.worker()
+	pool.workerGroup.Go(pool.worker)
 	go pool.lifetimeManager()
 
 	return pool

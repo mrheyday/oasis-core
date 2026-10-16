@@ -5,73 +5,120 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	"github.com/oasisprotocol/oasis-core/go/common/persistent"
 	control "github.com/oasisprotocol/oasis-core/go/control/api"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdGrpc "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/grpc"
 	upgrade "github.com/oasisprotocol/oasis-core/go/upgrade/api"
+	"github.com/oasisprotocol/oasis-core/go/worker/registration"
+)
+
+const (
+	// CmdControl is the control sub-command.
+	CmdControl = "control"
+	// CmdIsSynced is the is-synced sub-command.
+	CmdIsSynced = "is-synced"
+	// CmdWaitSync is the wait-sync sub-command.
+	CmdWaitSync = "wait-sync"
+	// CmdShutdown is the shutdown sub-command.
+	CmdShutdown = "shutdown"
+	// CmdClearDeregister is the clear-deregister sub-command.
+	CmdClearDeregister = "clear-deregister"
+	// CmdUpgradeBinary is the upgrade-binary sub-command.
+	CmdUpgradeBinary = "upgrade-binary"
+	// CmdCancelUpgrade is the cancel-upgrade sub-command.
+	CmdCancelUpgrade = "cancel-upgrade"
+	// CmdStatus is the status sub-command.
+	CmdStatus = "status"
+	// CmdRuntimeStats is the runtime-stats sub-command.
+	CmdRuntimeStats = "runtime-stats"
+	// CmdAddBundle is the add-bundle sub-command.
+	CmdAddBundle = "add-bundle"
 )
 
 var (
 	shutdownWait = false
 
 	controlCmd = &cobra.Command{
-		Use:   "control",
+		Use:   CmdControl,
 		Short: "node control interface utilities",
 	}
 
 	controlIsSyncedCmd = &cobra.Command{
-		Use:   "is-synced",
+		Use:   CmdIsSynced,
 		Short: "exit with 0 if the node completed initial syncing, 1 if not",
 		Run:   doIsSynced,
 	}
 
 	controlWaitSyncCmd = &cobra.Command{
-		Use:   "wait-sync",
+		Use:   CmdWaitSync,
 		Short: "wait for the node to complete initial syncing",
 		Run:   doWaitSync,
 	}
 
 	controlShutdownCmd = &cobra.Command{
-		Use:   "shutdown",
+		Use:   CmdShutdown,
 		Short: "request node shutdown on next epoch transition",
 		Run:   doShutdown,
 	}
 
+	controlClearDeregisterCmd = &cobra.Command{
+		Use:   CmdClearDeregister,
+		Short: "clear the forced node deregistration flag",
+		Run:   doClearDeregister,
+	}
+
 	controlUpgradeBinaryCmd = &cobra.Command{
-		Use:   "upgrade-binary <upgrade-descriptor>",
+		Use:   CmdUpgradeBinary + " <upgrade-descriptor>",
 		Short: "submit an upgrade descriptor to the node and request shutdown",
 		Args:  cobra.ExactArgs(1),
 		Run:   doUpgradeBinary,
 	}
 
 	controlCancelUpgradeCmd = &cobra.Command{
-		Use:   "cancel-upgrade",
+		Use:   CmdCancelUpgrade + " <upgrade-name>",
 		Short: "cancel a pending upgrade unless it is already in progress",
 		Run:   doCancelUpgrade,
 	}
 
 	controlStatusCmd = &cobra.Command{
-		Use:   "status",
+		Use:   CmdStatus,
 		Short: "show node status",
 		Run:   doStatus,
+	}
+
+	controlRuntimeStatsCmd = &cobra.Command{
+		Use:        CmdRuntimeStats + " <runtime-id> [<start-height> [<end-height>]]",
+		Short:      "show runtime statistics",
+		Run:        doRuntimeStats,
+		Deprecated: "use the `oasis` CLI instead.",
+	}
+
+	controlAddBundleCmd = &cobra.Command{
+		Use:   CmdAddBundle + " <path>",
+		Short: "adds runtime components from the bundle",
+		Run:   doAddBundle,
 	}
 
 	logger = logging.GetLogger("cmd/control")
 )
 
-// DoConnect connects to the runtime client grpc server.
+// DoConnect connects to the node's gRPC server.
 func DoConnect(cmd *cobra.Command) (*grpc.ClientConn, control.NodeController) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
 
+	return doConnectOnly(cmd)
+}
+
+func doConnectOnly(cmd *cobra.Command) (*grpc.ClientConn, control.NodeController) {
 	conn, err := cmdGrpc.NewClient(cmd)
 	if err != nil {
 		logger.Error("failed to establish connection with node",
@@ -85,7 +132,7 @@ func DoConnect(cmd *cobra.Command) (*grpc.ClientConn, control.NodeController) {
 	return conn, client
 }
 
-func doIsSynced(cmd *cobra.Command, args []string) {
+func doIsSynced(cmd *cobra.Command, _ []string) {
 	conn, client := DoConnect(cmd)
 	defer conn.Close()
 
@@ -102,13 +149,13 @@ func doIsSynced(cmd *cobra.Command, args []string) {
 	if synced {
 		fmt.Println("node completed initial syncing")
 		os.Exit(0)
-	} else {
-		fmt.Println("node has not completed initial syncing")
-		os.Exit(1)
 	}
+
+	fmt.Println("node has not completed initial syncing")
+	os.Exit(1)
 }
 
-func doWaitSync(cmd *cobra.Command, args []string) {
+func doWaitSync(cmd *cobra.Command, _ []string) {
 	conn, client := DoConnect(cmd)
 	defer conn.Close()
 
@@ -124,7 +171,7 @@ func doWaitSync(cmd *cobra.Command, args []string) {
 	}
 }
 
-func doShutdown(cmd *cobra.Command, args []string) {
+func doShutdown(cmd *cobra.Command, _ []string) {
 	conn, client := DoConnect(cmd)
 	defer conn.Close()
 
@@ -137,11 +184,55 @@ func doShutdown(cmd *cobra.Command, args []string) {
 	}
 }
 
+func doClearDeregister(*cobra.Command, []string) {
+	if err := cmdCommon.Init(); err != nil {
+		cmdCommon.EarlyLogAndExit(err)
+	}
+
+	dataDir := cmdCommon.DataDir()
+
+	// Sigh, there does not appear to be a "open, but do not create"
+	// badger option.  Instead, check to see if the persistent store
+	// directory exists.
+	dbPath := persistent.GetPersistentStoreDBDir(dataDir)
+	fs, err := os.Stat(dbPath)
+	if err != nil {
+		logger.Error("failed to stat persistent store directory",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	if !fs.IsDir() {
+		logger.Error("persistent store directory, is not a directory")
+		os.Exit(1)
+	}
+
+	commonStore, err := persistent.NewCommonStore(dataDir)
+	if err != nil {
+		logger.Error("failed to open common node store",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+	defer commonStore.Close()
+
+	serviceStore := commonStore.GetServiceStore(registration.DBBucketName)
+
+	if err = registration.SetForcedDeregister(serviceStore, false); err != nil {
+		logger.Error("failed to clear persisted forced-deregister",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	logger.Info("cleared persisted forced-deregister")
+}
+
 func doUpgradeBinary(cmd *cobra.Command, args []string) {
 	conn, client := DoConnect(cmd)
 	defer conn.Close()
 
-	descriptorBytes, err := ioutil.ReadFile(args[0])
+	descriptorBytes, err := os.ReadFile(args[0])
 	if err != nil {
 		logger.Error("failed to read upgrade descriptor",
 			"err", err,
@@ -157,8 +248,10 @@ func doUpgradeBinary(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	if !desc.IsValid() {
-		logger.Error("submitted upgrade descriptor is not valid")
+	if err = desc.ValidateBasic(); err != nil {
+		logger.Error("submitted upgrade descriptor is not valid",
+			"err", err,
+		)
 		os.Exit(1)
 	}
 
@@ -174,7 +267,28 @@ func doCancelUpgrade(cmd *cobra.Command, args []string) {
 	conn, client := DoConnect(cmd)
 	defer conn.Close()
 
-	err := client.CancelUpgrade(context.Background())
+	if len(args) == 0 {
+		logger.Error("expected descriptor path")
+		os.Exit(1)
+	}
+
+	descriptorBytes, err := os.ReadFile(args[0])
+	if err != nil {
+		logger.Error("failed to read upgrade descriptor",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	var desc upgrade.Descriptor
+	if err = json.Unmarshal(descriptorBytes, &desc); err != nil {
+		logger.Error("can't parse upgrade descriptor",
+			"err", err,
+		)
+		os.Exit(1)
+	}
+
+	err = client.CancelUpgrade(context.Background(), &desc)
 	if err != nil {
 		logger.Error("failed to send upgrade cancellation request",
 			"err", err,
@@ -183,11 +297,10 @@ func doCancelUpgrade(cmd *cobra.Command, args []string) {
 	}
 }
 
-func doStatus(cmd *cobra.Command, args []string) {
+// DoFetchStatus connects to the node's gRPC server and fetches its status.
+func DoFetchStatus(cmd *cobra.Command) *control.Status {
 	conn, client := DoConnect(cmd)
 	defer conn.Close()
-
-	logger.Debug("querying status")
 
 	// Use background context to block until the result comes in.
 	status, err := client.GetStatus(context.Background())
@@ -197,14 +310,37 @@ func doStatus(cmd *cobra.Command, args []string) {
 		)
 		os.Exit(128)
 	}
-	formatted, err := json.MarshalIndent(status, "", "  ")
+	return status
+}
+
+func doStatus(cmd *cobra.Command, _ []string) {
+	status := DoFetchStatus(cmd)
+
+	prettyStatus, err := cmdCommon.PrettyJSONMarshal(status)
 	if err != nil {
-		logger.Error("failed to format status",
+		logger.Error("failed to get pretty JSON of node status",
 			"err", err,
 		)
 		os.Exit(1)
 	}
-	fmt.Println(string(formatted))
+	fmt.Println(string(prettyStatus))
+}
+
+func doAddBundle(cmd *cobra.Command, args []string) {
+	if len(args) != 1 {
+		logger.Error("expected bundle path")
+		os.Exit(1)
+	}
+
+	conn, client := DoConnect(cmd)
+	defer conn.Close()
+
+	if err := client.AddBundle(context.Background(), args[0]); err != nil {
+		logger.Error("failed to add bundle",
+			"err", err,
+		)
+		os.Exit(1)
+	}
 }
 
 // Register registers the client sub-command and all of it's children.
@@ -216,8 +352,11 @@ func Register(parentCmd *cobra.Command) {
 	controlCmd.AddCommand(controlIsSyncedCmd)
 	controlCmd.AddCommand(controlWaitSyncCmd)
 	controlCmd.AddCommand(controlShutdownCmd)
+	controlCmd.AddCommand(controlClearDeregisterCmd)
 	controlCmd.AddCommand(controlUpgradeBinaryCmd)
 	controlCmd.AddCommand(controlCancelUpgradeCmd)
 	controlCmd.AddCommand(controlStatusCmd)
+	controlCmd.AddCommand(controlRuntimeStatsCmd)
+	controlCmd.AddCommand(controlAddBundleCmd)
 	parentCmd.AddCommand(controlCmd)
 }

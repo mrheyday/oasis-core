@@ -29,6 +29,8 @@ var (
 	methodCancelUpgrade = serviceName.NewMethod("CancelUpgrade", nil)
 	// methodGetStatus is the GetStatus method.
 	methodGetStatus = serviceName.NewMethod("GetStatus", nil)
+	// methodAddBundle is the AddBundle method.
+	methodAddBundle = serviceName.NewMethod("AddBundle", nil)
 
 	// serviceDesc is the gRPC service descriptor.
 	serviceDesc = grpc.ServiceDesc{
@@ -67,17 +69,21 @@ var (
 				MethodName: methodGetStatus.ShortName(),
 				Handler:    handlerGetStatus,
 			},
+			{
+				MethodName: methodAddBundle.ShortName(),
+				Handler:    handlerAddBundle,
+			},
 		},
 		Streams: []grpc.StreamDesc{},
 	}
 )
 
-func handlerRequestShutdown( // nolint: golint
-	srv interface{},
+func handlerRequestShutdown(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var wait bool
 	if err := dec(&wait); err != nil {
 		return nil, err
@@ -89,18 +95,18 @@ func handlerRequestShutdown( // nolint: golint
 		Server:     srv,
 		FullMethod: methodRequestShutdown.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return nil, srv.(NodeController).RequestShutdown(ctx, req.(bool))
 	}
 	return interceptor(ctx, wait, info, handler)
 }
 
-func handlerWaitSync( // nolint: golint
-	srv interface{},
+func handlerWaitSync(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	if interceptor == nil {
 		return nil, srv.(NodeController).WaitSync(ctx)
 	}
@@ -108,18 +114,18 @@ func handlerWaitSync( // nolint: golint
 		Server:     srv,
 		FullMethod: methodWaitSync.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ any) (any, error) {
 		return nil, srv.(NodeController).WaitSync(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerIsSynced( // nolint: golint
-	srv interface{},
+func handlerIsSynced(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	if interceptor == nil {
 		return srv.(NodeController).IsSynced(ctx)
 	}
@@ -127,18 +133,18 @@ func handlerIsSynced( // nolint: golint
 		Server:     srv,
 		FullMethod: methodIsSynced.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ any) (any, error) {
 		return srv.(NodeController).IsSynced(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerWaitReady( // nolint: golint
-	srv interface{},
+func handlerWaitReady(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	if interceptor == nil {
 		return nil, srv.(NodeController).WaitReady(ctx)
 	}
@@ -146,18 +152,18 @@ func handlerWaitReady( // nolint: golint
 		Server:     srv,
 		FullMethod: methodWaitReady.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ any) (any, error) {
 		return nil, srv.(NodeController).WaitReady(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerIsReady( // nolint: golint
-	srv interface{},
+func handlerIsReady(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	if interceptor == nil {
 		return srv.(NodeController).IsReady(ctx)
 	}
@@ -165,18 +171,18 @@ func handlerIsReady( // nolint: golint
 		Server:     srv,
 		FullMethod: methodIsSynced.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ any) (any, error) {
 		return srv.(NodeController).IsReady(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerUpgradeBinary( // nolint: golint
-	srv interface{},
+func handlerUpgradeBinary(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var descriptor upgradeApi.Descriptor
 	if err := dec(&descriptor); err != nil {
 		return nil, err
@@ -188,37 +194,41 @@ func handlerUpgradeBinary( // nolint: golint
 		Server:     srv,
 		FullMethod: methodUpgradeBinary.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return nil, srv.(NodeController).UpgradeBinary(ctx, req.(*upgradeApi.Descriptor))
 	}
 	return interceptor(ctx, &descriptor, info, handler)
 }
 
-func handlerCancelUpgrade( // nolint: golint
-	srv interface{},
+func handlerCancelUpgrade(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
+	var descriptor upgradeApi.Descriptor
+	if err := dec(&descriptor); err != nil {
+		return nil, err
+	}
 	if interceptor == nil {
-		return nil, srv.(NodeController).CancelUpgrade(ctx)
+		return nil, srv.(NodeController).CancelUpgrade(ctx, &descriptor)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
 		FullMethod: methodCancelUpgrade.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return nil, srv.(NodeController).CancelUpgrade(ctx)
+	handler := func(ctx context.Context, req any) (any, error) {
+		return nil, srv.(NodeController).CancelUpgrade(ctx, req.(*upgradeApi.Descriptor))
 	}
-	return interceptor(ctx, nil, info, handler)
+	return interceptor(ctx, &descriptor, info, handler)
 }
 
-func handlerGetStatus( // nolint: golint
-	srv interface{},
+func handlerGetStatus(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	if interceptor == nil {
 		return srv.(NodeController).GetStatus(ctx)
 	}
@@ -226,10 +236,33 @@ func handlerGetStatus( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetStatus.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ any) (any, error) {
 		return srv.(NodeController).GetStatus(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
+}
+
+func handlerAddBundle(
+	srv any,
+	ctx context.Context,
+	dec func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
+	var path string
+	if err := dec(&path); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return nil, srv.(NodeController).AddBundle(ctx, path)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodAddBundle.FullName(),
+	}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return nil, srv.(NodeController).AddBundle(ctx, *req.(*string))
+	}
+	return interceptor(ctx, &path, info, handler)
 }
 
 // RegisterService registers a new node controller service with the given gRPC server.
@@ -237,19 +270,27 @@ func RegisterService(server *grpc.Server, service NodeController) {
 	server.RegisterService(&serviceDesc, service)
 }
 
-type nodeControllerClient struct {
+// NodeControllerClient is a gRPC node controller client.
+type NodeControllerClient struct {
 	conn *grpc.ClientConn
 }
 
-func (c *nodeControllerClient) RequestShutdown(ctx context.Context, wait bool) error {
+// NewNodeControllerClient creates a new gRPC node controller client.
+func NewNodeControllerClient(c *grpc.ClientConn) *NodeControllerClient {
+	return &NodeControllerClient{
+		conn: c,
+	}
+}
+
+func (c *NodeControllerClient) RequestShutdown(ctx context.Context, wait bool) error {
 	return c.conn.Invoke(ctx, methodRequestShutdown.FullName(), wait, nil)
 }
 
-func (c *nodeControllerClient) WaitSync(ctx context.Context) error {
+func (c *NodeControllerClient) WaitSync(ctx context.Context) error {
 	return c.conn.Invoke(ctx, methodWaitSync.FullName(), nil, nil)
 }
 
-func (c *nodeControllerClient) IsSynced(ctx context.Context) (bool, error) {
+func (c *NodeControllerClient) IsSynced(ctx context.Context) (bool, error) {
 	var rsp bool
 	if err := c.conn.Invoke(ctx, methodIsSynced.FullName(), nil, &rsp); err != nil {
 		return false, err
@@ -257,11 +298,11 @@ func (c *nodeControllerClient) IsSynced(ctx context.Context) (bool, error) {
 	return rsp, nil
 }
 
-func (c *nodeControllerClient) WaitReady(ctx context.Context) error {
+func (c *NodeControllerClient) WaitReady(ctx context.Context) error {
 	return c.conn.Invoke(ctx, methodWaitReady.FullName(), nil, nil)
 }
 
-func (c *nodeControllerClient) IsReady(ctx context.Context) (bool, error) {
+func (c *NodeControllerClient) IsReady(ctx context.Context) (bool, error) {
 	var rsp bool
 	if err := c.conn.Invoke(ctx, methodIsReady.FullName(), nil, &rsp); err != nil {
 		return false, err
@@ -269,15 +310,15 @@ func (c *nodeControllerClient) IsReady(ctx context.Context) (bool, error) {
 	return rsp, nil
 }
 
-func (c *nodeControllerClient) UpgradeBinary(ctx context.Context, descriptor *upgradeApi.Descriptor) error {
+func (c *NodeControllerClient) UpgradeBinary(ctx context.Context, descriptor *upgradeApi.Descriptor) error {
 	return c.conn.Invoke(ctx, methodUpgradeBinary.FullName(), descriptor, nil)
 }
 
-func (c *nodeControllerClient) CancelUpgrade(ctx context.Context) error {
-	return c.conn.Invoke(ctx, methodCancelUpgrade.FullName(), nil, nil)
+func (c *NodeControllerClient) CancelUpgrade(ctx context.Context, descriptor *upgradeApi.Descriptor) error {
+	return c.conn.Invoke(ctx, methodCancelUpgrade.FullName(), descriptor, nil)
 }
 
-func (c *nodeControllerClient) GetStatus(ctx context.Context) (*Status, error) {
+func (c *NodeControllerClient) GetStatus(ctx context.Context) (*Status, error) {
 	var rsp Status
 	if err := c.conn.Invoke(ctx, methodGetStatus.FullName(), nil, &rsp); err != nil {
 		return nil, err
@@ -285,7 +326,10 @@ func (c *nodeControllerClient) GetStatus(ctx context.Context) (*Status, error) {
 	return &rsp, nil
 }
 
-// NewNodeControllerClient creates a new gRPC node controller client service.
-func NewNodeControllerClient(c *grpc.ClientConn) NodeController {
-	return &nodeControllerClient{c}
+func (c *NodeControllerClient) AddBundle(ctx context.Context, path string) error {
+	var rsp Status
+	if err := c.conn.Invoke(ctx, methodAddBundle.FullName(), path, &rsp); err != nil {
+		return err
+	}
+	return nil
 }

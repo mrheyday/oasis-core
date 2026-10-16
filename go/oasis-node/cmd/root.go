@@ -3,7 +3,6 @@ package cmd
 
 import (
 	"os"
-	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -13,6 +12,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/control"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/debug"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/genesis"
+	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/governance"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/ias"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/identity"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/keymanager"
@@ -20,6 +20,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/registry"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/signer"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/stake"
+	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/storage"
 )
 
 var rootCmd = &cobra.Command{
@@ -39,7 +40,7 @@ func RootCommand() *cobra.Command {
 func Execute() {
 	// Only the owner should have read/write/execute permissions for
 	// anything created by the oasis-node binary.
-	syscall.Umask(0o077)
+	cmdCommon.Umask(0o077)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -47,19 +48,18 @@ func Execute() {
 }
 
 func initVersions() {
-	cobra.AddTemplateFunc("nodeVersion", func() interface{} { return version.Versions })
+	cobra.AddTemplateFunc("nodeVersion", func() any { return version.Versions })
+	cobra.AddTemplateFunc("toolchain", func() any { return version.Toolchain })
 
 	rootCmd.SetVersionTemplate(`Software version: {{.Version}}
 {{- with nodeVersion }}
 Consensus:
   Consensus protocol version: {{ .ConsensusProtocol }}
-  Tendermint Core version:    {{ .Tendermint }}
-  ABCI library version:       {{ .ABCI }}
 Runtime:
   Host protocol version:      {{ .RuntimeHostProtocol }}
   Committee protocol version: {{ .RuntimeCommitteeProtocol }}
-Go toolchain version: {{ .Toolchain }}
 {{ end -}}
+Go toolchain version: {{ toolchain }}
 `)
 }
 
@@ -75,12 +75,14 @@ func init() {
 		control.Register,
 		debug.Register,
 		genesis.Register,
+		governance.Register,
 		ias.Register,
 		identity.Register,
 		keymanager.Register,
 		registry.Register,
 		signer.Register,
 		stake.Register,
+		storage.Register,
 		consensus.Register,
 		node.Register,
 	} {

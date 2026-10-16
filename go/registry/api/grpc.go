@@ -28,13 +28,15 @@ var (
 	// methodGetNodes is the GetNodes method.
 	methodGetNodes = serviceName.NewMethod("GetNodes", int64(0))
 	// methodGetRuntime is the GetRuntime method.
-	methodGetRuntime = serviceName.NewMethod("GetRuntime", NamespaceQuery{})
+	methodGetRuntime = serviceName.NewMethod("GetRuntime", GetRuntimeQuery{})
 	// methodGetRuntimes is the GetRuntimes method.
-	methodGetRuntimes = serviceName.NewMethod("GetRuntimes", int64(0))
+	methodGetRuntimes = serviceName.NewMethod("GetRuntimes", GetRuntimesQuery{})
 	// methodStateToGenesis is the StateToGenesis method.
 	methodStateToGenesis = serviceName.NewMethod("StateToGenesis", int64(0))
 	// methodGetEvents is the GetEvents method.
 	methodGetEvents = serviceName.NewMethod("GetEvents", int64(0))
+	// methodConsensusParameters is the ConsensusParameters method.
+	methodConsensusParameters = serviceName.NewMethod("ConsensusParameters", int64(0))
 
 	// methodWatchEntities is the WatchEntities method.
 	methodWatchEntities = serviceName.NewMethod("WatchEntities", nil)
@@ -44,6 +46,8 @@ var (
 	methodWatchNodeList = serviceName.NewMethod("WatchNodeList", nil)
 	// methodWatchRuntimes is the WatchRuntimes method.
 	methodWatchRuntimes = serviceName.NewMethod("WatchRuntimes", nil)
+	// methodWatchEvents is the WatchEvents method.
+	methodWatchEvents = serviceName.NewMethod("WatchEvents", nil)
 
 	// serviceDesc is the gRPC service descriptor.
 	serviceDesc = grpc.ServiceDesc{
@@ -90,6 +94,10 @@ var (
 				MethodName: methodGetEvents.ShortName(),
 				Handler:    handlerGetEvents,
 			},
+			{
+				MethodName: methodConsensusParameters.ShortName(),
+				Handler:    handlerConsensusParameters,
+			},
 		},
 		Streams: []grpc.StreamDesc{
 			{
@@ -112,16 +120,21 @@ var (
 				Handler:       handlerWatchRuntimes,
 				ServerStreams: true,
 			},
+			{
+				StreamName:    methodWatchEvents.ShortName(),
+				Handler:       handlerWatchEvents,
+				ServerStreams: true,
+			},
 		},
 	}
 )
 
-func handlerGetEntity( // nolint: golint
-	srv interface{},
+func handlerGetEntity(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var query IDQuery
 	if err := dec(&query); err != nil {
 		return nil, err
@@ -133,18 +146,18 @@ func handlerGetEntity( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetEntity.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetEntity(ctx, req.(*IDQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerGetEntities( // nolint: golint
-	srv interface{},
+func handlerGetEntities(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -156,18 +169,18 @@ func handlerGetEntities( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetEntities.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetEntities(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerGetNode( // nolint: golint
-	srv interface{},
+func handlerGetNode(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var query IDQuery
 	if err := dec(&query); err != nil {
 		return nil, err
@@ -179,18 +192,18 @@ func handlerGetNode( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetNode.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetNode(ctx, req.(*IDQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerGetNodeByConsensusAddress( // nolint: golint
-	srv interface{},
+func handlerGetNodeByConsensusAddress(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var query ConsensusAddressQuery
 	if err := dec(&query); err != nil {
 		return nil, err
@@ -202,18 +215,18 @@ func handlerGetNodeByConsensusAddress( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetNodeByConsensusAddress.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetNodeByConsensusAddress(ctx, req.(*ConsensusAddressQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerGetNodeStatus( // nolint: golint
-	srv interface{},
+func handlerGetNodeStatus(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var query IDQuery
 	if err := dec(&query); err != nil {
 		return nil, err
@@ -225,18 +238,18 @@ func handlerGetNodeStatus( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetNodeStatus.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetNodeStatus(ctx, req.(*IDQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerGetNodes( // nolint: golint
-	srv interface{},
+func handlerGetNodes(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -248,19 +261,19 @@ func handlerGetNodes( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetNodes.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetNodes(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerGetRuntime( // nolint: golint
-	srv interface{},
+func handlerGetRuntime(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
-	var query NamespaceQuery
+) (any, error) {
+	var query GetRuntimeQuery
 	if err := dec(&query); err != nil {
 		return nil, err
 	}
@@ -271,18 +284,18 @@ func handlerGetRuntime( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetRuntime.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(Backend).GetRuntime(ctx, req.(*NamespaceQuery))
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).GetRuntime(ctx, req.(*GetRuntimeQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerGetRuntimes( // nolint: golint
-	srv interface{},
+func handlerGetRuntimes(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var query GetRuntimesQuery
 	if err := dec(&query); err != nil {
 		return nil, err
@@ -294,18 +307,18 @@ func handlerGetRuntimes( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetRuntimes.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetRuntimes(ctx, req.(*GetRuntimesQuery))
 	}
 	return interceptor(ctx, &query, info, handler)
 }
 
-func handlerStateToGenesis( // nolint: golint
-	srv interface{},
+func handlerStateToGenesis(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -317,18 +330,18 @@ func handlerStateToGenesis( // nolint: golint
 		Server:     srv,
 		FullMethod: methodStateToGenesis.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).StateToGenesis(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerGetEvents( // nolint: golint
-	srv interface{},
+func handlerGetEvents(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var height int64
 	if err := dec(&height); err != nil {
 		return nil, err
@@ -340,13 +353,36 @@ func handlerGetEvents( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetEvents.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Backend).GetEvents(ctx, req.(int64))
 	}
 	return interceptor(ctx, height, info, handler)
 }
 
-func handlerWatchEntities(srv interface{}, stream grpc.ServerStream) error {
+func handlerConsensusParameters(
+	srv any,
+	ctx context.Context,
+	dec func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
+	var height int64
+	if err := dec(&height); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(Backend).ConsensusParameters(ctx, height)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: methodConsensusParameters.FullName(),
+	}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(Backend).ConsensusParameters(ctx, req.(int64))
+	}
+	return interceptor(ctx, height, info, handler)
+}
+
+func handlerWatchEntities(srv any, stream grpc.ServerStream) error {
 	if err := stream.RecvMsg(nil); err != nil {
 		return err
 	}
@@ -374,7 +410,7 @@ func handlerWatchEntities(srv interface{}, stream grpc.ServerStream) error {
 	}
 }
 
-func handlerWatchNodes(srv interface{}, stream grpc.ServerStream) error {
+func handlerWatchNodes(srv any, stream grpc.ServerStream) error {
 	if err := stream.RecvMsg(nil); err != nil {
 		return err
 	}
@@ -402,7 +438,7 @@ func handlerWatchNodes(srv interface{}, stream grpc.ServerStream) error {
 	}
 }
 
-func handlerWatchNodeList(srv interface{}, stream grpc.ServerStream) error {
+func handlerWatchNodeList(srv any, stream grpc.ServerStream) error {
 	if err := stream.RecvMsg(nil); err != nil {
 		return err
 	}
@@ -430,7 +466,7 @@ func handlerWatchNodeList(srv interface{}, stream grpc.ServerStream) error {
 	}
 }
 
-func handlerWatchRuntimes(srv interface{}, stream grpc.ServerStream) error {
+func handlerWatchRuntimes(srv any, stream grpc.ServerStream) error {
 	if err := stream.RecvMsg(nil); err != nil {
 		return err
 	}
@@ -458,16 +494,51 @@ func handlerWatchRuntimes(srv interface{}, stream grpc.ServerStream) error {
 	}
 }
 
+func handlerWatchEvents(srv any, stream grpc.ServerStream) error {
+	if err := stream.RecvMsg(nil); err != nil {
+		return err
+	}
+
+	ctx := stream.Context()
+	ch, sub, err := srv.(Backend).WatchEvents(ctx)
+	if err != nil {
+		return err
+	}
+	defer sub.Close()
+
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			if err := stream.SendMsg(ev); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 // RegisterService registers a new registry backend service with the given gRPC server.
 func RegisterService(server *grpc.Server, service Backend) {
 	server.RegisterService(&serviceDesc, service)
 }
 
-type registryClient struct {
+// Client is a gRPC registry client.
+type Client struct {
 	conn *grpc.ClientConn
 }
 
-func (c *registryClient) GetEntity(ctx context.Context, query *IDQuery) (*entity.Entity, error) {
+// NewClient creates a new gRPC registry client.
+func NewClient(c *grpc.ClientConn) *Client {
+	return &Client{
+		conn: c,
+	}
+}
+
+func (c *Client) GetEntity(ctx context.Context, query *IDQuery) (*entity.Entity, error) {
 	var rsp entity.Entity
 	if err := c.conn.Invoke(ctx, methodGetEntity.FullName(), query, &rsp); err != nil {
 		return nil, err
@@ -475,7 +546,7 @@ func (c *registryClient) GetEntity(ctx context.Context, query *IDQuery) (*entity
 	return &rsp, nil
 }
 
-func (c *registryClient) GetEntities(ctx context.Context, height int64) ([]*entity.Entity, error) {
+func (c *Client) GetEntities(ctx context.Context, height int64) ([]*entity.Entity, error) {
 	var rsp []*entity.Entity
 	if err := c.conn.Invoke(ctx, methodGetEntities.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -483,7 +554,7 @@ func (c *registryClient) GetEntities(ctx context.Context, height int64) ([]*enti
 	return rsp, nil
 }
 
-func (c *registryClient) WatchEntities(ctx context.Context) (<-chan *EntityEvent, pubsub.ClosableSubscription, error) {
+func (c *Client) WatchEntities(ctx context.Context) (<-chan *EntityEvent, pubsub.ClosableSubscription, error) {
 	ctx, sub := pubsub.NewContextSubscription(ctx)
 
 	stream, err := c.conn.NewStream(ctx, &serviceDesc.Streams[0], methodWatchEntities.FullName())
@@ -518,7 +589,7 @@ func (c *registryClient) WatchEntities(ctx context.Context) (<-chan *EntityEvent
 	return ch, sub, nil
 }
 
-func (c *registryClient) GetNode(ctx context.Context, query *IDQuery) (*node.Node, error) {
+func (c *Client) GetNode(ctx context.Context, query *IDQuery) (*node.Node, error) {
 	var rsp node.Node
 	if err := c.conn.Invoke(ctx, methodGetNode.FullName(), query, &rsp); err != nil {
 		return nil, err
@@ -526,7 +597,7 @@ func (c *registryClient) GetNode(ctx context.Context, query *IDQuery) (*node.Nod
 	return &rsp, nil
 }
 
-func (c *registryClient) GetNodeByConsensusAddress(ctx context.Context, query *ConsensusAddressQuery) (*node.Node, error) {
+func (c *Client) GetNodeByConsensusAddress(ctx context.Context, query *ConsensusAddressQuery) (*node.Node, error) {
 	var rsp node.Node
 	if err := c.conn.Invoke(ctx, methodGetNodeByConsensusAddress.FullName(), query, &rsp); err != nil {
 		return nil, err
@@ -534,7 +605,7 @@ func (c *registryClient) GetNodeByConsensusAddress(ctx context.Context, query *C
 	return &rsp, nil
 }
 
-func (c *registryClient) GetNodeStatus(ctx context.Context, query *IDQuery) (*NodeStatus, error) {
+func (c *Client) GetNodeStatus(ctx context.Context, query *IDQuery) (*NodeStatus, error) {
 	var rsp NodeStatus
 	if err := c.conn.Invoke(ctx, methodGetNodeStatus.FullName(), query, &rsp); err != nil {
 		return nil, err
@@ -542,7 +613,7 @@ func (c *registryClient) GetNodeStatus(ctx context.Context, query *IDQuery) (*No
 	return &rsp, nil
 }
 
-func (c *registryClient) GetNodes(ctx context.Context, height int64) ([]*node.Node, error) {
+func (c *Client) GetNodes(ctx context.Context, height int64) ([]*node.Node, error) {
 	var rsp []*node.Node
 	if err := c.conn.Invoke(ctx, methodGetNodes.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -550,7 +621,7 @@ func (c *registryClient) GetNodes(ctx context.Context, height int64) ([]*node.No
 	return rsp, nil
 }
 
-func (c *registryClient) WatchNodes(ctx context.Context) (<-chan *NodeEvent, pubsub.ClosableSubscription, error) {
+func (c *Client) WatchNodes(ctx context.Context) (<-chan *NodeEvent, pubsub.ClosableSubscription, error) {
 	ctx, sub := pubsub.NewContextSubscription(ctx)
 
 	stream, err := c.conn.NewStream(ctx, &serviceDesc.Streams[1], methodWatchNodes.FullName())
@@ -585,7 +656,7 @@ func (c *registryClient) WatchNodes(ctx context.Context) (<-chan *NodeEvent, pub
 	return ch, sub, nil
 }
 
-func (c *registryClient) WatchNodeList(ctx context.Context) (<-chan *NodeList, pubsub.ClosableSubscription, error) {
+func (c *Client) WatchNodeList(ctx context.Context) (<-chan *NodeList, pubsub.ClosableSubscription, error) {
 	ctx, sub := pubsub.NewContextSubscription(ctx)
 
 	stream, err := c.conn.NewStream(ctx, &serviceDesc.Streams[2], methodWatchNodeList.FullName())
@@ -620,7 +691,7 @@ func (c *registryClient) WatchNodeList(ctx context.Context) (<-chan *NodeList, p
 	return ch, sub, nil
 }
 
-func (c *registryClient) GetRuntime(ctx context.Context, query *NamespaceQuery) (*Runtime, error) {
+func (c *Client) GetRuntime(ctx context.Context, query *GetRuntimeQuery) (*Runtime, error) {
 	var rsp Runtime
 	if err := c.conn.Invoke(ctx, methodGetRuntime.FullName(), query, &rsp); err != nil {
 		return nil, err
@@ -628,7 +699,7 @@ func (c *registryClient) GetRuntime(ctx context.Context, query *NamespaceQuery) 
 	return &rsp, nil
 }
 
-func (c *registryClient) GetRuntimes(ctx context.Context, query *GetRuntimesQuery) ([]*Runtime, error) {
+func (c *Client) GetRuntimes(ctx context.Context, query *GetRuntimesQuery) ([]*Runtime, error) {
 	var rsp []*Runtime
 	if err := c.conn.Invoke(ctx, methodGetRuntimes.FullName(), query, &rsp); err != nil {
 		return nil, err
@@ -636,7 +707,7 @@ func (c *registryClient) GetRuntimes(ctx context.Context, query *GetRuntimesQuer
 	return rsp, nil
 }
 
-func (c *registryClient) WatchRuntimes(ctx context.Context) (<-chan *Runtime, pubsub.ClosableSubscription, error) {
+func (c *Client) WatchRuntimes(ctx context.Context) (<-chan *Runtime, pubsub.ClosableSubscription, error) {
 	ctx, sub := pubsub.NewContextSubscription(ctx)
 
 	stream, err := c.conn.NewStream(ctx, &serviceDesc.Streams[3], methodWatchRuntimes.FullName())
@@ -671,7 +742,7 @@ func (c *registryClient) WatchRuntimes(ctx context.Context) (<-chan *Runtime, pu
 	return ch, sub, nil
 }
 
-func (c *registryClient) StateToGenesis(ctx context.Context, height int64) (*Genesis, error) {
+func (c *Client) StateToGenesis(ctx context.Context, height int64) (*Genesis, error) {
 	var rsp Genesis
 	if err := c.conn.Invoke(ctx, methodStateToGenesis.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -679,7 +750,7 @@ func (c *registryClient) StateToGenesis(ctx context.Context, height int64) (*Gen
 	return &rsp, nil
 }
 
-func (c *registryClient) GetEvents(ctx context.Context, height int64) ([]*Event, error) {
+func (c *Client) GetEvents(ctx context.Context, height int64) ([]*Event, error) {
 	var rsp []*Event
 	if err := c.conn.Invoke(ctx, methodGetEvents.FullName(), height, &rsp); err != nil {
 		return nil, err
@@ -687,10 +758,48 @@ func (c *registryClient) GetEvents(ctx context.Context, height int64) ([]*Event,
 	return rsp, nil
 }
 
-func (c *registryClient) Cleanup() {
+func (c *Client) WatchEvents(ctx context.Context) (<-chan *Event, pubsub.ClosableSubscription, error) {
+	ctx, sub := pubsub.NewContextSubscription(ctx)
+
+	stream, err := c.conn.NewStream(ctx, &serviceDesc.Streams[0], methodWatchEvents.FullName())
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = stream.SendMsg(nil); err != nil {
+		return nil, nil, err
+	}
+	if err = stream.CloseSend(); err != nil {
+		return nil, nil, err
+	}
+
+	ch := make(chan *Event)
+	go func() {
+		defer close(ch)
+
+		for {
+			var ev Event
+			if serr := stream.RecvMsg(&ev); serr != nil {
+				return
+			}
+
+			select {
+			case ch <- &ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return ch, sub, nil
 }
 
-// NewRegistryClient creates a new gRPC registry client service.
-func NewRegistryClient(c *grpc.ClientConn) Backend {
-	return &registryClient{c}
+func (c *Client) ConsensusParameters(ctx context.Context, height int64) (*ConsensusParameters, error) {
+	var rsp ConsensusParameters
+	if err := c.conn.Invoke(ctx, methodConsensusParameters.FullName(), height, &rsp); err != nil {
+		return nil, err
+	}
+	return &rsp, nil
+}
+
+func (c *Client) Cleanup() {
 }

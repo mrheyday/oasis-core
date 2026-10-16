@@ -32,10 +32,10 @@ func (ph PreHashed) String() string {
 }
 
 type hashedFormat struct {
-	inner interface{}
+	inner any
 }
 
-func (h *hashedFormat) getData(v interface{}) ([]byte, error) {
+func (h *hashedFormat) getData(v any) ([]byte, error) {
 	switch t := v.(type) {
 	case encoding.BinaryMarshaler:
 		return t.MarshalBinary()
@@ -47,22 +47,22 @@ func (h *hashedFormat) getData(v interface{}) ([]byte, error) {
 }
 
 // Implements CustomFormat.
-func (h *hashedFormat) MarshalBinary(v interface{}) (data []byte, err error) {
+func (h *hashedFormat) MarshalBinary(v any) (data []byte, err error) {
 	if ph, ok := v.(*PreHashed); ok {
 		return ph[:], nil
 	}
 
 	data, err = h.getData(v)
 	if err != nil {
-		return
+		return nil, err
 	}
 	hh := hash.NewFromBytes(data)
 	data = hh[:]
-	return
+	return data, nil
 }
 
 // Implements CustomFormat.
-func (h *hashedFormat) UnmarshalBinary(v interface{}, data []byte) error {
+func (h *hashedFormat) UnmarshalBinary(v any, data []byte) error {
 	if ph, ok := v.(*PreHashed); ok {
 		return ph.UnmarshalBinary(data)
 	}
@@ -75,6 +75,6 @@ func (h *hashedFormat) Size() int {
 }
 
 // H wraps a key element to signal that the element should be hashed after regular encoding.
-func H(inner interface{}) CustomFormat {
+func H(inner any) CustomFormat {
 	return &hashedFormat{inner}
 }

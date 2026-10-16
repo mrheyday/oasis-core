@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	"github.com/oasisprotocol/oasis-core/go/common/version"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 )
@@ -17,15 +18,23 @@ type Genesis struct {
 }
 
 // Parameters are the consensus parameters.
-type Parameters struct { // nolint: maligned
-	TimeoutCommit      time.Duration `json:"timeout_commit"`
-	SkipTimeoutCommit  bool          `json:"skip_timeout_commit"`
+type Parameters struct {
+	// TimeoutCommit specifies the duration to wait after committing a block
+	// before starting a new height.
+	TimeoutCommit time.Duration `json:"timeout_commit"`
+	// SkipTimeoutCommit determines whether to proceed immediately once all
+	// precommits are received.
+	SkipTimeoutCommit bool `json:"skip_timeout_commit"`
+	// EmptyBlockInterval defines the time interval between empty blocks.
 	EmptyBlockInterval time.Duration `json:"empty_block_interval"`
 
 	MaxTxSize       uint64          `json:"max_tx_size"`
 	MaxBlockSize    uint64          `json:"max_block_size"`
 	MaxBlockGas     transaction.Gas `json:"max_block_gas"`
 	MaxEvidenceSize uint64          `json:"max_evidence_size"`
+
+	// MinGasPrice is the minimum gas price.
+	MinGasPrice uint64 `json:"min_gas_price,omitempty"`
 
 	// StateCheckpointInterval is the expected state checkpoint interval (in blocks).
 	StateCheckpointInterval uint64 `json:"state_checkpoint_interval"`
@@ -39,6 +48,20 @@ type Parameters struct { // nolint: maligned
 
 	// PublicKeyBlacklist is the network-wide public key blacklist.
 	PublicKeyBlacklist []signature.PublicKey `json:"public_key_blacklist,omitempty"`
+
+	// FeatureVersion represents the latest consensus-breaking software version
+	// that follows calendar versioning (yy.minor[.micro]).
+	FeatureVersion *version.Version `json:"feature_version,omitempty"`
+}
+
+// IsFeatureVersion returns true iff the consensus feature version is high
+// enough for the feature to be enabled.
+func (p *Parameters) IsFeatureVersion(minVersion version.Version) bool {
+	if p.FeatureVersion == nil {
+		return false
+	}
+
+	return p.FeatureVersion.ToU64() >= minVersion.ToU64()
 }
 
 const (

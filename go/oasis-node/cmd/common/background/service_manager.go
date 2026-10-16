@@ -7,10 +7,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/service"
 )
+
+const svcStopTimeout = 10 * time.Second
 
 // ServiceManager manages a group of background services.
 type ServiceManager struct {
@@ -50,9 +53,9 @@ func (m *ServiceManager) Wait() {
 
 	select {
 	case <-m.stopCh:
-		m.logger.Info("programatic termination requested")
+		m.logger.Info("programmatic termination requested")
 	case m.termSvc = <-m.termCh:
-		m.logger.Info("background task terminated, propagating")
+		m.logger.Info("background task terminated, propagating", "task", m.termSvc.Name())
 	case <-sigCh:
 		m.logger.Info("user requested termination")
 	}
@@ -60,11 +63,32 @@ func (m *ServiceManager) Wait() {
 	// Cancel the context before stopping the services.
 	m.cancelFn()
 
+	m.logger.Debug("stopping services")
 	for _, svc := range m.services {
 		if svc != m.termSvc {
+			m.logger.Debug("stopping service",
+				"svc", svc.Name(),
+			)
 			svc.Stop()
 		}
 	}
+	for _, svc := range m.services {
+		if service.IsCleanupOnlyService(svc) {
+			continue
+		}
+
+		m.logger.Debug("waiting for the service to stop",
+			"svc", svc.Name(),
+		)
+		select {
+		case <-svc.Quit():
+		case <-time.After(svcStopTimeout):
+			m.logger.Warn("timed out waiting for the service to stop",
+				"svc", svc.Name(),
+			)
+		}
+	}
+	m.logger.Debug("all services stopped")
 }
 
 // Stop stops all services.

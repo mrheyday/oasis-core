@@ -5,8 +5,8 @@ import (
 
 	"google.golang.org/grpc"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	cmnGrpc "github.com/oasisprotocol/oasis-core/go/common/grpc"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 )
 
 var (
@@ -14,7 +14,7 @@ var (
 	debugServiceName = cmnGrpc.NewServiceName("DebugController")
 
 	// methodSetEpoch is the SetEpoch method.
-	methodSetEpoch = debugServiceName.NewMethod("SetEpoch", epochtime.EpochTime(0))
+	methodSetEpoch = debugServiceName.NewMethod("SetEpoch", beacon.EpochTime(0))
 	// methodWaitNodesRegistered is the WaitNodesRegistered method.
 	methodWaitNodesRegistered = debugServiceName.NewMethod("WaitNodesRegistered", int(0))
 
@@ -36,13 +36,13 @@ var (
 	}
 )
 
-func handlerSetEpoch( // nolint: golint
-	srv interface{},
+func handlerSetEpoch(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
-	var epoch epochtime.EpochTime
+) (any, error) {
+	var epoch beacon.EpochTime
 	if err := dec(&epoch); err != nil {
 		return nil, err
 	}
@@ -53,18 +53,18 @@ func handlerSetEpoch( // nolint: golint
 		Server:     srv,
 		FullMethod: methodSetEpoch.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return nil, srv.(DebugController).SetEpoch(ctx, req.(epochtime.EpochTime))
+	handler := func(ctx context.Context, req any) (any, error) {
+		return nil, srv.(DebugController).SetEpoch(ctx, req.(beacon.EpochTime))
 	}
 	return interceptor(ctx, epoch, info, handler)
 }
 
-func handlerWaitNodesRegistered( // nolint: golint
-	srv interface{},
+func handlerWaitNodesRegistered(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var count int
 	if err := dec(&count); err != nil {
 		return nil, err
@@ -76,7 +76,7 @@ func handlerWaitNodesRegistered( // nolint: golint
 		Server:     srv,
 		FullMethod: methodWaitNodesRegistered.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return nil, srv.(DebugController).WaitNodesRegistered(ctx, req.(int))
 	}
 	return interceptor(ctx, count, info, handler)
@@ -87,19 +87,22 @@ func RegisterDebugService(server *grpc.Server, service DebugController) {
 	server.RegisterService(&debugServiceDesc, service)
 }
 
-type debugControllerClient struct {
+// DebugControllerClient is a gRPC debug controller client.
+type DebugControllerClient struct {
 	conn *grpc.ClientConn
 }
 
-func (c *debugControllerClient) SetEpoch(ctx context.Context, epoch epochtime.EpochTime) error {
+// NewDebugControllerClient creates a new gRPC debug controller client.
+func NewDebugControllerClient(c *grpc.ClientConn) *DebugControllerClient {
+	return &DebugControllerClient{
+		conn: c,
+	}
+}
+
+func (c *DebugControllerClient) SetEpoch(ctx context.Context, epoch beacon.EpochTime) error {
 	return c.conn.Invoke(ctx, methodSetEpoch.FullName(), epoch, nil)
 }
 
-func (c *debugControllerClient) WaitNodesRegistered(ctx context.Context, count int) error {
+func (c *DebugControllerClient) WaitNodesRegistered(ctx context.Context, count int) error {
 	return c.conn.Invoke(ctx, methodWaitNodesRegistered.FullName(), count, nil)
-}
-
-// NewDebugControllerClient creates a new gRPC debug controller client service.
-func NewDebugControllerClient(c *grpc.ClientConn) DebugController {
-	return &debugControllerClient{c}
 }

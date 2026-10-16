@@ -105,7 +105,7 @@ func initRootEnv(cmd *cobra.Command) (*env.Env, error) {
 	return env, nil
 }
 
-func runRoot(cmd *cobra.Command, args []string) error {
+func runRoot(cmd *cobra.Command, _ []string) error {
 	cmd.SilenceUsage = true
 
 	// Initialize the base dir, logging, etc.
@@ -139,6 +139,10 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("root: failed to instantiate fixture: %w", err)
 	}
 
+	// Set logging level and format for all spawned nodes.
+	net.Config().NodeLogLevel = viper.GetString(cfgLogLevel)
+	net.Config().NodeLogFormat = viper.GetString(cfgLogFmt)
+
 	// Start the network and keep it running.
 	if err = net.Start(); err != nil {
 		logger.Error("failed to start network",
@@ -166,7 +170,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func doDumpFixture(cmd *cobra.Command, args []string) {
+func doDumpFixture(*cobra.Command, []string) {
 	f, err := fixtures.GetFixture()
 	if err != nil {
 		common.EarlyLogAndExit(err)

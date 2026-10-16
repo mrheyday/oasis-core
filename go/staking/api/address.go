@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/address"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/encoding/bech32"
@@ -13,6 +14,10 @@ import (
 var (
 	// AddressV0Context is the unique context for v0 staking account addresses.
 	AddressV0Context = address.NewContext("oasis-core/address: staking", 0)
+	// AddressRuntimeV0Context is the unique context for v0 runtime account addresses.
+	AddressRuntimeV0Context = address.NewContext("oasis-core/address: runtime", 0)
+	// AddressModuleV0Context is the unique context for v0 module account addresses.
+	AddressModuleV0Context = address.NewContext("oasis-core/address: module", 0)
 	// AddressBech32HRP is the unique human readable part of Bech32 encoded
 	// staking account addresses.
 	AddressBech32HRP = address.NewBech32HRP("oasis")
@@ -30,17 +35,17 @@ type Address address.Address
 
 // MarshalBinary encodes an address into binary form.
 func (a Address) MarshalBinary() ([]byte, error) {
-	return (address.Address)(a).MarshalBinary()
+	return address.Address(a).MarshalBinary()
 }
 
-// UnMarshalBinary decodes a binary marshaled address.
+// UnmarshalBinary decodes a binary marshaled address.
 func (a *Address) UnmarshalBinary(data []byte) error {
 	return (*address.Address)(a).UnmarshalBinary(data)
 }
 
 // MarshalText encodes an address into text form.
 func (a Address) MarshalText() ([]byte, error) {
-	return (address.Address)(a).MarshalBech32(AddressBech32HRP)
+	return address.Address(a).MarshalBech32(AddressBech32HRP)
 }
 
 // UnmarshalText decodes a text marshaled address.
@@ -50,7 +55,7 @@ func (a *Address) UnmarshalText(text []byte) error {
 
 // Equal compares vs another address for equality.
 func (a Address) Equal(cmp Address) bool {
-	return (address.Address)(a).Equal((address.Address)(cmp))
+	return address.Address(a).Equal(address.Address(cmp))
 }
 
 // String returns the string representation of an address.
@@ -64,8 +69,7 @@ func (a Address) String() string {
 
 // Reserve adds the address to the reserved addresses list.
 func (a Address) Reserve() error {
-	_, loaded := reservedAddresses.LoadOrStore(a, true)
-	if loaded {
+	if _, loaded := reservedAddresses.LoadOrStore(a, struct{}{}); loaded {
 		return fmt.Errorf("address: address '%s' is already reserved", a)
 	}
 	return nil
@@ -86,7 +90,19 @@ func (a Address) IsValid() bool {
 // NewAddress creates a new address from the given public key, i.e. entity ID.
 func NewAddress(pk signature.PublicKey) (a Address) {
 	pkData, _ := pk.MarshalBinary()
-	return (Address)(address.NewAddress(AddressV0Context, pkData))
+	return Address(address.NewAddress(AddressV0Context, pkData))
+}
+
+// NewRuntimeAddress creates a new runtime address for the given runtime ID.
+func NewRuntimeAddress(id common.Namespace) (a Address) {
+	nsData, _ := id.MarshalBinary()
+	return Address(address.NewAddress(AddressRuntimeV0Context, nsData))
+}
+
+// NewModuleAddress creates a new module address for the given module and address kind.
+func NewModuleAddress(module string, kind string) (a Address) {
+	data := []byte(module + "." + kind)
+	return Address(address.NewAddress(AddressModuleV0Context, data))
 }
 
 // NewReservedAddress creates a new reserved address from the given public key

@@ -42,12 +42,12 @@ var (
 	}
 )
 
-func handlerVerifyEvidence( // nolint: golint
-	srv interface{},
+func handlerVerifyEvidence(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var req Evidence
 	if err := dec(&req); err != nil {
 		return nil, err
@@ -59,18 +59,18 @@ func handlerVerifyEvidence( // nolint: golint
 		Server:     srv,
 		FullMethod: methodVerifyEvidence.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Endpoint).VerifyEvidence(ctx, req.(*Evidence))
 	}
 	return interceptor(ctx, &req, info, handler)
 }
 
-func handlerGetSPIDInfo( // nolint: golint
-	srv interface{},
+func handlerGetSPIDInfo(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	_ func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	if interceptor == nil {
 		return srv.(Endpoint).GetSPIDInfo(ctx)
 	}
@@ -78,18 +78,18 @@ func handlerGetSPIDInfo( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetSPIDInfo.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, _ any) (any, error) {
 		return srv.(Endpoint).GetSPIDInfo(ctx)
 	}
 	return interceptor(ctx, nil, info, handler)
 }
 
-func handlerGetSigRL( // nolint: golint
-	srv interface{},
+func handlerGetSigRL(
+	srv any,
 	ctx context.Context,
-	dec func(interface{}) error,
+	dec func(any) error,
 	interceptor grpc.UnaryServerInterceptor,
-) (interface{}, error) {
+) (any, error) {
 	var epidGID uint32
 	if err := dec(&epidGID); err != nil {
 		return nil, err
@@ -101,7 +101,7 @@ func handlerGetSigRL( // nolint: golint
 		Server:     srv,
 		FullMethod: methodGetSigRL.FullName(),
 	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(Endpoint).GetSigRL(ctx, req.(uint32))
 	}
 	return interceptor(ctx, epidGID, info, handler)
@@ -112,11 +112,19 @@ func RegisterService(server *grpc.Server, service Endpoint) {
 	server.RegisterService(&serviceDesc, service)
 }
 
-type endpointClient struct {
+// Client is a gRPC IAS endpoint client.
+type Client struct {
 	conn *grpc.ClientConn
 }
 
-func (c *endpointClient) VerifyEvidence(ctx context.Context, evidence *Evidence) (*ias.AVRBundle, error) {
+// NewClient creates a new gRPC IAS endpoint client.
+func NewClient(c *grpc.ClientConn) *Client {
+	return &Client{
+		conn: c,
+	}
+}
+
+func (c *Client) VerifyEvidence(ctx context.Context, evidence *Evidence) (*ias.AVRBundle, error) {
 	var rsp ias.AVRBundle
 	if err := c.conn.Invoke(ctx, methodVerifyEvidence.FullName(), evidence, &rsp); err != nil {
 		return nil, err
@@ -124,7 +132,7 @@ func (c *endpointClient) VerifyEvidence(ctx context.Context, evidence *Evidence)
 	return &rsp, nil
 }
 
-func (c *endpointClient) GetSPIDInfo(ctx context.Context) (*SPIDInfo, error) {
+func (c *Client) GetSPIDInfo(ctx context.Context) (*SPIDInfo, error) {
 	var rsp SPIDInfo
 	if err := c.conn.Invoke(ctx, methodGetSPIDInfo.FullName(), nil, &rsp); err != nil {
 		return nil, err
@@ -132,7 +140,7 @@ func (c *endpointClient) GetSPIDInfo(ctx context.Context) (*SPIDInfo, error) {
 	return &rsp, nil
 }
 
-func (c *endpointClient) GetSigRL(ctx context.Context, epidGID uint32) ([]byte, error) {
+func (c *Client) GetSigRL(ctx context.Context, epidGID uint32) ([]byte, error) {
 	var rsp []byte
 	if err := c.conn.Invoke(ctx, methodGetSigRL.FullName(), epidGID, &rsp); err != nil {
 		return nil, err
@@ -140,10 +148,5 @@ func (c *endpointClient) GetSigRL(ctx context.Context, epidGID uint32) ([]byte, 
 	return rsp, nil
 }
 
-func (c *endpointClient) Cleanup() {
-}
-
-// NewEndpointClient creates a new gRPC IAS endpoint client service.
-func NewEndpointClient(c *grpc.ClientConn) Endpoint {
-	return &endpointClient{c}
+func (c *Client) Cleanup() {
 }

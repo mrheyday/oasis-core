@@ -23,6 +23,13 @@ var (
 	// ErrInvalidNonce is the error returned when a nonce is invalid.
 	ErrInvalidNonce = errors.New(moduleName, 1, "transaction: invalid nonce")
 
+	// ErrUpgradePending is the error returned when an upgrade is pending and the transaction thus
+	// cannot be processed right now. The submitter should retry the transaction in this case.
+	ErrUpgradePending = errors.New(moduleName, 4, "transaction: upgrade pending")
+
+	// ErrMethodNotSupported is the error returned if transaction method is not supported.
+	ErrMethodNotSupported = errors.New(moduleName, 5, "transaction: method not supported")
+
 	// SignatureContext is the context used for signing transactions.
 	SignatureContext = signature.NewContext("oasis-core/consensus: tx", signature.WithChainSeparation())
 
@@ -81,6 +88,9 @@ func (t Transaction) PrettyPrintBody(ctx context.Context, prefix string, w io.Wr
 // PrettyPrint writes a pretty-printed representation of the transaction to the
 // given writer.
 func (t Transaction) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
+	fmt.Fprintf(w, "%sMethod: %s\n", prefix, t.Method)
+	fmt.Fprintf(w, "%sBody:\n", prefix)
+	t.PrettyPrintBody(ctx, prefix+"  ", w)
 	fmt.Fprintf(w, "%sNonce:  %d\n", prefix, t.Nonce)
 	if t.Fee != nil {
 		fmt.Fprintf(w, "%sFee:\n", prefix)
@@ -88,10 +98,6 @@ func (t Transaction) PrettyPrint(ctx context.Context, prefix string, w io.Writer
 	} else {
 		fmt.Fprintf(w, "%sFee:   none\n", prefix)
 	}
-	fmt.Fprintf(w, "%sMethod: %s\n", prefix, t.Method)
-	fmt.Fprintf(w, "%sBody:\n", prefix)
-	t.PrettyPrintBody(ctx, prefix+"  ", w)
-
 	if genesisHash, ok := ctx.Value(prettyprint.ContextKeyGenesisHash).(hash.Hash); ok {
 		fmt.Println("Other info:")
 		fmt.Printf("  Genesis document's hash: %s\n", genesisHash)
@@ -99,7 +105,7 @@ func (t Transaction) PrettyPrint(ctx context.Context, prefix string, w io.Writer
 }
 
 // PrettyType returns a representation of the type that can be used for pretty printing.
-func (t *Transaction) PrettyType() (interface{}, error) {
+func (t *Transaction) PrettyType() (any, error) {
 	bodyType := t.Method.BodyType()
 	if bodyType == nil {
 		return nil, fmt.Errorf("unknown method body type")
@@ -133,7 +139,7 @@ func (t *Transaction) SanityCheck() error {
 }
 
 // NewTransaction creates a new transaction.
-func NewTransaction(nonce uint64, fee *Fee, method MethodName, body interface{}) *Transaction {
+func NewTransaction(nonce uint64, fee *Fee, method MethodName, body any) *Transaction {
 	var rawBody []byte
 	if body != nil {
 		rawBody = cbor.Marshal(body)
@@ -152,13 +158,13 @@ func NewTransaction(nonce uint64, fee *Fee, method MethodName, body interface{})
 //
 // It should only be used for pretty printing.
 type PrettyTransaction struct {
-	Nonce  uint64      `json:"nonce"`
-	Fee    *Fee        `json:"fee,omitempty"`
-	Method MethodName  `json:"method"`
-	Body   interface{} `json:"body,omitempty"`
+	Nonce  uint64     `json:"nonce"`
+	Fee    *Fee       `json:"fee,omitempty"`
+	Method MethodName `json:"method"`
+	Body   any        `json:"body,omitempty"`
 }
 
-// SignedTransaction is a signed transaction.
+// SignedTransaction is a signed consensus transaction.
 type SignedTransaction struct {
 	signature.Signed
 }
@@ -195,7 +201,7 @@ func (s SignedTransaction) PrettyPrint(ctx context.Context, prefix string, w io.
 }
 
 // PrettyType returns a representation of the type that can be used for pretty printing.
-func (s SignedTransaction) PrettyType() (interface{}, error) {
+func (s SignedTransaction) PrettyType() (any, error) {
 	var tx Transaction
 	if err := cbor.Unmarshal(s.Blob, &tx); err != nil {
 		return nil, fmt.Errorf("malformed signed blob: %w", err)
@@ -204,7 +210,7 @@ func (s SignedTransaction) PrettyType() (interface{}, error) {
 }
 
 // Open first verifies the blob signature and then unmarshals the blob.
-func (s *SignedTransaction) Open(tx *Transaction) error { // nolint: interfacer
+func (s *SignedTransaction) Open(tx *Transaction) error {
 	return s.Signed.Open(SignatureContext, tx)
 }
 
@@ -218,8 +224,77 @@ func Sign(signer signature.Signer, tx *Transaction) (*SignedTransaction, error) 
 	return &SignedTransaction{Signed: *signed}, nil
 }
 
+// OpenRawTransactions takes a vector of raw byte-serialized SignedTransactions,
+// and deserializes them, returning all of the signing public key and deserialized
+// Transaction, for the transactions that have valid signatures.
+//
+// The index of each of the return values is that of the corresponding raw
+// transaction input.
+func OpenRawTransactions(rawTxBytes [][]byte) ([]signature.PublicKey, []*Transaction, []error) {
+	l := len(rawTxBytes)
+	publicKeys := make([]signature.PublicKey, l)
+	txes := make([]*Transaction, l)
+
+	// Deserialize the transaction envelopes.
+	verifier := signature.NewBatchVerifierWithCapacity(l)
+	signedTxes := make([]SignedTransaction, l)
+	for i, v := range rawTxBytes {
+		err := cbor.Unmarshal(v, &signedTxes[i])
+		switch err {
+		case nil:
+			publicKeys[i] = signedTxes[i].Signed.Signature.PublicKey
+			verifier.Add(
+				publicKeys[i],
+				SignatureContext,
+				signedTxes[i].Signed.Blob,
+				signedTxes[i].Signed.Signature.Signature[:],
+			)
+		default:
+			verifier.AddError(err)
+		}
+	}
+
+	// Verify the transaction signatures, and deserialize the valid transactions.
+	_, errs := verifier.Verify()
+	for i, sigErr := range errs {
+		if sigErr != nil {
+			continue
+		}
+		var tx Transaction
+		if err := cbor.Unmarshal(signedTxes[i].Signed.Blob, &tx); err != nil {
+			errs[i] = err
+			continue
+		}
+		txes[i] = &tx
+	}
+
+	return publicKeys, txes, errs
+}
+
 // MethodSeparator is the separator used to separate backend name from method name.
 const MethodSeparator = "."
+
+// MethodPriority is the method handling priority.
+type MethodPriority uint8
+
+const (
+	// MethodPriorityNormal is the normal method priority.
+	MethodPriorityNormal = 0
+	// MethodPriorityCritical is the priority for methods critical to the protocol operation.
+	MethodPriorityCritical = 255
+)
+
+// MethodMetadata is the method metadata.
+type MethodMetadata struct {
+	Priority MethodPriority
+}
+
+// MethodMetadataProvider is the method metadata provider interface that can be implemented by
+// method body types to provide additional method metadata.
+type MethodMetadataProvider interface {
+	// MethodMetadata returns the method metadata.
+	MethodMetadata() MethodMetadata
+}
 
 // MethodName is a method name.
 type MethodName string
@@ -234,22 +309,47 @@ func (m MethodName) SanityCheck() error {
 }
 
 // BodyType returns the registered body type associated with this method.
-func (m MethodName) BodyType() interface{} {
+func (m MethodName) BodyType() any {
 	bodyType, _ := registeredMethods.Load(string(m))
 	return bodyType
+}
+
+// Metadata returns the method metadata.
+func (m MethodName) Metadata() MethodMetadata {
+	mp, ok := m.BodyType().(MethodMetadataProvider)
+	if !ok {
+		// Return defaults.
+		return MethodMetadata{
+			Priority: MethodPriorityNormal,
+		}
+	}
+	return mp.MethodMetadata()
+}
+
+// IsCritical returns true if the method is critical for the operation of the protocol.
+func (m MethodName) IsCritical() bool {
+	return m.Metadata().Priority == MethodPriorityCritical
 }
 
 // NewMethodName creates a new method name.
 //
 // Module and method pair must be unique. If they are not, this method
 // will panic.
-func NewMethodName(module, method string, bodyType interface{}) MethodName {
+func NewMethodName(module, method string, bodyType any) MethodName {
 	// Check for duplicate method names.
 	name := module + MethodSeparator + method
-	if _, isRegistered := registeredMethods.Load(name); isRegistered {
+	if _, isRegistered := registeredMethods.LoadOrStore(name, bodyType); isRegistered {
 		panic(fmt.Errorf("transaction: method already registered: %s", name))
 	}
-	registeredMethods.Store(name, bodyType)
 
 	return MethodName(name)
+}
+
+// Proof is a proof of transaction inclusion in a block.
+type Proof struct {
+	// Height is the block height at which the transaction was published.
+	Height int64 `json:"height"`
+
+	// RawProof is the actual raw proof.
+	RawProof []byte `json:"raw_proof"`
 }

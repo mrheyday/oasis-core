@@ -12,39 +12,51 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
-	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
+	consensusAPI "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
-const (
-	// NameParallel is the name of the parallel workload.
-	NameParallel = "parallel"
+// NameParallel is the name of the parallel workload.
+const NameParallel = "parallel"
 
-	parallelSendWaitTimeoutInterval = 30 * time.Second
-	parallelSendTimeoutInterval     = 60 * time.Second
-	parallelConcurency              = 200
-	parallelTxTransferAmount        = 100
-	parallelTxFundInterval          = 10
+// Parallel is the parallel workload.
+var Parallel = &parallel{
+	BaseWorkload: NewBaseWorkload(NameParallel),
+}
+
+const (
+	parallelSendWaitTimeout     = 120 * time.Second
+	parallelSendTimeoutInterval = 60 * time.Second
+	parallelConcurency          = 200
+	parallelTxTransferAmount    = 100
+	parallelTxFundInterval      = 10
 )
 
 var parallelLogger = logging.GetLogger("cmd/txsource/workload/parallel")
 
-type parallel struct{}
+type parallel struct {
+	BaseWorkload
+}
 
 // Implements Workload.
-func (parallel) NeedsFunds() bool {
+func (p *parallel) NeedsFunds() bool {
 	return true
 }
 
 // Implements workload.
-func (parallel) Run(
+func (p *parallel) Run(
 	gracefulExit context.Context,
 	rng *rand.Rand,
-	conn *grpc.ClientConn,
-	cnsc consensus.ClientBackend,
+	_ *grpc.ClientConn,
+	consensus consensusAPI.Services,
+	sm consensusAPI.SubmissionManager,
 	fundingAccount signature.Signer,
+	_ []signature.Signer,
 ) error {
+	// Initialize base workload.
+	p.BaseWorkload.Init(consensus, sm, fundingAccount)
+
 	ctx := context.Background()
 	var err error
 
@@ -56,13 +68,14 @@ func (parallel) Run(
 	if err = xfer.Amount.FromInt64(parallelTxTransferAmount); err != nil {
 		return fmt.Errorf("transfer base units FromInt64 %d: %w", parallelTxTransferAmount, err)
 	}
-	txGasAmount, err = cnsc.EstimateGas(ctx, &consensus.EstimateGasRequest{
+	txGasAmount, err = consensus.Core().EstimateGas(ctx, &consensusAPI.EstimateGasRequest{
 		Signer:      fundingAccount.Public(),
 		Transaction: staking.NewTransferTx(0, nil, xfer),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to estimate gas: %w", err)
 	}
+	gasPrice := p.GasPrice()
 
 	accounts := make([]signature.Signer, parallelConcurency)
 	fac := memorySigner.NewFactory()
@@ -74,9 +87,9 @@ func (parallel) Run(
 
 		// Initial funding of accounts.
 		fundAmount := parallelTxTransferAmount + // self transfer amount
-			parallelTxFundInterval*txGasAmount*gasPrice // gas for `parallelTxFundInterval` transfers.
+			parallelTxFundInterval*uint64(txGasAmount)*gasPrice // gas for `parallelTxFundInterval` transfers.
 		addr := staking.NewAddress(accounts[i].Public())
-		if err = transferFunds(ctx, parallelLogger, cnsc, fundingAccount, addr, int64(fundAmount)); err != nil {
+		if err = p.TransferFunds(ctx, fundingAccount, addr, fundAmount); err != nil {
 			return fmt.Errorf("account funding failure: %w", err)
 		}
 	}
@@ -88,7 +101,7 @@ func (parallel) Run(
 		Gas: txGasAmount,
 	}
 	if err = fee.Amount.FromUint64(uint64(txGasAmount) * gasPrice); err != nil {
-		return fmt.Errorf("Fee amount error: %w", err)
+		return fmt.Errorf("fee amount error: %w", err)
 	}
 
 	for i := uint64(1); ; i++ {
@@ -123,7 +136,7 @@ func (parallel) Run(
 				parallelLogger.Debug("submitting self transfer",
 					"account", addr,
 				)
-				if err = cnsc.SubmitTx(ctx, signedTx); err != nil {
+				if err = consensus.Core().SubmitTx(ctx, signedTx); err != nil {
 					parallelLogger.Error("SubmitTx error", "err", err)
 					errCh <- fmt.Errorf("cnsc.SubmitTx: %w", err)
 					return
@@ -140,7 +153,7 @@ func (parallel) Run(
 		}()
 
 		select {
-		case <-time.After(parallelSendWaitTimeoutInterval):
+		case <-time.After(parallelSendWaitTimeout):
 			parallelLogger.Error("transactions not completed within timeout")
 			return fmt.Errorf("workload parallel: transactions not completed within timeout")
 
@@ -159,9 +172,9 @@ func (parallel) Run(
 		if i%parallelTxFundInterval == 0 {
 			// Re-fund accounts for next `parallelTxFundInterval` transfers.
 			for i := range accounts {
-				fundAmount := parallelTxFundInterval * txGasAmount * gasPrice // gas for `parallelTxFundInterval` transfers.
+				fundAmount := parallelTxFundInterval * uint64(txGasAmount) * gasPrice // gas for `parallelTxFundInterval` transfers.
 				addr := staking.NewAddress(accounts[i].Public())
-				if err = transferFunds(ctx, parallelLogger, cnsc, fundingAccount, addr, int64(fundAmount)); err != nil {
+				if err = p.TransferFunds(ctx, fundingAccount, addr, fundAmount); err != nil {
 					return fmt.Errorf("account funding failure: %w", err)
 				}
 			}

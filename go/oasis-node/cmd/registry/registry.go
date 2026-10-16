@@ -9,9 +9,21 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/registry/runtime"
 )
 
+const (
+	// SubcommandRegistry is the registry subcommand.
+	CmdRegistry = "registry"
+	// CmdEntity is the entity subcommand.
+	CmdEntity = "entity"
+	// CmdUpdate is the update subcommand.
+	CmdUpdate = "update"
+	// CmdInit is the init subcommand.
+	CmdInit = "init"
+)
+
 var registryCmd = &cobra.Command{
-	Use:   "registry",
-	Short: "registry backend utilities",
+	Use:        CmdRegistry,
+	Short:      "registry backend utilities",
+	Deprecated: "use the `oasis` CLI instead.",
 }
 
 // Register registers the registry sub-command and all of it's children.

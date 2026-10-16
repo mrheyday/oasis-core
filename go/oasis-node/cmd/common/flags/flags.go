@@ -5,6 +5,8 @@ package flags
 import (
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
+
+	"github.com/oasisprotocol/oasis-core/go/config"
 )
 
 const (
@@ -16,8 +18,6 @@ const (
 	CfgDebugTestEntity = "debug.test_entity"
 	// CfgGenesisFile is the flag used to specify a genesis file.
 	CfgGenesisFile = "genesis.file"
-	// CfgConsensusValidator is the flag used to opt-in to being a validator.
-	CfgConsensusValidator = "consensus.validator"
 
 	cfgVerbose = "verbose"
 	cfgForce   = "force"
@@ -42,8 +42,6 @@ var (
 	// GenesisFileFlags has the genesis file flag.
 	GenesisFileFlags = flag.NewFlagSet("", flag.ContinueOnError)
 
-	// ConsensusValidatorFlag has the consensus validator flag.
-	ConsensusValidatorFlag = flag.NewFlagSet("", flag.ContinueOnError)
 	// DebugDontBlameOasisFlag has the "don't blame oasis" flag.
 	DebugDontBlameOasisFlag = flag.NewFlagSet("", flag.ContinueOnError)
 
@@ -64,15 +62,14 @@ func Force() bool {
 	return viper.GetBool(cfgForce)
 }
 
-// ConsensusValidator returns true iff the node is opting in to be a consensus
-// validator.
-func ConsensusValidator() bool {
-	return viper.GetBool(CfgConsensusValidator)
-}
-
 // DebugTestEntity returns true iff the test entity enable flag is set.
 func DebugTestEntity() bool {
 	return DebugDontBlameOasis() && viper.GetBool(CfgDebugTestEntity)
+}
+
+// DebugAllowRoot returns true iff the root account enable flag is set.
+func DebugAllowRoot() bool {
+	return DebugDontBlameOasis() && config.GlobalConfig.Common.Debug.AllowRoot
 }
 
 // GenesisFile returns the set genesis file.
@@ -100,14 +97,12 @@ func init() {
 
 	ForceFlags.Bool(cfgForce, false, "force")
 
-	ConsensusValidatorFlag.Bool(CfgConsensusValidator, false, "node is a consensus validator")
-
 	DebugTestEntityFlags.Bool(CfgDebugTestEntity, false, "use the test entity (UNSAFE)")
 	_ = DebugTestEntityFlags.MarkHidden(CfgDebugTestEntity)
 
 	GenesisFileFlags.StringP(CfgGenesisFile, "g", "genesis.json", "path to genesis file")
 
-	DebugDontBlameOasisFlag.Bool(CfgDebugDontBlameOasis, false, "Enable debug/unsafe/insecure options")
+	DebugDontBlameOasisFlag.Bool(CfgDebugDontBlameOasis, false, "enable debug/unsafe/insecure options")
 	_ = DebugDontBlameOasisFlag.MarkHidden(CfgDebugDontBlameOasis)
 
 	DryRunFlag.BoolP(CfgDryRun, "n", false, "don't actually do anything, just show what will be done")
@@ -119,7 +114,6 @@ func init() {
 		ForceFlags,
 		DebugTestEntityFlags,
 		GenesisFileFlags,
-		ConsensusValidatorFlag,
 		DebugDontBlameOasisFlag,
 		DryRunFlag,
 		AssumeYesFlag,

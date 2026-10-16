@@ -15,7 +15,7 @@ type Endpoint interface {
 	// certificate chain respectively.
 	VerifyEvidence(ctx context.Context, evidence *Evidence) (*ias.AVRBundle, error)
 
-	// GetSPID returns the SPID and associated info used by the endpoint.
+	// GetSPIDInfo returns the SPID and associated info used by the endpoint.
 	GetSPIDInfo(ctx context.Context) (*SPIDInfo, error)
 
 	// GetSigRL returns the Signature Revocation List for a given EPID group.
@@ -33,8 +33,10 @@ type SPIDInfo struct {
 
 // Evidence is attestation evidence.
 type Evidence struct {
-	RuntimeID   common.Namespace `json:"runtime_id"`
-	Quote       []byte           `json:"quote"`
-	PSEManifest []byte           `json:"pse_manifest"`
-	Nonce       string           `json:"nonce"`
+	RuntimeID                  common.Namespace `json:"runtime_id"`
+	Quote                      []byte           `json:"quote"`
+	PSEManifest                []byte           `json:"pse_manifest"`
+	Nonce                      string           `json:"nonce"`
+	EarlyTCBUpdate             bool             `json:"early_tcb_update,omitempty"`
+	MinTCBEvaluationDataNumber uint32           `json:"min_tcb_evaluation_data_number,omitempty"`
 }

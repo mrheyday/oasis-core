@@ -5,7 +5,7 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -192,8 +192,11 @@ func (env *Env) Cleanup() {
 	}
 
 	// Tear down this environment's commands.
-	for _, v := range env.cleanupCmds {
-		v.termOrKill()
+	for _, m := range env.cleanupCmds {
+		go m.termOrKill()
+	}
+	for _, m := range env.cleanupCmds {
+		<-m.doneCh
 	}
 
 	// Do the cleanup for this environment.
@@ -240,7 +243,7 @@ func (env *Env) WriteScenarioInfo() error {
 	if err != nil {
 		return err
 	}
-	if err = ioutil.WriteFile(filepath.Join(env.Dir(), "scenario_info.json"), b, 0o644); err != nil { // nolint: gosec
+	if err = os.WriteFile(filepath.Join(env.Dir(), "scenario_info.json"), b, 0o644); err != nil { // nolint: gosec
 		return err
 	}
 

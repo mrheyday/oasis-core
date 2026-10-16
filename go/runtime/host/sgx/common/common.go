@@ -1,0 +1,188 @@
+// Package common implements common SGX functions.
+package common
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/cenkalti/backoff/v4"
+
+	"github.com/oasisprotocol/oasis-core/go/common/cbor"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	"github.com/oasisprotocol/oasis-core/go/common/identity"
+	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	"github.com/oasisprotocol/oasis-core/go/common/node"
+	"github.com/oasisprotocol/oasis-core/go/common/sgx/pcs"
+	sgxQuote "github.com/oasisprotocol/oasis-core/go/common/sgx/quote"
+	"github.com/oasisprotocol/oasis-core/go/runtime/host"
+	"github.com/oasisprotocol/oasis-core/go/runtime/host/protocol"
+	"github.com/oasisprotocol/oasis-core/go/runtime/host/sandbox"
+)
+
+// EndorseCapabilityTEE endorses the given CapabilityTEE and submits the signed endorsement to the
+// runtime over the given connection.
+func EndorseCapabilityTEE(
+	ctx context.Context,
+	identity *identity.Identity,
+	capabilityTEE *node.CapabilityTEE,
+	conn protocol.Connection,
+	logger *logging.Logger,
+) {
+	ri, err := conn.GetInfo()
+	if err != nil {
+		logger.Error("failed to get host information, not endorsing local component",
+			"err", err,
+		)
+		return
+	}
+	if !ri.Features.EndorsedCapabilityTEE {
+		logger.Debug("runtime does not support endorsed TEE capabilities, skipping endorsement")
+		return
+	}
+
+	// Endorse CapabilityTEE by signing it under the proper domain separation context.
+	nodeSignature, err := signature.Sign(
+		identity.NodeSigner,
+		node.EndorseCapabilityTEESignatureContext,
+		cbor.Marshal(capabilityTEE),
+	)
+	if err != nil {
+		logger.Error("failed to sign endorsement of local component",
+			"err", err,
+		)
+		return
+	}
+
+	_, err = conn.Call(ctx, &protocol.Body{
+		RuntimeCapabilityTEEUpdateEndorsementRequest: &protocol.RuntimeCapabilityTEEUpdateEndorsementRequest{
+			EndorsedCapabilityTEE: node.EndorsedCapabilityTEE{
+				CapabilityTEE:   *capabilityTEE,
+				NodeEndorsement: *nodeSignature,
+			},
+		},
+	})
+	if err != nil {
+		logger.Error("failed to update endorsement of local component",
+			"err", err,
+		)
+		return
+	}
+
+	logger.Debug("successfully updated component's TEE capability endorsement")
+}
+
+// UpdateRuntimeQuote sends the given quote bundle to the runtime so it can be configured for remote
+// attestation purposes. The runtime responds with a signed attestation.
+func UpdateRuntimeQuote(ctx context.Context, conn protocol.Connection, quote *pcs.QuoteBundle) ([]byte, error) {
+	// Prepare quote structure.
+	q := sgxQuote.Quote{
+		PCS: quote,
+	}
+
+	// Call the runtime with the quote and TCB bundle.
+	rspBody, err := conn.Call(
+		ctx,
+		&protocol.Body{
+			RuntimeCapabilityTEERakQuoteRequest: &protocol.RuntimeCapabilityTEERakQuoteRequest{
+				Quote: q,
+			},
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error while configuring quote: %w", err)
+	}
+	rsp := rspBody.RuntimeCapabilityTEERakQuoteResponse
+	if rsp == nil {
+		return nil, fmt.Errorf("unexpected response from runtime")
+	}
+
+	return cbor.Marshal(node.SGXAttestation{
+		Versioned: cbor.NewVersioned(node.LatestSGXAttestationVersion),
+		Quote:     q,
+		Height:    rsp.Height,
+		Signature: rsp.Signature,
+	}), nil
+}
+
+// AttestationWorker is the periodic re-attestation worker loop.
+//
+// It should be started in its own goroutine.
+func AttestationWorker(
+	interval time.Duration,
+	logger *logging.Logger,
+	hp *sandbox.HostInitializerParams,
+	updateCapabilityFunc func(context.Context, *sandbox.HostInitializerParams) (*node.CapabilityTEE, error),
+) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	var retryTicker *backoff.Ticker
+	defer func() {
+		if retryTicker == nil {
+			return
+		}
+		retryTicker.Stop()
+		retryTicker = nil
+	}()
+
+	logger = logger.With("runtime_id", hp.Runtime.ID())
+
+	// Get the event emitter.
+	eventEmitter, _ := hp.Runtime.(host.RuntimeEventEmitter)
+
+	for {
+		var retryCh <-chan time.Time
+		if retryTicker != nil {
+			retryCh = retryTicker.C
+		}
+
+		select {
+		case <-hp.Process.Wait():
+			// Process has terminated.
+			return
+		case <-t.C:
+			// Re-attest based on the configured interval.
+		case <-retryCh:
+			// Re-attest based on retry ticker after failure.
+		case <-hp.NotifyUpdateCapabilityTEE:
+			// Re-attest when explicitly requested. Also reset the periodic ticker to make sure we
+			// don't needlessly re-attest too often.
+			t.Reset(interval)
+		}
+
+		// Update CapabilityTEE.
+		logger.Info("regenerating CapabilityTEE")
+
+		capabilityTEE, err := updateCapabilityFunc(context.Background(), hp)
+		if err != nil {
+			logger.Error("failed to regenerate CapabilityTEE",
+				"err", err,
+			)
+
+			// Setup a retry ticker so we retry attestation faster than the configured interval.
+			if retryTicker == nil {
+				expBackoff := backoff.NewExponentialBackOff(
+					backoff.WithMaxElapsedTime(0), // Never stop.
+				)
+				retryTicker = backoff.NewTicker(expBackoff)
+			}
+
+			continue
+		}
+
+		// Clear retry ticker after successful attestation.
+		if retryTicker != nil {
+			retryTicker.Stop()
+			retryTicker = nil
+		}
+
+		// Emit event about the updated CapabilityTEE.
+		if eventEmitter != nil {
+			eventEmitter.EmitEvent(&host.Event{Updated: &host.UpdatedEvent{
+				Version:       hp.Version,
+				CapabilityTEE: capabilityTEE,
+			}})
+		}
+	}
+}

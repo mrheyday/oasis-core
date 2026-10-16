@@ -18,7 +18,7 @@ const (
 
 // RemoteSignerParamsDummy is a dummy instance of remoteSignerImpl used to register global
 // remote-signer flags.
-var RemoteSignerParamsDummy *remoteSignerImpl = newRemoteSignerImpl("")
+var RemoteSignerParamsDummy = newRemoteSignerImpl("")
 
 type remoteSignerImpl struct {
 	name   string
@@ -59,7 +59,7 @@ func (sc *remoteSignerImpl) Parameters() *env.ParameterFlagSet {
 	return sc.flags
 }
 
-func (sc *remoteSignerImpl) PreInit(childEnv *env.Env) error {
+func (sc *remoteSignerImpl) PreInit() error {
 	return nil
 }
 
@@ -67,7 +67,11 @@ func (sc *remoteSignerImpl) Fixture() (*oasis.NetworkFixture, error) {
 	return nil, nil
 }
 
-func (sc *remoteSignerImpl) Init(childEnv *env.Env, net *oasis.Network) error {
+func (sc *remoteSignerImpl) Network() *oasis.Network {
+	return nil
+}
+
+func (sc *remoteSignerImpl) Init(*env.Env, *oasis.Network) error {
 	return nil
 }
 

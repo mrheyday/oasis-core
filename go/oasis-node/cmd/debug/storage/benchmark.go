@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -18,8 +17,6 @@ import (
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
-	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
-	"github.com/oasisprotocol/oasis-core/go/common/identity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	storageAPI "github.com/oasisprotocol/oasis-core/go/storage/api"
@@ -41,7 +38,7 @@ var (
 	storageBenchmarkFlags = flag.NewFlagSet("", flag.ContinueOnError)
 )
 
-func doBenchmark(cmd *cobra.Command, args []string) { // nolint: gocyclo
+func doBenchmark(_ *cobra.Command, _ []string) { // nolint: gocyclo
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
@@ -53,7 +50,7 @@ func doBenchmark(cmd *cobra.Command, args []string) { // nolint: gocyclo
 	// Initialize the data directory.
 	dataDir := cmdCommon.DataDir()
 	if dataDir == "" {
-		dataDir, err = ioutil.TempDir("", "storage-benchmark")
+		dataDir, err = os.MkdirTemp("", "storage-benchmark")
 		if err != nil {
 			logger.Error("failed to initialize data directory",
 				"err", err,
@@ -68,21 +65,9 @@ func doBenchmark(cmd *cobra.Command, args []string) { // nolint: gocyclo
 		defer os.RemoveAll(dataDir)
 	}
 
-	// Create an identity.
-	ident, err := identity.LoadOrGenerate(dataDir, memorySigner.NewFactory(), false)
-	if err != nil {
-		logger.Error("failed to generate a new identity",
-			"err", err,
-		)
-		return
-	}
-
-	// Disable expected root checks.
-	viper.Set("storage.debug.insecure_skip_checks", true)
-
 	var ns common.Namespace
 
-	storage, err := storage.NewLocalBackend(dataDir, ns, ident)
+	storage, err := storage.NewLocalBackend(dataDir, ns)
 	if err != nil {
 		logger.Error("failed to initialize storage",
 			"err", err,
@@ -139,8 +124,7 @@ func doBenchmark(cmd *cobra.Command, args []string) { // nolint: gocyclo
 				wl := storageAPI.WriteLog{storageAPI.LogEntry{Key: key, Value: buf}}
 				b.StartTimer()
 
-				var receipts []*storageAPI.Receipt
-				receipts, err = storage.Apply(context.Background(), &storageAPI.ApplyRequest{
+				err = storage.Apply(context.Background(), &storageAPI.ApplyRequest{
 					Namespace: ns,
 					SrcRound:  0,
 					SrcRoot:   root,
@@ -151,15 +135,6 @@ func doBenchmark(cmd *cobra.Command, args []string) { // nolint: gocyclo
 				if err != nil {
 					b.Fatalf("failed to Apply(): %v", err)
 				}
-
-				// Open the first receipt and obtain the new root from it.
-				b.StopTimer()
-				var receiptBody storageAPI.ReceiptBody
-				if err = receipts[0].Open(&receiptBody); err != nil {
-					b.Fatalf("failed to Open(): %v", err)
-				}
-				newRoot.Hash = receiptBody.Roots[0]
-				b.StartTimer()
 			}
 		})
 		if err != nil {
@@ -223,7 +198,7 @@ func doBenchmark(cmd *cobra.Command, args []string) { // nolint: gocyclo
 					}
 					b.StartTimer()
 
-					_, err = storage.Apply(context.Background(), &storageAPI.ApplyRequest{
+					err = storage.Apply(context.Background(), &storageAPI.ApplyRequest{
 						Namespace: ns,
 						SrcRound:  0,
 						SrcRoot:   root,
@@ -273,7 +248,7 @@ func doBenchmark(cmd *cobra.Command, args []string) { // nolint: gocyclo
 		b.SetParallelism(100)
 		b.RunParallel(func(pb *testing.PB) {
 			for pb.Next() {
-				_, cerr = storage.Apply(context.Background(), &storageAPI.ApplyRequest{
+				cerr = storage.Apply(context.Background(), &storageAPI.ApplyRequest{
 					Namespace: ns,
 					SrcRound:  0,
 					SrcRoot:   emptyRoot,

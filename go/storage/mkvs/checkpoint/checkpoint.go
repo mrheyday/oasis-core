@@ -6,7 +6,6 @@ import (
 	"io"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
 	"github.com/oasisprotocol/oasis-core/go/common/errors"
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/node"
 )
@@ -61,7 +60,13 @@ type Creator interface {
 	ChunkProvider
 
 	// CreateCheckpoint creates a new checkpoint at the given root.
-	CreateCheckpoint(ctx context.Context, root node.Root, chunkSize uint64) (*Metadata, error)
+	//
+	// If 0 chunker threads are specified the old (deprecated) sequential algorithm is used.
+	// Otherwise, chunks are created in parallel up to target chunker threads.
+	//
+	// Warning: Only with same chunk size and chunker threads the generated checkpoint hash for the given root
+	//          will be the same.
+	CreateCheckpoint(ctx context.Context, root node.Root, chunkSize uint64, chunkerThreads uint16) (*Metadata, error)
 
 	// GetCheckpoint retrieves checkpoint metadata for a specific checkpoint.
 	GetCheckpoint(ctx context.Context, version uint16, root node.Root) (*Metadata, error)
@@ -73,11 +78,15 @@ type Creator interface {
 // Restorer is a checkpoint restorer.
 type Restorer interface {
 	// StartRestore starts a checkpoint restoration process.
+	//
+	// Multipart management in the underlying database is the responsibility of the caller.
 	StartRestore(ctx context.Context, checkpoint *Metadata) error
 
 	// AbortRestore aborts a checkpoint restore in progress.
 	//
 	// It is not an error to call this method when no checkpoint restore is in progress.
+	//
+	// Multipart management in the underlying database is the responsibility of the caller.
 	AbortRestore(ctx context.Context) error
 
 	// GetCurrentCheckpoint returns the checkpoint that is being restored. If no restoration is in
@@ -88,7 +97,10 @@ type Restorer interface {
 	//
 	// This method requires that a restoration is in progress.
 	//
-	// Returns true when the checkpoint has been fully restored.
+	// Returns true when the checkpoint has been fully restored. At this point,
+	// the restoration is also cleaned  up so that AbortRestore doesn't need to be called.
+	//
+	// Multipart management in the underlying database is the responsibility of the caller.
 	RestoreChunk(ctx context.Context, index uint64, r io.Reader) (bool, error)
 }
 
@@ -109,38 +121,4 @@ func NewCreateRestorer(creator Creator, restorer Restorer) CreateRestorer {
 		Creator:  creator,
 		Restorer: restorer,
 	}
-}
-
-// ChunkMetadata is chunk metadata.
-type ChunkMetadata struct {
-	Version uint16    `json:"version"`
-	Root    node.Root `json:"root"`
-	Index   uint64    `json:"index"`
-	Digest  hash.Hash `json:"digest"`
-}
-
-// Metadata is checkpoint metadata.
-type Metadata struct {
-	Version uint16      `json:"version"`
-	Root    node.Root   `json:"root"`
-	Chunks  []hash.Hash `json:"chunks"`
-}
-
-// EncodedHash returns the encoded cryptographic hash of the checkpoint metadata.
-func (m *Metadata) EncodedHash() hash.Hash {
-	return hash.NewFrom(m)
-}
-
-// GetChunkMetadata returns the chunk metadata for the corresponding chunk.
-func (m Metadata) GetChunkMetadata(idx uint64) (*ChunkMetadata, error) {
-	if idx >= uint64(len(m.Chunks)) {
-		return nil, ErrChunkNotFound
-	}
-
-	return &ChunkMetadata{
-		Version: m.Version,
-		Root:    m.Root,
-		Index:   idx,
-		Digest:  m.Chunks[int(idx)],
-	}, nil
 }

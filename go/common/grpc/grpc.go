@@ -4,17 +4,15 @@ package grpc
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	"github.com/prometheus/client_golang/prometheus"
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -36,6 +34,11 @@ const (
 
 	maxRecvMsgSize = 104857600 // 100 MiB
 	maxSendMsgSize = 104857600 // 100 MiB
+
+	gracefulStopWaitPeriod = 5 * time.Second
+
+	// labelCall is the label for the call method.
+	labelCall = "call"
 )
 
 var (
@@ -50,42 +53,42 @@ var (
 			Name: "oasis_grpc_server_calls",
 			Help: "Number of gRPC calls.",
 		},
-		[]string{"call"},
+		[]string{labelCall},
 	)
 	grpcServerLatency = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
 			Name: "oasis_grpc_server_latency",
 			Help: "gRPC call latency (seconds).",
 		},
-		[]string{"call"},
+		[]string{labelCall},
 	)
 	grpcServerStreamWrites = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "oasis_grpc_server_stream_writes",
 			Help: "Number of gRPC stream writes.",
 		},
-		[]string{"call"},
+		[]string{labelCall},
 	)
 	grpcClientCalls = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "oasis_grpc_client_calls",
 			Help: "Number of gRPC calls.",
 		},
-		[]string{"call"},
+		[]string{labelCall},
 	)
 	grpcClientLatency = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
 			Name: "oasis_grpc_client_latency",
 			Help: "gRPC call latency (seconds).",
 		},
-		[]string{"call"},
+		[]string{labelCall},
 	)
 	grpcClientStreamWrites = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "oasis_grpc_client_stream_writes",
 			Help: "Number of gRPC stream writes.",
 		},
-		[]string{"call"},
+		[]string{labelCall},
 	)
 
 	grpcCollectors = []prometheus.Collector{
@@ -115,55 +118,55 @@ type grpcLogAdapter struct {
 	isDebug   bool
 }
 
-func (l *grpcLogAdapter) Info(args ...interface{}) {
+func (l *grpcLogAdapter) Info(args ...any) {
 	l.logger.Info(fmt.Sprint(args...))
 }
 
-func (l *grpcLogAdapter) Infoln(args ...interface{}) {
+func (l *grpcLogAdapter) Infoln(args ...any) {
 	l.logger.Info(fmt.Sprintln(args...))
 }
 
-func (l *grpcLogAdapter) Infof(format string, args ...interface{}) {
+func (l *grpcLogAdapter) Infof(format string, args ...any) {
 	l.logger.Info(fmt.Sprintf(format, args...))
 }
 
-func (l *grpcLogAdapter) Warning(args ...interface{}) {
+func (l *grpcLogAdapter) Warning(args ...any) {
 	l.logger.Warn(fmt.Sprint(args...))
 }
 
-func (l *grpcLogAdapter) Warningln(args ...interface{}) {
+func (l *grpcLogAdapter) Warningln(args ...any) {
 	l.logger.Warn(fmt.Sprintln(args...))
 }
 
-func (l *grpcLogAdapter) Warningf(format string, args ...interface{}) {
+func (l *grpcLogAdapter) Warningf(format string, args ...any) {
 	l.logger.Warn(fmt.Sprintf(format, args...))
 }
 
-func (l *grpcLogAdapter) Error(args ...interface{}) {
+func (l *grpcLogAdapter) Error(args ...any) {
 	l.logger.Error(fmt.Sprint(args...))
 }
 
-func (l *grpcLogAdapter) Errorln(args ...interface{}) {
+func (l *grpcLogAdapter) Errorln(args ...any) {
 	l.logger.Error(fmt.Sprintln(args...))
 }
 
-func (l *grpcLogAdapter) Errorf(format string, args ...interface{}) {
+func (l *grpcLogAdapter) Errorf(format string, args ...any) {
 	l.logger.Error(fmt.Sprintf(format, args...))
 }
 
-func (l *grpcLogAdapter) Fatal(args ...interface{}) {
+func (l *grpcLogAdapter) Fatal(args ...any) {
 	l.logger.Error(fmt.Sprint(args...),
 		"fatal", true,
 	)
 }
 
-func (l *grpcLogAdapter) Fatalln(args ...interface{}) {
+func (l *grpcLogAdapter) Fatalln(args ...any) {
 	l.logger.Error(fmt.Sprintln(args...),
 		"fatal", true,
 	)
 }
 
-func (l *grpcLogAdapter) Fatalf(format string, args ...interface{}) {
+func (l *grpcLogAdapter) Fatalf(format string, args ...any) {
 	l.logger.Error(fmt.Sprintf(format, args...),
 		"fatal", true,
 	)
@@ -173,7 +176,7 @@ func (l *grpcLogAdapter) V(level int) bool {
 	return l.verbosity >= level
 }
 
-func (l *grpcLogAdapter) unaryLogger(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+func (l *grpcLogAdapter) unaryLogger(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	// TODO: Pull useful things out of ctx for logging.
 	seq := atomic.AddUint64(&l.reqSeq, 1)
 	if l.isDebug {
@@ -184,34 +187,34 @@ func (l *grpcLogAdapter) unaryLogger(ctx context.Context, req interface{}, info 
 		)
 	}
 
-	grpcServerCalls.With(prometheus.Labels{"call": info.FullMethod}).Inc()
+	grpcServerCalls.With(prometheus.Labels{labelCall: info.FullMethod}).Inc()
 
 	start := time.Now()
-	resp, err = handler(ctx, req)
-	grpcServerLatency.With(prometheus.Labels{"call": info.FullMethod}).Observe(time.Since(start).Seconds())
-	switch err {
-	case nil:
-		if l.isDebug {
-			l.reqLogger.Debug("request succeeded",
-				"method", info.FullMethod,
-				"req_seq", seq,
-				"resp", resp,
-			)
-		}
-	default:
+	rsp, err := handler(ctx, req)
+	grpcServerLatency.With(prometheus.Labels{labelCall: info.FullMethod}).Observe(time.Since(start).Seconds())
+	if err != nil {
 		l.reqLogger.Error("request failed",
 			"method", info.FullMethod,
 			"req_seq", seq,
 			"err", err,
 		)
+		return nil, err
 	}
 
-	return
+	if l.isDebug {
+		l.reqLogger.Debug("request succeeded",
+			"method", info.FullMethod,
+			"req_seq", seq,
+			"resp", rsp,
+		)
+	}
+
+	return rsp, nil
 }
 
 func (l *grpcLogAdapter) unaryClientLogger(ctx context.Context,
 	method string,
-	req, rsp interface{},
+	req, rsp any,
 	cc *grpc.ClientConn,
 	invoker grpc.UnaryInvoker,
 	opts ...grpc.CallOption,
@@ -225,11 +228,11 @@ func (l *grpcLogAdapter) unaryClientLogger(ctx context.Context,
 		)
 	}
 
-	grpcClientCalls.With(prometheus.Labels{"call": method}).Inc()
+	grpcClientCalls.With(prometheus.Labels{labelCall: method}).Inc()
 
 	start := time.Now()
 	err := invoker(ctx, method, req, rsp, cc, opts...)
-	grpcClientLatency.With(prometheus.Labels{"call": method}).Observe(time.Since(start).Seconds())
+	grpcClientLatency.With(prometheus.Labels{labelCall: method}).Observe(time.Since(start).Seconds())
 	switch err {
 	case nil:
 		if l.isDebug {
@@ -258,7 +261,7 @@ func (l *grpcLogAdapter) streamClientLogger(ctx context.Context,
 	streamer grpc.Streamer,
 	opts ...grpc.CallOption,
 ) (grpc.ClientStream, error) {
-	grpcClientCalls.With(prometheus.Labels{"call": method}).Inc()
+	grpcClientCalls.With(prometheus.Labels{labelCall: method}).Inc()
 
 	seq := atomic.AddUint64(&l.streamSeq, 1)
 	cs, err := streamer(ctx, desc, cc, method, opts...)
@@ -280,7 +283,7 @@ func (l *grpcLogAdapter) streamClientLogger(ctx context.Context,
 	return csLog, err
 }
 
-func (l *grpcLogAdapter) streamLogger(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+func (l *grpcLogAdapter) streamLogger(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	seq := atomic.AddUint64(&l.streamSeq, 1)
 	if l.isDebug {
 		l.reqLogger.Debug("stream",
@@ -296,7 +299,7 @@ func (l *grpcLogAdapter) streamLogger(srv interface{}, ss grpc.ServerStream, inf
 		seq:          seq,
 	}
 
-	grpcServerCalls.With(prometheus.Labels{"call": info.FullMethod}).Inc()
+	grpcServerCalls.With(prometheus.Labels{labelCall: info.FullMethod}).Inc()
 
 	err := handler(srv, stream)
 
@@ -345,8 +348,8 @@ type grpcClientStreamLogger struct {
 	seq    uint64
 }
 
-func (s *grpcClientStreamLogger) SendMsg(m interface{}) error {
-	grpcClientStreamWrites.With(prometheus.Labels{"call": s.method}).Inc()
+func (s *grpcClientStreamLogger) SendMsg(m any) error {
+	grpcClientStreamWrites.With(prometheus.Labels{labelCall: s.method}).Inc()
 	err := s.ClientStream.SendMsg(m)
 
 	if s.logAdapter.isDebug {
@@ -379,8 +382,8 @@ type grpcStreamLogger struct {
 	seq    uint64
 }
 
-func (s *grpcStreamLogger) SendMsg(m interface{}) error {
-	grpcServerStreamWrites.With(prometheus.Labels{"call": s.method}).Inc()
+func (s *grpcStreamLogger) SendMsg(m any) error {
+	grpcServerStreamWrites.With(prometheus.Labels{labelCall: s.method}).Inc()
 	err := s.ServerStream.SendMsg(m)
 
 	if s.logAdapter.isDebug {
@@ -420,7 +423,7 @@ type Server struct {
 }
 
 // ServerConfig holds the configuration used for creating a server.
-type ServerConfig struct { // nolint: maligned
+type ServerConfig struct {
 	// Name of the server being constructed.
 	Name string
 	// Port is the port used for TCP servers.
@@ -465,6 +468,7 @@ func (s *Server) Start() error {
 		s.Logger.Warn("The debug gRPC port is NOT FOR PRODUCTION USE.")
 	}
 
+	var wg sync.WaitGroup
 	for _, v := range s.listenerCfgs {
 		cfg := v
 
@@ -479,13 +483,19 @@ func (s *Server) Start() error {
 
 		s.startedListeners = append(s.startedListeners, ln)
 
-		go func() {
+		wg.Go(func() {
 			if err := server.Serve(ln); err != nil {
-				s.BaseBackgroundService.Stop()
+				server.Stop() // Force stop in case of errors so all other listeners stop.
 				s.errCh <- err
 			}
-		}()
+		})
 	}
+
+	// Wait for all of the listeners to stop.
+	go func() {
+		wg.Wait()
+		s.BaseBackgroundService.Stop()
+	}()
 
 	return nil
 }
@@ -494,6 +504,12 @@ func (s *Server) Start() error {
 func (s *Server) Stop() {
 	s.Lock()
 	defer s.Unlock()
+
+	// If we never started, make sure that the service doesn't hang forever.
+	if len(s.startedListeners) == 0 {
+		s.BaseBackgroundService.Stop()
+		return
+	}
 
 	if s.server != nil {
 		select {
@@ -506,7 +522,19 @@ func (s *Server) Stop() {
 			}
 		default:
 		}
-		s.server.GracefulStop() // Repeated calls are ok.
+
+		// Attempt to stop gracefully, but if that doesn't work, stop forcibly.
+		gracefulCh := make(chan struct{})
+		go func() {
+			s.server.GracefulStop()
+			close(gracefulCh)
+		}()
+		select {
+		case <-gracefulCh:
+		case <-time.After(gracefulStopWaitPeriod):
+			s.Logger.Warn("graceful stop failed, forcing stop")
+			s.server.Stop()
+		}
 		s.server = nil
 	}
 }
@@ -591,13 +619,11 @@ func NewServer(config *ServerConfig) (*Server, error) {
 	var wrapper *grpcWrapper
 	unaryInterceptors := []grpc.UnaryServerInterceptor{
 		logAdapter.unaryLogger,
-		grpc_opentracing.UnaryServerInterceptor(),
 		serverUnaryErrorMapper,
 		auth.UnaryServerInterceptor(config.AuthFunc),
 	}
 	streamInterceptors := []grpc.StreamServerInterceptor{
 		logAdapter.streamLogger,
-		grpc_opentracing.StreamServerInterceptor(),
 		serverStreamErrorMapper,
 		auth.StreamServerInterceptor(config.AuthFunc),
 	}
@@ -607,25 +633,28 @@ func NewServer(config *ServerConfig) (*Server, error) {
 		streamInterceptors = append(streamInterceptors, wrapper.streamInterceptor)
 	}
 	sOpts := []grpc.ServerOption{
-		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(unaryInterceptors...)),
-		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(streamInterceptors...)),
+		grpc.ChainUnaryInterceptor(unaryInterceptors...),
+		grpc.ChainStreamInterceptor(streamInterceptors...),
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
 		grpc.MaxSendMsgSize(maxSendMsgSize),
 		grpc.KeepaliveParams(serverKeepAliveParams),
-		grpc.CustomCodec(&CBORCodec{}), // nolint: staticcheck
+		grpc.ForceServerCodec(&CBORCodec{}),
 	}
-	if config.Identity != nil && config.Identity.GetTLSCertificate() != nil {
+	if config.Identity != nil && config.Identity.TLSCertificate != nil {
 		tlsConfig := &tls.Config{
 			ClientAuth: clientAuthType,
-			VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-				return cmnTLS.VerifyCertificate(rawCerts, cmnTLS.VerifyOptions{
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				// Ensure certificate verification runs for every connection,
+				// including resumed TLS sessions, which bypass function
+				// VerifyPeerCertificate.
+				return cmnTLS.VerifyCertificates(cs.PeerCertificates, cmnTLS.VerifyOptions{
 					CommonName:         config.ClientCommonName,
 					AllowUnknownKeys:   true,
 					AllowNoCertificate: true,
 				})
 			},
-			GetCertificate: func(ch *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				return config.Identity.GetTLSCertificate(), nil
+			GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				return config.Identity.TLSCertificate, nil
 			},
 		}
 
@@ -665,12 +694,70 @@ func Dial(target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	logger := logging.GetLogger("grpc/client")
 	logAdapter := newGrpcLogAdapter(logger)
 	dialOpts := []grpc.DialOption{
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(&CBORCodec{})),
+		grpc.WithDefaultCallOptions(
+			grpc.ForceCodec(&CBORCodec{}),
+			grpc.MaxCallSendMsgSize(maxSendMsgSize),
+			grpc.MaxCallRecvMsgSize(maxRecvMsgSize),
+		),
 		grpc.WithChainUnaryInterceptor(logAdapter.unaryClientLogger, clientUnaryErrorMapper),
 		grpc.WithChainStreamInterceptor(logAdapter.streamClientLogger, clientStreamErrorMapper),
 	}
 	dialOpts = append(dialOpts, opts...)
-	return grpc.Dial(target, dialOpts...)
+	return grpc.NewClient(target, dialOpts...)
+}
+
+// IsSocketAddress checks if the gRPC address is a socket address.
+func IsSocketAddress(addr string) bool {
+	if strings.HasPrefix(addr, "unix:") || strings.HasPrefix(addr, "unix-abstract:") {
+		return true
+	}
+	if strings.HasPrefix(addr, "vsock:") {
+		return true
+	}
+	return false
+}
+
+// IsLocalAddress checks if the gRPC address points to a local socket or loopback address.
+//
+// This function takes a conservative approach and may return false for complex addresses
+// such as those with authorities or non-standard schemes.
+//
+// The expected format for the gRPC address is specified at:
+// https://github.com/grpc/grpc/blob/master/doc/naming.md
+func IsLocalAddress(addr string) bool {
+	// Sockets are considered local.
+	if IsSocketAddress(addr) {
+		return true
+	}
+
+	// Strip dns: scheme if present, other schemes are not supported.
+	if strings.HasPrefix(addr, "dns:") {
+		addr = strings.TrimPrefix(addr, "dns:")
+
+		// If authority is present, consider the address non-local as it might rely on complex resolver logic.
+		if strings.HasPrefix(addr, "//") {
+			return false
+		}
+	}
+
+	// Validate the address.
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Try parsing with a port.
+		host, _, err = net.SplitHostPort(addr + ":" + "80")
+		if err != nil {
+			// This means that the scheme was not trimmed (e.g. was not 'dns:').
+			// Consider such addresses non-local as they might rely on complex resolver logic.
+			return false
+		}
+		// The address is parsed fine with port attached, continue.
+	}
+
+	ip, err := net.LookupIP(host)
+	if err != nil || len(ip) == 0 {
+		return false
+	}
+	return ip[0].IsLoopback()
 }
 
 func init() {

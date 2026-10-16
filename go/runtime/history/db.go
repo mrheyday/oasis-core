@@ -3,8 +3,8 @@ package history
 import (
 	"fmt"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/badger/v4/options"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	cmnBadger "github.com/oasisprotocol/oasis-core/go/common/badger"
@@ -17,14 +17,25 @@ import (
 const dbVersion = 1
 
 var (
+	// keyFormat is the namespace for the runtime history database key formats.
+	keyFormat = keyformat.NewNamespace("runtime history db")
+
 	// metadataKeyFmt is the metadata key format.
 	//
 	// Value is CBOR-serialized dbMetadata.
-	metadataKeyFmt = keyformat.New(0x01)
+	metadataKeyFmt = keyFormat.New(0x01)
 	// blockKeyFmt is the block index key format.
 	//
 	// Value is CBOR-serialized roothash.AnnotatedBlock.
-	blockKeyFmt = keyformat.New(0x02, uint64(0))
+	blockKeyFmt = keyFormat.New(0x02, uint64(0))
+
+	// deprecatedRoundResultsKeyFmt is the deprecated round result index key format.
+	//
+	// Value is CBOR-serialized roothash.RoundResults.
+	//
+	// Deprecated: This key format is deprecated and will be removed in future versions
+	// after we clean up the remaining round results from the block history (#6098).
+	deprecatedRoundResultsKeyFmt = keyFormat.New(0x03, uint64(0)) //nolint:unused
 )
 
 type dbMetadata struct {
@@ -53,9 +64,6 @@ func newDB(fn string, runtimeID common.Namespace) (*DB, error) {
 	opts := badger.DefaultOptions(fn)
 	opts = opts.WithLogger(cmnBadger.NewLogAdapter(logger))
 	opts = opts.WithSyncWrites(true)
-	// Allow value log truncation if required (this is needed to recover the
-	// value log file which can get corrupted in crashes).
-	opts = opts.WithTruncate(true)
 	opts = opts.WithCompression(options.None)
 
 	db, err := badger.Open(opts)
@@ -63,10 +71,13 @@ func newDB(fn string, runtimeID common.Namespace) (*DB, error) {
 		return nil, fmt.Errorf("runtime/history: failed to open database: %w", err)
 	}
 
+	gc := cmnBadger.NewGCWorker(logger, db)
+	gc.Start()
+
 	d := &DB{
 		logger: logger,
 		db:     db,
-		gc:     cmnBadger.NewGCWorker(logger, db),
+		gc:     gc,
 	}
 
 	// Ensure metadata is valid.
@@ -142,63 +153,49 @@ func (d *DB) metadata() (*dbMetadata, error) {
 	return meta, nil
 }
 
-func (d *DB) consensusCheckpoint(height int64) error {
+func (d *DB) commit(blks []*roothash.AnnotatedBlock) error {
+	if len(blks) == 0 {
+		return nil
+	}
+
 	return d.db.Update(func(tx *badger.Txn) error {
 		meta, err := d.queryGetMetadata(tx)
 		if err != nil {
 			return err
 		}
 
-		if height < meta.LastConsensusHeight {
-			return fmt.Errorf("runtime/history: consensus checkpoint at lower height (current: %d wanted: %d)",
-				meta.LastConsensusHeight,
-				height,
-			)
+		for _, blk := range blks {
+			rtID := blk.Block.Header.Namespace
+			if !rtID.Equal(&meta.RuntimeID) {
+				return fmt.Errorf("runtime mismatch (expected: %s got: %s)",
+					meta.RuntimeID,
+					rtID,
+				)
+			}
+
+			if blk.Height < meta.LastConsensusHeight {
+				return fmt.Errorf("commit at lower consensus height (current: %d wanted: %d)",
+					meta.LastConsensusHeight,
+					blk.Height,
+				)
+			}
+
+			if blk.Block.Header.Round <= meta.LastRound && meta.LastConsensusHeight != 0 {
+				return fmt.Errorf("commit at lower or equal round (current: %d wanted: %d)",
+					meta.LastRound,
+					blk.Block.Header.Round,
+				)
+			}
+
+			if err := tx.Set(blockKeyFmt.Encode(blk.Block.Header.Round), cbor.Marshal(blk)); err != nil {
+				return err
+			}
+
+			meta.LastRound = blk.Block.Header.Round
+			if blk.Height > meta.LastConsensusHeight {
+				meta.LastConsensusHeight = blk.Height
+			}
 		}
-
-		meta.LastConsensusHeight = height
-		return tx.Set(metadataKeyFmt.Encode(), cbor.Marshal(meta))
-	})
-}
-
-func (d *DB) commit(blk *roothash.AnnotatedBlock) error {
-	return d.db.Update(func(tx *badger.Txn) error {
-		meta, err := d.queryGetMetadata(tx)
-		if err != nil {
-			return err
-		}
-
-		rtID := blk.Block.Header.Namespace
-		if !rtID.Equal(&meta.RuntimeID) {
-			return fmt.Errorf("runtime/history: runtime mismatch (expected: %s got: %s)",
-				meta.RuntimeID,
-				rtID,
-			)
-		}
-
-		if blk.Height < meta.LastConsensusHeight {
-			return fmt.Errorf("runtime/history: commit at lower consensus height (current: %d wanted: %d)",
-				meta.LastConsensusHeight,
-				blk.Height,
-			)
-		}
-
-		if blk.Block.Header.Round <= meta.LastRound && meta.LastConsensusHeight != 0 {
-			return fmt.Errorf("runtime/history: commit at lower round (current: %d wanted: %d)",
-				meta.LastRound,
-				blk.Block.Header.Round,
-			)
-		}
-
-		if err = tx.Set(blockKeyFmt.Encode(blk.Block.Header.Round), cbor.Marshal(blk)); err != nil {
-			return err
-		}
-
-		meta.LastRound = blk.Block.Header.Round
-		if blk.Height > meta.LastConsensusHeight {
-			meta.LastConsensusHeight = blk.Height
-		}
-
 		return tx.Set(metadataKeyFmt.Encode(), cbor.Marshal(meta))
 	})
 }
@@ -216,7 +213,7 @@ func (d *DB) getBlock(round uint64) (*roothash.AnnotatedBlock, error) {
 		}
 
 		return item.Value(func(val []byte) error {
-			return cbor.Unmarshal(val, &blk)
+			return cbor.UnmarshalTrusted(val, &blk)
 		})
 	})
 	if txErr != nil {
@@ -225,7 +222,93 @@ func (d *DB) getBlock(round uint64) (*roothash.AnnotatedBlock, error) {
 	return &blk, nil
 }
 
+func (d *DB) getEarliestBlock() (*roothash.AnnotatedBlock, error) {
+	var blk roothash.AnnotatedBlock
+	txErr := d.db.View(func(tx *badger.Txn) error {
+		prefix := blockKeyFmt.Encode()
+		it := tx.NewIterator(badger.IteratorOptions{Prefix: prefix})
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			return item.Value(func(val []byte) error {
+				return cbor.UnmarshalTrusted(val, &blk)
+			})
+		}
+		return roothash.ErrNotFound
+	})
+	if txErr != nil {
+		return nil, txErr
+	}
+	return &blk, nil
+}
+
+func (d *DB) pruneBefore(round uint64) (uint64, error) {
+	var pruned uint64
+	if err := d.db.Update(func(tx *badger.Txn) error {
+		it := tx.NewIterator(badger.IteratorOptions{
+			Prefix: blockKeyFmt.Encode(),
+		})
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+
+			var r uint64
+			if !blockKeyFmt.Decode(item.Key(), &r) {
+				panic("bad iterator: unable to decode key") // cannot happen.
+			}
+
+			if r >= round {
+				break
+			}
+
+			if err := tx.Delete(item.KeyCopy(nil)); err != nil {
+				return err
+			}
+
+			pruned++
+		}
+
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return pruned, nil
+}
+
+func (d *DB) getLastBlock() (*roothash.AnnotatedBlock, error) {
+	var blk roothash.AnnotatedBlock
+	txErr := d.db.View(func(tx *badger.Txn) error {
+		meta, err := d.queryGetMetadata(tx)
+		if err != nil {
+			return err
+		}
+
+		item, err := tx.Get(blockKeyFmt.Encode(meta.LastRound))
+		switch err {
+		case nil:
+		case badger.ErrKeyNotFound:
+			return roothash.ErrNotFound
+		default:
+			return err
+		}
+
+		return item.Value(func(val []byte) error {
+			return cbor.UnmarshalTrusted(val, &blk)
+		})
+	})
+	if txErr != nil {
+		return nil, txErr
+	}
+	return &blk, nil
+}
+
+func (d *DB) flatten() error {
+	return d.db.Flatten(1)
+}
+
 func (d *DB) close() {
-	d.gc.Close()
+	d.gc.Stop()
 	d.db.Close()
 }

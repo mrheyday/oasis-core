@@ -1,8 +1,6 @@
 package storage
 
 import (
-	"crypto/rand"
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -10,7 +8,7 @@ import (
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crash"
-	memorySigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/memory"
+	genesisTestHelpers "github.com/oasisprotocol/oasis-core/go/genesis/tests"
 	"github.com/oasisprotocol/oasis-core/go/storage/api"
 	"github.com/oasisprotocol/oasis-core/go/storage/database"
 	"github.com/oasisprotocol/oasis-core/go/storage/tests"
@@ -30,17 +28,13 @@ func TestCrashingBackendDoNotInterfere(t *testing.T) {
 		err error
 	)
 
-	cfg.Signer, err = memorySigner.NewSigner(rand.Reader)
-	require.NoError(err, "NewSigner()")
-
-	cfg.DB, err = ioutil.TempDir("", "crashing.test.badgerdb")
+	cfg.DB, err = os.MkdirTemp("", "crashing.test.badgerdb")
 	require.NoError(err, "TempDir")
 	defer os.RemoveAll(cfg.DB)
 
 	realBackend, err := database.New(&cfg)
 	require.NoError(err, "database.New")
 	backend := newCrashingWrapper(realBackend)
-	localBackend := realBackend.(api.LocalBackend)
 
 	crash.Config(map[string]float64{
 		"storage.write.before": 0.0,
@@ -49,5 +43,6 @@ func TestCrashingBackendDoNotInterfere(t *testing.T) {
 		"storage.read.after":   0.0,
 	})
 
-	tests.StorageImplementationTests(t, localBackend, backend, testNs, 0)
+	genesisTestHelpers.SetTestChainContext()
+	tests.StorageImplementationTests(t, backend, backend, testNs, 0)
 }

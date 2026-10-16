@@ -1,85 +1,64 @@
 //! Runtime call context.
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
-use io_context::Context as IoContext;
-
-use super::tags::{Tag, Tags};
-use crate::common::roothash::{Header, Message};
-
-struct NoRuntimeContext;
+use crate::{
+    consensus::{
+        beacon::EpochTime,
+        roothash::{Header, RoundResults},
+        state::ConsensusState,
+        LightBlock,
+    },
+    protocol::Protocol,
+    storage::MKVS,
+};
 
 /// Transaction context.
 pub struct Context<'a> {
-    /// I/O context.
-    pub io_ctx: Arc<IoContext>,
+    /// Low-level access to the underlying Runtime Host Protocol.
+    pub protocol: Arc<Protocol>,
+    /// Consensus light block.
+    pub consensus_block: &'a LightBlock,
+    /// Consensus state tree.
+    pub consensus_state: ConsensusState,
+    /// Runtime state.
+    pub runtime_state: &'a mut dyn MKVS,
     /// The block header accompanying this transaction.
     pub header: &'a Header,
-    /// Runtime-specific context.
-    pub runtime: Box<dyn Any>,
-
+    /// Epoch corresponding to the currently processed block.
+    pub epoch: EpochTime,
+    /// Results of processing the previous successful round.
+    pub round_results: &'a RoundResults,
+    /// The maximum number of messages that can be emitted in this round.
+    pub max_messages: u32,
     /// Flag indicating whether to only perform transaction check rather than
     /// running the transaction.
     pub check_only: bool,
-
-    /// List of emitted tags for each transaction.
-    tags: Vec<Tags>,
-
-    /// List of messages emitted.
-    messages: Vec<Message>,
 }
 
 impl<'a> Context<'a> {
     /// Construct new transaction context.
-    pub fn new(io_ctx: Arc<IoContext>, header: &'a Header, check_only: bool) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        protocol: Arc<Protocol>,
+        consensus_block: &'a LightBlock,
+        consensus_state: ConsensusState,
+        runtime_state: &'a mut dyn MKVS,
+        header: &'a Header,
+        epoch: EpochTime,
+        round_results: &'a RoundResults,
+        max_messages: u32,
+        check_only: bool,
+    ) -> Self {
         Self {
-            io_ctx,
+            protocol,
+            consensus_block,
+            consensus_state,
+            runtime_state,
             header,
-            runtime: Box::new(NoRuntimeContext),
+            epoch,
+            round_results,
+            max_messages,
             check_only,
-            tags: Vec::new(),
-            messages: Vec::new(),
         }
-    }
-
-    /// Start a new transaction.
-    pub fn start_transaction(&mut self) {
-        self.tags.push(Tags::new());
-    }
-
-    /// Close the context and return the emitted tags and sent roothash messages.
-    pub fn close(self) -> (Vec<Tags>, Vec<Message>) {
-        (self.tags, self.messages)
-    }
-
-    /// Emit a runtime-specific indexable tag refering to the specific
-    /// transaction which is being processed.
-    ///
-    /// If multiple tags with the same key are emitted for a transaction, only
-    /// the last one will be indexed.
-    ///
-    /// # Panics
-    ///
-    /// Calling this method outside of a transaction will panic.
-    ///
-    pub fn emit_txn_tag<K, V>(&mut self, key: K, value: V)
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        assert!(
-            !self.tags.is_empty(),
-            "must only be called inside a transaction"
-        );
-
-        self.tags
-            .last_mut()
-            .expect("tags is not empty")
-            .push(Tag::new(key.as_ref().to_vec(), value.as_ref().to_vec()))
-    }
-
-    /// Send a roothash message as part of the block that contains this transaction.
-    /// See RFC 0065 for information on roothash messages.
-    pub fn send_roothash_message(&mut self, message: Message) {
-        self.messages.push(message);
     }
 }

@@ -3,8 +3,9 @@
 # For more info, browse to http://goreleaser.com.
 #
 # NOTE: The GoReleaser is not meant to be run directly, but rather through
-# Make's release target.
+# Make's release-build target.
 
+version: 2
 project_name: Oasis Core
 
 env:
@@ -18,6 +19,10 @@ builds:
     dir: go/
     flags:
       - -trimpath
+      # Build oasis-node with jemalloc tag (used by badgerdb).
+      # TODO: Use 'tags' attribute when GoReleaser is udpated to newer version:
+      # https://github.com/goreleaser/goreleaser/pull/2268
+      - -tags=jemalloc
     ldflags:
       # NOTE: At the moment, GoReleaser produces different binaries when
       # releases are built from different git paths, unless -buildid= is added
@@ -73,7 +78,7 @@ archives:
       - CHANGELOG.md
       - README.md
       - LICENSE
-      # NOTE: We assume that the Makefile release target prepares this binary.
+      # NOTE: We assume that the Makefile release-build target prepares this binary.
       - oasis-core-runtime-loader
 
 checksum:
@@ -81,7 +86,9 @@ checksum:
   algorithm: sha256
 
 snapshot:
-  name_template: "{{.Version}}-dev"
+  version_template: "{{.Version}}-dev"
 
 release:
   name_template: "{{.ProjectName}} {{.Version}}"
+  prerelease: true
+  make_latest: false

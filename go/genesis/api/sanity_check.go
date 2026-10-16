@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
+	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 )
 
 // SanityCheck does basic sanity checking on the contents of the genesis document.
@@ -25,31 +26,43 @@ func (d *Document) SanityCheck() error {
 		pkBlacklist[v] = true
 	}
 
-	if err := d.EpochTime.SanityCheck(); err != nil {
+	if err := d.Beacon.SanityCheck(); err != nil {
 		return err
 	}
-	if err := d.Registry.SanityCheck(d.EpochTime.Base, d.Staking.Ledger, d.Staking.Parameters.Thresholds, pkBlacklist); err != nil {
+	epoch := d.Beacon.Base // Note: d.Height has no easy connection to the epoch.
+
+	escrows := make(map[staking.Address]*staking.EscrowAccount)
+
+	if err := d.Registry.SanityCheck(
+		d.Time,
+		uint64(d.Height),
+		epoch,
+		pkBlacklist,
+		escrows,
+	); err != nil {
 		return err
 	}
 	if err := d.RootHash.SanityCheck(); err != nil {
 		return err
 	}
-	if err := d.Staking.SanityCheck(d.EpochTime.Base); err != nil {
+	if err := d.Staking.SanityCheck(epoch); err != nil {
 		return err
 	}
 	if err := d.KeyManager.SanityCheck(); err != nil {
 		return err
 	}
-	if err := d.Scheduler.SanityCheck(&d.Staking.TotalSupply); err != nil {
+	if err := d.Scheduler.SanityCheck(&d.Staking.TotalSupply, d.Scheduler.Parameters.VotingPowerDistribution); err != nil {
 		return err
 	}
-	if err := d.Beacon.SanityCheck(); err != nil {
+	if err := d.Governance.SanityCheck(epoch, &d.Staking.GovernanceDeposits); err != nil {
+		return err
+	}
+	if err := d.Vault.SanityCheck(); err != nil {
 		return err
 	}
 
-	if d.HaltEpoch < d.EpochTime.Base {
-		return fmt.Errorf("genesis: sanity check failed: halt epoch is in the past")
+	if d.Staking.Parameters.DebugBypassStake {
+		return nil
 	}
-
-	return nil
+	return staking.SanityCheckStake(d.Staking.Ledger, escrows, d.Staking.Parameters.Thresholds, true)
 }

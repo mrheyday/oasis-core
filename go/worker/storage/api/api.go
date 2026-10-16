@@ -11,16 +11,34 @@ import (
 // ModuleName is the storage worker module name.
 const ModuleName = "worker/storage"
 
-// ErrRuntimeNotFound is the error returned when the called references an unknown runtime.
-var ErrRuntimeNotFound = errors.New(ModuleName, 1, "worker/storage: runtime not found")
+// StorageWorkerStatus is the status of the storage worker.
+type StorageWorkerStatus string
+
+const (
+	StatusInitializing        StorageWorkerStatus = "initializing"
+	StatusStarting            StorageWorkerStatus = "starting"
+	StatusStopping            StorageWorkerStatus = "stopping"
+	StatusInitializingGenesis StorageWorkerStatus = "initializing genesis"
+	StatusSyncStartCheck      StorageWorkerStatus = "sync start check"
+	StatusSyncingCheckpoints  StorageWorkerStatus = "syncing checkpoints"
+	StatusSyncingRounds       StorageWorkerStatus = "syncing rounds"
+)
+
+var (
+	// ErrRuntimeNotFound is the error returned when the called references an unknown runtime.
+	ErrRuntimeNotFound = errors.New(ModuleName, 1, "worker/storage: runtime not found")
+	// ErrCantPauseCheckpointer is the error returned when trying to pause the checkpointer without
+	// setting the debug flag.
+	ErrCantPauseCheckpointer = errors.New(ModuleName, 2, "worker/storage: pausing checkpointer only available in debug mode")
+)
 
 // StorageWorker is the storage worker control API interface.
 type StorageWorker interface {
 	// GetLastSyncedRound retrieves the last synced round for the storage worker.
 	GetLastSyncedRound(ctx context.Context, request *GetLastSyncedRoundRequest) (*GetLastSyncedRoundResponse, error)
 
-	// ForceFinalize forces finalization of a specific round.
-	ForceFinalize(ctx context.Context, request *ForceFinalizeRequest) error
+	// PauseCheckpointer pauses or unpauses the storage worker's checkpointer.
+	PauseCheckpointer(ctx context.Context, request *PauseCheckpointerRequest) error
 }
 
 // GetLastSyncedRoundRequest is a GetLastSyncedRound request.
@@ -35,14 +53,17 @@ type GetLastSyncedRoundResponse struct {
 	StateRoot storage.Root `json:"state_root"`
 }
 
-// ForceFinalizeRequest is a ForceFinalize request.
-type ForceFinalizeRequest struct {
+// PauseCheckpointerRequest is a PauseCheckpointer request.
+type PauseCheckpointerRequest struct {
 	RuntimeID common.Namespace `json:"runtime_id"`
-	Round     uint64           `json:"round"`
+	Pause     bool             `json:"pause"`
 }
 
 // Status is the storage worker status.
 type Status struct {
+	// Status is the current status of the storage worker.
+	Status StorageWorkerStatus `json:"status"`
+
 	// LastFinalizedRound is the last synced and finalized round.
 	LastFinalizedRound uint64 `json:"last_finalized_round"`
 }

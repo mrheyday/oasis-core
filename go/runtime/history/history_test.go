@@ -3,8 +3,8 @@ package history
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -15,20 +15,22 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/roothash/api/block"
 )
 
-const recvTimeout = 1 * time.Second
+const recvTimeout = time.Second
 
 func TestHistory(t *testing.T) {
 	require := require.New(t)
+	ctx := context.Background()
 
 	// Create a new random temporary directory under /tmp.
-	dataDir, err := ioutil.TempDir("", "oasis-runtime-history-test_")
+	dataDir, err := os.MkdirTemp("", "oasis-runtime-history-test_")
 	require.NoError(err, "TempDir")
 	defer os.RemoveAll(dataDir)
 
 	runtimeID := common.NewTestNamespaceFromSeed([]byte("history test ns 1"), 0)
 	runtimeID2 := common.NewTestNamespaceFromSeed([]byte("history test ns 2"), 0)
 
-	history, err := New(dataDir, runtimeID, NewDefaultConfig())
+	prunerFactory := NewNonePrunerFactory()
+	history, err := New(runtimeID, dataDir, prunerFactory, true)
 	require.NoError(err, "New")
 
 	require.Equal(runtimeID, history.RuntimeID())
@@ -37,83 +39,425 @@ func TestHistory(t *testing.T) {
 	require.NoError(err, "LastConsensusHeight")
 	require.EqualValues(0, lastHeight)
 
-	_, err = history.GetBlock(context.Background(), 10)
+	lastRound, ok := history.LastStorageSyncedRound()
+	require.False(ok, "LastStorageSyncedRound")
+	require.EqualValues(0, lastRound)
+
+	_, err = history.GetBlock(ctx, 10)
 	require.Error(err, "GetBlock should fail for non-indexed block")
 	require.Equal(roothash.ErrNotFound, err)
 
-	_, err = history.GetLatestBlock(context.Background())
-	require.Error(err, "GetLatestBlock should fail for no indexed block")
+	_, err = history.GetAnnotatedBlock(ctx, 10)
+	require.Error(err, "GetAnnotatedBlock should fail for non-indexed block")
 	require.Equal(roothash.ErrNotFound, err)
 
-	err = history.ConsensusCheckpoint(42)
-	require.NoError(err, "ConsensusCheckpoint")
-	err = history.ConsensusCheckpoint(40)
-	require.Error(err, "ConsensusCheckpoint should fail for lower height")
-
-	lastHeight, err = history.LastConsensusHeight()
-	require.NoError(err, "LastConsensusHeight")
-	require.EqualValues(42, lastHeight)
+	_, err = history.GetBlock(ctx, roothash.RoundLatest)
+	require.Error(err, "GetBlock(RoundLatest) should fail for no indexed block")
+	require.Equal(roothash.ErrNotFound, err)
 
 	blk := roothash.AnnotatedBlock{
-		Height: 40,
+		Height: 50,
 		Block:  block.NewGenesisBlock(runtimeID, 0),
 	}
 	blk.Block.Header.Round = 10
 
-	err = history.Commit(&blk)
-	require.Error(err, "Commit should fail for lower consensus height")
-
-	blk.Height = 50
 	copy(blk.Block.Header.Namespace[:], runtimeID2[:])
-	err = history.Commit(&blk)
+	err = history.Commit([]*roothash.AnnotatedBlock{&blk})
 	require.Error(err, "Commit should fail for different runtime")
 
 	copy(blk.Block.Header.Namespace[:], runtimeID[:])
-	err = history.Commit(&blk)
+	err = history.Commit([]*roothash.AnnotatedBlock{&blk})
 	require.NoError(err, "Commit")
+
+	blk2 := roothash.AnnotatedBlock{
+		Height: 40,
+		Block:  block.NewGenesisBlock(runtimeID, 0),
+	}
+	err = history.Commit([]*roothash.AnnotatedBlock{&blk2})
+	require.Error(err, "Commit should fail for lower consensus height")
+
 	putBlk := *blk.Block
-	err = history.Commit(&blk)
+	err = history.Commit([]*roothash.AnnotatedBlock{&blk})
 	require.Error(err, "Commit should fail for the same round")
 	blk.Block.Header.Round = 5
-	err = history.Commit(&blk)
+	err = history.Commit([]*roothash.AnnotatedBlock{&blk})
 	require.Error(err, "Commit should fail for a lower round")
+	blk.Block.Header.Round = 10
 
 	lastHeight, err = history.LastConsensusHeight()
 	require.NoError(err, "LastConsensusHeight")
 	require.EqualValues(50, lastHeight)
 
-	gotBlk, err := history.GetBlock(context.Background(), 10)
+	err = history.StorageSyncCheckpoint(12)
+	require.Error(err, "StorageSyncCheckpoint should fail for non-indexed round")
+	err = history.StorageSyncCheckpoint(10)
+	require.NoError(err, "StorageSyncCheckpoint")
+	err = history.StorageSyncCheckpoint(5)
+	require.Error(err, "StorageSyncCheckpoint should fail for lower height")
+
+	lastRound, ok = history.LastStorageSyncedRound()
+	require.True(ok, "LastStorageSyncedRound")
+	require.EqualValues(10, lastRound)
+
+	gotBlk, err := history.GetBlock(ctx, 10)
 	require.NoError(err, "GetBlock")
 	require.Equal(&putBlk, gotBlk, "GetBlock should return the correct block")
 
-	gotLatestBlk, err := history.GetLatestBlock(context.Background())
-	require.NoError(err, "GetLatestBlock")
-	require.Equal(&putBlk, gotLatestBlk, "GetLatestBlock should return the correct block")
+	gotAnnBlk, err := history.GetAnnotatedBlock(ctx, 10)
+	require.NoError(err, "GetAnnotatedBlock")
+	require.Equal(&blk, gotAnnBlk, "GetAnnotatedBlock should return the correct block")
+
+	gotLatestBlk, err := history.GetBlock(ctx, 10)
+	require.NoError(err, "GetBlock(RoundLatest)")
+	require.Equal(&putBlk, gotLatestBlk, "GetBlock(RoundLatest) should return the correct block")
 
 	// Close history and try to reopen and continue.
 	history.Close()
 
 	// Try to manually load the block index database with incorrect runtime ID.
 	// Use path from the first runtime.
-	_, err = New(dataDir, runtimeID2, NewDefaultConfig())
+	_, err = New(runtimeID2, dataDir, prunerFactory, true)
 	require.Error(err, "New should return an error on runtime mismatch")
 
-	history, err = New(dataDir, runtimeID, NewDefaultConfig())
+	history, err = New(runtimeID, dataDir, prunerFactory, true)
 	require.NoError(err, "New")
 
 	require.Equal(runtimeID, history.RuntimeID())
+
+	// Storage sync checkpoint is not persisted.
+	err = history.StorageSyncCheckpoint(10)
+	require.NoError(err, "StorageSyncCheckpoint should work")
 
 	lastHeight, err = history.LastConsensusHeight()
 	require.NoError(err, "LastConsensusHeight")
 	require.EqualValues(50, lastHeight)
 
-	gotBlk, err = history.GetBlock(context.Background(), 10)
+	gotBlk, err = history.GetBlock(ctx, 10)
 	require.NoError(err, "GetBlock")
 	require.Equal(&putBlk, gotBlk, "GetBlock should return the correct block")
 
-	gotLatestBlk, err = history.GetLatestBlock(context.Background())
-	require.NoError(err, "GetLatestBlock")
-	require.Equal(&putBlk, gotLatestBlk, "GetLatestBlock should return the correct block")
+	gotAnnBlk, err = history.GetAnnotatedBlock(ctx, 10)
+	require.NoError(err, "GetAnnotatedBlock")
+	require.Equal(&blk, gotAnnBlk, "GetAnnotatedBlock should return the correct block")
+
+	gotLatestBlk, err = history.GetBlock(ctx, roothash.RoundLatest)
+	require.NoError(err, "GetBlock(RoundLatest)")
+	require.Equal(&putBlk, gotLatestBlk, "GetBlock(RoundLatest) should return the correct block")
+}
+
+func TestCommit(t *testing.T) {
+	ctx := t.Context()
+
+	dataDir, err := os.MkdirTemp("", "oasis-runtime-history-test_")
+	require.NoError(t, err, "TempDir")
+	defer os.RemoveAll(dataDir)
+
+	runtimeID1 := common.NewTestNamespaceFromSeed([]byte("history test ns 1"), 0)
+	runtimeID2 := common.NewTestNamespaceFromSeed([]byte("history test ns 2"), 0)
+
+	prunerFactory := NewNonePrunerFactory()
+	history, err := New(runtimeID1, dataDir, prunerFactory, true)
+	require.NoError(t, err, "New")
+
+	blks := createBlocks(runtimeID1)
+
+	t.Run("different runtimes", func(t *testing.T) {
+		blks[0].Block.Header.Namespace = runtimeID2
+		err = history.Commit(blks)
+		require.Error(t, err, "Commit should fail when different runtimes IDs")
+		blks[0].Block.Header.Namespace = runtimeID1
+	})
+
+	t.Run("wrong order", func(t *testing.T) {
+		slices.Reverse(blks)
+		err = history.Commit(blks)
+		require.Error(t, err, "Commit should fail for unordered batch")
+		slices.Reverse(blks)
+	})
+
+	t.Run("no blocks", func(t *testing.T) {
+		err = history.Commit(nil)
+		require.NoError(t, err, "Commit should succeed for empty batch")
+
+		err = history.Commit([]*roothash.AnnotatedBlock{})
+		require.NoError(t, err, "Commit should succeed for empty batch")
+	})
+
+	t.Run("one block", func(t *testing.T) {
+		err = history.Commit(blks[:1])
+		require.NoError(t, err, "Commit")
+
+		gotBlock, err := history.GetCommittedBlock(ctx, blks[0].Block.Header.Round)
+		require.NoError(t, err, "GetCommittedBlock")
+		require.Equal(t, blks[0].Block, gotBlock, "GetCommittedBlock should return the correct block")
+
+		gotBlock, err = history.GetCommittedBlock(ctx, roothash.RoundLatest)
+		require.NoError(t, err, "GetCommittedBlock(RoundLatest)")
+		require.Equal(t, blks[0].Block, gotBlock, "GetCommittedBlock should return the correct block")
+
+		lastHeight, err := history.LastConsensusHeight()
+		require.NoError(t, err, "LastConsensusHeight")
+		require.EqualValues(t, blks[0].Height, lastHeight)
+	})
+
+	t.Run("multiple blocks", func(t *testing.T) {
+		err = history.Commit(blks[1:])
+		require.NoError(t, err, "Commit")
+
+		for _, blk := range blks {
+			gotBlock, err := history.GetCommittedBlock(ctx, blk.Block.Header.Round)
+			require.NoError(t, err, "GetCommittedBlock")
+			require.Equal(t, blk.Block, gotBlock, "GetCommittedBlock should return the correct block")
+		}
+
+		gotBlock, err := history.GetCommittedBlock(ctx, roothash.RoundLatest)
+		require.NoError(t, err, "GetCommittedBlock(RoundLatest)")
+		require.Equal(t, blks[len(blks)-1].Block, gotBlock, "GetCommittedBlock should return the correct block")
+
+		lastHeight, err := history.LastConsensusHeight()
+		require.NoError(t, err, "LastConsensusHeight")
+		require.EqualValues(t, blks[len(blks)-1].Height, lastHeight)
+	})
+
+	t.Run("commit at latest height", func(t *testing.T) {
+		blk := &roothash.AnnotatedBlock{
+			Height: 3,
+			Block:  block.NewGenesisBlock(runtimeID1, 0),
+		}
+		blk.Block.Header.Round = 3
+		err = history.Commit([]*roothash.AnnotatedBlock{blk})
+		require.Error(t, err, "Commit should fail for same consensus height")
+	})
+
+	t.Run("commit at latest round", func(t *testing.T) {
+		blk := &roothash.AnnotatedBlock{
+			Height: 4,
+			Block:  block.NewGenesisBlock(runtimeID1, 0),
+		}
+		blk.Block.Header.Round = 2
+		err = history.Commit([]*roothash.AnnotatedBlock{blk})
+		require.Error(t, err, "Commit should fail for same round")
+	})
+}
+
+func testWatchBlocks(t *testing.T, blkCh <-chan *roothash.AnnotatedBlock, n int) uint64 {
+	t.Helper()
+
+	var blk *roothash.AnnotatedBlock
+	for i := 0; i < n; i++ {
+		select {
+		case blk = <-blkCh:
+		case <-time.After(recvTimeout):
+			t.Fatalf("failed to receive storage synced round")
+		}
+	}
+	select {
+	case blk = <-blkCh:
+		t.Fatalf("received unexpected block: %d", blk.Block.Header.Round)
+	case <-time.After(recvTimeout):
+	}
+	if n == 0 {
+		return 0
+	}
+	return blk.Block.Header.Round
+}
+
+func TestWatchBlocksWithHistory(t *testing.T) {
+	dataDir, err := os.MkdirTemp("", "oasis-runtime-history-test_")
+	require.NoError(t, err, "TempDir")
+	defer os.RemoveAll(dataDir)
+
+	runtimeID := common.NewTestNamespaceFromSeed([]byte("history test ns 1"), 0)
+	blks := createBlocks(runtimeID)
+
+	prunerFactory := NewNonePrunerFactory()
+	history, err := New(runtimeID, dataDir, prunerFactory, true)
+	require.NoError(t, err, "New")
+
+	blkCh, blkSub, err := history.WatchBlocks()
+	require.NoError(t, err)
+	defer blkSub.Close()
+
+	t.Run("no blocks", func(t *testing.T) {
+		_ = testWatchBlocks(t, blkCh, 0)
+	})
+
+	t.Run("one block, not initialized", func(t *testing.T) {
+		err = history.Commit(blks[:1])
+		require.NoError(t, err, "Commit")
+		_ = testWatchBlocks(t, blkCh, 0)
+
+		err = history.StorageSyncCheckpoint(blks[0].Block.Header.Round)
+		require.NoError(t, err, "StorageSyncCheckpoint")
+		_ = testWatchBlocks(t, blkCh, 0)
+	})
+
+	err = history.SetInitialized()
+	require.NoError(t, err, "SetInitialized")
+
+	t.Run("one block, initialized", func(t *testing.T) {
+		err = history.Commit(blks[1:2])
+		require.NoError(t, err, "Commit")
+		_ = testWatchBlocks(t, blkCh, 0)
+
+		err = history.StorageSyncCheckpoint(blks[1].Block.Header.Round)
+		require.NoError(t, err, "StorageSyncCheckpoint")
+		round := testWatchBlocks(t, blkCh, 1)
+		require.Equal(t, blks[1].Block.Header.Round, round)
+	})
+
+	t.Run("multiple blocks, initialized", func(t *testing.T) {
+		err = history.Commit(blks[2:])
+		require.NoError(t, err, "Commit")
+		_ = testWatchBlocks(t, blkCh, 0)
+
+		for _, blk := range blks[2:] {
+			err = history.StorageSyncCheckpoint(blk.Block.Header.Round)
+			require.NoError(t, err, "StorageSyncCheckpoint")
+		}
+		round := testWatchBlocks(t, blkCh, len(blks)-2)
+		require.Equal(t, blks[len(blks)-1].Block.Header.Round, round)
+	})
+}
+
+func TestWatchBlocksWithoutHistory(t *testing.T) {
+	dataDir, err := os.MkdirTemp("", "oasis-runtime-history-test_")
+	require.NoError(t, err, "TempDir")
+	defer os.RemoveAll(dataDir)
+
+	runtimeID := common.NewTestNamespaceFromSeed([]byte("history test ns 1"), 0)
+	blks := createBlocks(runtimeID)
+
+	prunerFactory := NewNonePrunerFactory()
+	history, err := New(runtimeID, dataDir, prunerFactory, false)
+	require.NoError(t, err, "New")
+
+	blkCh, blkSub, err := history.WatchBlocks()
+	require.NoError(t, err)
+	defer blkSub.Close()
+
+	t.Run("no blocks", func(t *testing.T) {
+		testWatchBlocks(t, blkCh, 0)
+	})
+
+	t.Run("one block, not initialized", func(t *testing.T) {
+		err = history.Commit(blks[:1])
+		require.NoError(t, err, "Commit")
+		_ = testWatchBlocks(t, blkCh, 0)
+	})
+
+	err = history.SetInitialized()
+	require.NoError(t, err, "SetInitialized")
+
+	t.Run("one block, initialized", func(t *testing.T) {
+		err = history.Commit(blks[1:2])
+		require.NoError(t, err, "Commit")
+		round := testWatchBlocks(t, blkCh, 1)
+		require.Equal(t, blks[1].Block.Header.Round, round)
+	})
+
+	t.Run("multiple blocks, initialized", func(t *testing.T) {
+		err = history.Commit(blks[2:])
+		require.NoError(t, err, "Commit")
+		round := testWatchBlocks(t, blkCh, len(blks)-2)
+		require.Equal(t, blks[len(blks)-1].Block.Header.Round, round)
+	})
+}
+
+func TestPruneBefore(t *testing.T) {
+	ctx := t.Context()
+
+	runtimeID := common.NewTestNamespaceFromSeed([]byte("prune test namespace"), 0)
+
+	h, err := New(runtimeID, t.TempDir(), NewNonePrunerFactory(), false)
+	require.NoError(t, err, "New")
+	defer h.Close()
+
+	// Commit blocks for rounds 10-20.
+	blks := make([]*roothash.AnnotatedBlock, 11)
+	for i := range blks {
+		blk := &roothash.AnnotatedBlock{
+			Height: int64(100 + i), // height is different than round.
+			Block:  block.NewGenesisBlock(runtimeID, 0),
+		}
+		blk.Block.Header.Round = uint64(10 + i)
+		blks[i] = blk
+	}
+	require.NoError(t, h.Commit(blks), "Commit")
+
+	t.Run("prune before earliest: no-op", func(t *testing.T) {
+		pruned, err := h.PruneBefore(10)
+		require.NoError(t, err)
+		require.EqualValues(t, 0, pruned, "no blocks should be pruned")
+
+		earliest, err := h.GetEarliestBlock(ctx)
+		require.NoError(t, err)
+		require.EqualValues(t, 10, earliest.Header.Round, "earliest round should still be 10")
+	})
+
+	t.Run("prune some versions", func(t *testing.T) {
+		pruned, err := h.PruneBefore(12)
+		require.NoError(t, err)
+		require.EqualValues(t, 2, pruned, "rounds 10-11 should be pruned")
+
+		earliest, err := h.GetEarliestBlock(ctx)
+		require.NoError(t, err)
+		require.EqualValues(t, 12, earliest.Header.Round, "earliest round should now be 12")
+	})
+
+	t.Run("prune everything", func(t *testing.T) {
+		pruned, err := h.PruneBefore(21)
+		require.NoError(t, err)
+		require.EqualValues(t, 9, pruned, "rounds 12-20 should all be pruned")
+
+		_, err = h.GetEarliestBlock(ctx)
+		require.ErrorIs(t, err, roothash.ErrNotFound, "history should be empty")
+	})
+
+	t.Run("prune on empty: no-op", func(t *testing.T) {
+		pruned, err := h.PruneBefore(2)
+		require.NoError(t, err)
+		require.EqualValues(t, 0, pruned, "nothing to prune on empty history")
+	})
+}
+
+func TestCompact(t *testing.T) {
+	ctx := t.Context()
+
+	runtimeID := common.NewTestNamespaceFromSeed([]byte("compact test namespace"), 0)
+	h, err := New(runtimeID, t.TempDir(), NewNonePrunerFactory(), false)
+	require.NoError(t, err, "New")
+	defer h.Close()
+
+	t.Run("compact empty", func(t *testing.T) {
+		require.NoError(t, h.Compact())
+	})
+
+	blks := createBlocks(runtimeID)
+	t.Run("compact without pruning", func(t *testing.T) {
+		require.NoError(t, h.Commit(blks), "Commit")
+		require.NoError(t, h.Compact())
+
+		for _, blk := range blks {
+			got, err := h.GetBlock(ctx, blk.Block.Header.Round)
+			require.NoError(t, err, "GetBlock(%d)", blk.Block.Header.Round)
+			require.Equal(t, blk.Block, got)
+		}
+	})
+
+	t.Run("compact after prune", func(t *testing.T) {
+		firstRound := blks[0].Block.Header.Round
+		_, err := h.PruneBefore(firstRound + 1)
+		require.NoError(t, err)
+		require.NoError(t, h.Compact())
+
+		_, err = h.GetBlock(ctx, blks[0].Block.Header.Round)
+		require.ErrorIs(t, err, roothash.ErrNotFound)
+
+		got, err := h.GetBlock(ctx, blks[1].Block.Header.Round)
+		require.NoError(t, err, "GetBlock(%d)", blks[1].Block.Header.Round)
+		require.Equal(t, blks[1].Block, got)
+	})
 }
 
 type testPruneHandler struct {
@@ -124,7 +468,7 @@ type testPruneHandler struct {
 	batches      []int
 }
 
-func (h *testPruneHandler) Prune(ctx context.Context, rounds []uint64) error {
+func (h *testPruneHandler) CanPruneRuntime(rounds []uint64) error {
 	// NOTE: Users must ensure that accessing prunedRounds is safe (e.g., that
 	//       no more pruning happens using this handler before prunedRounds is
 	//       accessed from a different goroutine).
@@ -143,18 +487,17 @@ func (h *testPruneHandler) Prune(ctx context.Context, rounds []uint64) error {
 
 func TestHistoryPrune(t *testing.T) {
 	require := require.New(t)
+	ctx := context.Background()
 
 	// Create a new random temporary directory under /tmp.
-	dataDir, err := ioutil.TempDir("", "oasis-runtime-history-test_")
+	dataDir, err := os.MkdirTemp("", "oasis-runtime-history-test_")
 	require.NoError(err, "TempDir")
 	defer os.RemoveAll(dataDir)
 
 	runtimeID := common.NewTestNamespaceFromSeed([]byte("history prune test ns"), 0)
 
-	history, err := New(dataDir, runtimeID, &Config{
-		Pruner:        NewKeepLastPruner(10),
-		PruneInterval: 100 * time.Millisecond,
-	})
+	pruneFactory := NewKeepLastPrunerFactory(10, 100*time.Millisecond)
+	history, err := New(runtimeID, dataDir, pruneFactory, true)
 	require.NoError(err, "New")
 	defer history.Close()
 
@@ -164,18 +507,36 @@ func TestHistoryPrune(t *testing.T) {
 	}
 	history.Pruner().RegisterHandler(&ph)
 
-	// Create some blocks.
-	for i := 0; i <= 50; i++ {
+	const n = 51
+
+	blks := make([]*roothash.AnnotatedBlock, n)
+	for i := 0; i < n; i++ {
 		blk := roothash.AnnotatedBlock{
 			Height: int64(i),
 			Block:  block.NewGenesisBlock(runtimeID, 0),
 		}
 		blk.Block.Header.Round = uint64(i)
-
-		err = history.Commit(&blk)
-		require.NoError(err, "Commit")
+		blks[i] = &blk
 	}
 
+	// Commit first 30 blocks in a batch of 10.
+	err = history.Commit(blks[:10])
+	require.NoError(err, "Commit")
+	err = history.Commit(blks[10:20])
+	require.NoError(err, "Commit")
+	err = history.Commit(blks[20:30])
+	require.NoError(err, "Commit")
+
+	// Commit remaining 20 blocks one by one.
+	for i := 30; i < n; i++ {
+		err = history.Commit([]*roothash.AnnotatedBlock{blks[i]})
+		require.NoError(err, "Commit")
+	}
+	// Simulate storage syncing.
+	for i := 0; i < n; i++ {
+		err = history.StorageSyncCheckpoint(blks[i].Block.Header.Round)
+		require.NoError(err, "StorageSyncCheckpoint")
+	}
 	// No more blocks after this point.
 
 	// Wait for pruning to complete.
@@ -187,7 +548,7 @@ func TestHistoryPrune(t *testing.T) {
 
 	// Wait until the pruning transaction has been committed. This is needed because doneCh may be
 	// closed before the database transaction commits so the pruning may not yet be visible.
-	ctx, cancel := context.WithTimeout(context.Background(), recvTimeout)
+	ctx, cancel := context.WithTimeout(ctx, recvTimeout)
 	defer cancel()
 	for {
 		_, err = history.GetBlock(ctx, 0)
@@ -202,14 +563,14 @@ func TestHistoryPrune(t *testing.T) {
 	}
 
 	// Ensure we can only lookup the last 10 blocks.
-	for i := 0; i <= 50; i++ {
-		_, err = history.GetBlock(context.Background(), uint64(i))
+	for i := 0; i < n; i++ {
+		_, err = history.GetBlock(ctx, uint64(i))
 		if i <= 40 {
 			require.Error(err, "GetBlock should fail for pruned block %d", i)
 			require.Equal(roothash.ErrNotFound, err)
-		} else {
-			require.NoError(err, "GetBlock(%d)", i)
+			continue
 		}
+		require.NoError(err, "GetBlock(%d)", i)
 	}
 
 	// Ensure the prune handler was called.
@@ -219,27 +580,25 @@ func TestHistoryPrune(t *testing.T) {
 	}
 }
 
-type testPruneFailingHandler struct {
-}
+type testPruneFailingHandler struct{}
 
-func (h *testPruneFailingHandler) Prune(ctx context.Context, rounds []uint64) error {
+func (h *testPruneFailingHandler) CanPruneRuntime([]uint64) error {
 	return fmt.Errorf("thou shall not pass")
 }
 
 func TestHistoryPruneError(t *testing.T) {
 	require := require.New(t)
+	ctx := context.Background()
 
 	// Create a new random temporary directory under /tmp.
-	dataDir, err := ioutil.TempDir("", "oasis-runtime-history-test_")
+	dataDir, err := os.MkdirTemp("", "oasis-runtime-history-test_")
 	require.NoError(err, "TempDir")
 	defer os.RemoveAll(dataDir)
 
 	runtimeID := common.NewTestNamespaceFromSeed([]byte("history prune error test ns"), 0)
 
-	history, err := New(dataDir, runtimeID, &Config{
-		Pruner:        NewKeepLastPruner(10),
-		PruneInterval: 100 * time.Millisecond,
-	})
+	pruneFactory := NewKeepLastPrunerFactory(10, 100*time.Millisecond)
+	history, err := New(runtimeID, dataDir, pruneFactory, true)
 	require.NoError(err, "New")
 	defer history.Close()
 
@@ -254,8 +613,11 @@ func TestHistoryPruneError(t *testing.T) {
 		}
 		blk.Block.Header.Round = uint64(i)
 
-		err = history.Commit(&blk)
+		err = history.Commit([]*roothash.AnnotatedBlock{&blk})
 		require.NoError(err, "Commit")
+
+		err = history.StorageSyncCheckpoint(blk.Block.Header.Round)
+		require.NoError(err, "StorageSyncCheckpoint")
 	}
 
 	// Wait for some pruning.
@@ -263,7 +625,32 @@ func TestHistoryPruneError(t *testing.T) {
 
 	// Ensure nothing was pruned.
 	for i := 0; i <= 50; i++ {
-		_, err = history.GetBlock(context.Background(), uint64(i))
+		_, err = history.GetBlock(ctx, uint64(i))
 		require.NoError(err, "GetBlock(%d)", i)
 	}
+}
+
+func createBlocks(runtimeID common.Namespace) []*roothash.AnnotatedBlock {
+	blks := []*roothash.AnnotatedBlock{
+		{
+			Height: 1,
+			Block:  block.NewGenesisBlock(runtimeID, 0),
+		},
+		{
+			Height: 3,
+			Block:  block.NewGenesisBlock(runtimeID, 0),
+		},
+		{
+			Height: 4,
+			Block:  block.NewGenesisBlock(runtimeID, 0),
+		},
+		{
+			Height: 6,
+			Block:  block.NewGenesisBlock(runtimeID, 0),
+		},
+	}
+	for i, blk := range blks {
+		blk.Block.Header.Round = uint64(i) + 1
+	}
+	return blks
 }

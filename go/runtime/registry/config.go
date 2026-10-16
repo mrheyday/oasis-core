@@ -2,84 +2,111 @@ package registry
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
-	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
+	"github.com/oasisprotocol/oasis-core/go/common"
+	"github.com/oasisprotocol/oasis-core/go/config"
+	cmdFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle"
+	"github.com/oasisprotocol/oasis-core/go/runtime/bundle/component"
+	rtConfig "github.com/oasisprotocol/oasis-core/go/runtime/config"
 	"github.com/oasisprotocol/oasis-core/go/runtime/history"
-	"github.com/oasisprotocol/oasis-core/go/runtime/tagindexer"
 )
 
-const (
-	// CfgSupported configures a supported runtime ID.
-	CfgSupported = "runtime.supported"
-
-	// CfgHistoryPrunerStrategy configures the history pruner strategy.
-	CfgHistoryPrunerStrategy = "runtime.history.pruner.strategy"
-	// CfgHistoryPrunerInterval configures the history pruner interval.
-	CfgHistoryPrunerInterval = "runtime.history.pruner.interval"
-	// CfgHistoryPrunerKeepLastNum configures the number of last kept
-	// rounds when using the "keep last" pruner strategy.
-	CfgHistoryPrunerKeepLastNum = "runtime.history.pruner.num_kept"
-
-	// CfgTagIndexerBackend configures the history tag indexer backend.
-	CfgTagIndexerBackend = "runtime.history.tag_indexer.backend"
-)
-
-// Flags has the configuration flags.
-var Flags = flag.NewFlagSet("", flag.ContinueOnError)
-
-// RuntimeConfig is a per-runtime config.
-type RuntimeConfig struct {
-	// History configures the runtime history keeper.
-	History history.Config
-
-	// TagIndexer configures the tag indexer backend.
-	TagIndexer tagindexer.BackendFactory
+func getLocalConfig(runtimeID common.Namespace, compID component.ID) map[string]any {
+	compCfg, ok := config.GlobalConfig.Runtime.GetComponent(runtimeID, compID)
+	// Support legacy RONL configuration defined at the top level.
+	if !ok && compID == component.ID_RONL {
+		return config.GlobalConfig.Runtime.GetLocalConfig(runtimeID)
+	}
+	return compCfg.Config
 }
 
-func newConfig() (*RuntimeConfig, error) {
-	var cfg RuntimeConfig
+// GetConfiguredRuntimeIDs returns namespaces of all the configured runtimes.
+//
+// Configuration is validated against the current mode of the node.
+func GetConfiguredRuntimeIDs() ([]common.Namespace, error) {
+	// Check if any runtimes are configured to be hosted.
+	runtimes := make(map[common.Namespace]struct{})
+	for _, cfg := range config.GlobalConfig.Runtime.Runtimes {
+		runtimes[cfg.ID] = struct{}{}
+	}
 
-	strategy := viper.GetString(CfgHistoryPrunerStrategy)
+	// Support legacy configurations where runtimes are specified within
+	// configured bundles.
+	for _, path := range config.GlobalConfig.Runtime.Paths {
+		if err := func() error {
+			bnd, err := bundle.Open(path)
+			if err != nil {
+				return fmt.Errorf("failed to open bundle: %w", err)
+			}
+			defer bnd.Close()
+
+			runtimes[bnd.Manifest.ID] = struct{}{}
+			return nil
+		}(); err != nil {
+			return nil, err
+		}
+	}
+
+	if cmdFlags.DebugDontBlameOasis() && viper.IsSet(bundle.CfgDebugMockIDs) {
+		// Allow the mock provisioner to function, as it does not use an actual
+		// runtime. This is only used for the basic node tests.
+		for _, str := range viper.GetStringSlice(bundle.CfgDebugMockIDs) {
+			var runtimeID common.Namespace
+			if err := runtimeID.UnmarshalText([]byte(str)); err != nil {
+				return nil, fmt.Errorf("failed to deserialize runtime ID: %w", err)
+			}
+			runtimes[runtimeID] = struct{}{}
+		}
+
+		// Skip validation
+		return slices.Collect(maps.Keys(runtimes)), nil
+	}
+
+	// Validate configured runtimes based on the runtime mode.
+	switch config.GlobalConfig.Mode {
+	case config.ModeValidator, config.ModeSeed:
+		// No runtimes should be configured.
+		if len(runtimes) > 0 && !cmdFlags.DebugDontBlameOasis() {
+			return nil, fmt.Errorf("no runtimes should be configured when in validator or seed modes")
+		}
+	case config.ModeCompute, config.ModeKeyManager, config.ModeObserver:
+		// At least one runtime should be configured.
+		if len(runtimes) == 0 && !cmdFlags.DebugDontBlameOasis() {
+			return nil, fmt.Errorf("at least one runtime must be configured when in compute, keymanager, or observer modes")
+		}
+	default:
+		// In any other mode, runtimes can be optionally configured.
+	}
+
+	return slices.Collect(maps.Keys(runtimes)), nil
+}
+
+func createHistoryFactory() (history.Factory, error) {
+	var pruneFactory history.PrunerFactory
+	strategy := config.GlobalConfig.Runtime.Prune.Strategy
 	switch strings.ToLower(strategy) {
-	case history.PrunerStrategyNone:
-		cfg.History.Pruner = history.NewNonePruner()
-	case history.PrunerStrategyKeepLast:
-		numKept := viper.GetUint64(CfgHistoryPrunerKeepLastNum)
-		cfg.History.Pruner = history.NewKeepLastPruner(numKept)
+	case rtConfig.PrunerStrategyNone:
+		pruneFactory = history.NewNonePrunerFactory()
+	case rtConfig.PrunerStrategyKeepLast:
+		numKept := config.GlobalConfig.Runtime.Prune.NumKept
+		pruneInterval := max(config.GlobalConfig.Runtime.Prune.Interval, time.Second)
+		pruneFactory = history.NewKeepLastPrunerFactory(numKept, pruneInterval)
 	default:
 		return nil, fmt.Errorf("runtime/registry: unknown history pruner strategy: %s", strategy)
 	}
 
-	cfg.History.PruneInterval = viper.GetDuration(CfgHistoryPrunerInterval)
-	if cfg.History.PruneInterval.Seconds() < 1.0 {
-		return nil, fmt.Errorf("runtime/registry: history prune interval must be >= 1s (got %s)", cfg.History.PruneInterval)
-	}
+	// Archive node won't commit any new blocks, so disable waiting for storage
+	// sync commits.
+	honorStorageSync := config.GlobalConfig.Consensus.LocalStorage && !config.GlobalConfig.Mode.IsArchive()
 
-	tagIndexer := viper.GetString(CfgTagIndexerBackend)
-	switch strings.ToLower(tagIndexer) {
-	case "":
-		cfg.TagIndexer = tagindexer.NewNopBackend()
-	case tagindexer.BleveBackendName:
-		cfg.TagIndexer = tagindexer.NewBleveBackend()
-	default:
-		return nil, fmt.Errorf("runtime/registry: unknown tag indexer backend: %s", tagIndexer)
-	}
+	historyFactory := history.NewFactory(pruneFactory, honorStorageSync)
 
-	return &cfg, nil
-}
-
-func init() {
-	Flags.StringSlice(CfgSupported, nil, "Add supported runtime ID (hex-encoded)")
-
-	Flags.String(CfgHistoryPrunerStrategy, history.PrunerStrategyNone, "History pruner strategy")
-	Flags.Duration(CfgHistoryPrunerInterval, 2*time.Minute, "History pruning interval")
-	Flags.Uint64(CfgHistoryPrunerKeepLastNum, 600, "Keep last history pruner: number of last rounds to keep")
-
-	Flags.String(CfgTagIndexerBackend, "", "Runtime tag indexer backend (disabled by default)")
-
-	_ = viper.BindPFlags(Flags)
+	return historyFactory, nil
 }

@@ -9,8 +9,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Maximum message size.
-const maxMessageSize = 16 * 1024 * 1024 // 16 MiB
+const (
+	// maxMessageSize is the maximum message size.
+	maxMessageSize = 64 * 1024 * 1024 // 64 MiB
+	// labelCall is the label for the call method.
+	labelCall = "call"
+	// labelModule is the label for the module name.
+	labelModule = "module"
+)
 
 var (
 	errMessageTooLarge  = errors.New("codec: message too large")
@@ -21,7 +27,7 @@ var (
 			Name: "oasis_codec_size",
 			Help: "CBOR codec message size (bytes).",
 		},
-		[]string{"call", "module"},
+		[]string{labelCall, labelModule},
 	)
 
 	codecCollectors = []prometheus.Collector{
@@ -40,14 +46,14 @@ type MessageReader struct {
 }
 
 // Read deserializes a single CBOR-encoded Message from the underlying reader.
-func (c *MessageReader) Read(msg interface{}) error {
+func (c *MessageReader) Read(msg any) error {
 	// Read 32-bit length prefix.
 	rawLength := make([]byte, 4)
 	if _, err := io.ReadAtLeast(c.reader, rawLength, 4); err != nil {
 		return err
 	}
 
-	labels := prometheus.Labels{"module": c.module, "call": "read"}
+	labels := prometheus.Labels{labelModule: c.module, labelCall: "read"}
 	length := binary.BigEndian.Uint32(rawLength)
 	codecValueSize.With(labels).Observe(float64(length))
 	if length > maxMessageSize {
@@ -56,7 +62,7 @@ func (c *MessageReader) Read(msg interface{}) error {
 
 	// Decode message bytes.
 	r := io.LimitReader(c.reader, int64(length))
-	dec := NewDecoder(r)
+	dec := NewDecoderRPC(r)
 	if err := dec.Decode(msg); err != nil {
 		return err
 	}
@@ -76,11 +82,11 @@ type MessageWriter struct {
 }
 
 // Write serializes a single Message to CBOR and writes it to the underlying writer.
-func (c *MessageWriter) Write(msg interface{}) error {
+func (c *MessageWriter) Write(msg any) error {
 	// Encode into CBOR.
 	data := Marshal(msg)
 	length := len(data)
-	labels := prometheus.Labels{"module": c.module, "call": "write"}
+	labels := prometheus.Labels{labelModule: c.module, labelCall: "write"}
 	codecValueSize.With(labels).Observe(float64(length))
 	if length > maxMessageSize {
 		return errMessageTooLarge

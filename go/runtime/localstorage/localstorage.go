@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 
-	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/badger/v2/options"
+	"github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/badger/v4/options"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
 	cmnBadger "github.com/oasisprotocol/oasis-core/go/common/badger"
-	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 )
 
@@ -40,6 +40,8 @@ type localStorage struct {
 
 	db *badger.DB
 	gc *cmnBadger.GCWorker
+
+	closeOnce sync.Once
 }
 
 func (s *localStorage) Get(key []byte) ([]byte, error) {
@@ -70,7 +72,7 @@ func (s *localStorage) Get(key []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	return cbor.FixSliceForSerde(value), nil
+	return value, nil
 }
 
 func (s *localStorage) Set(key, value []byte) error {
@@ -93,13 +95,15 @@ func (s *localStorage) Set(key, value []byte) error {
 }
 
 func (s *localStorage) Stop() {
-	s.gc.Close()
-	if err := s.db.Close(); err != nil {
-		s.logger.Error("failed to close local storage",
-			"err", err,
-		)
-	}
-	s.db = nil
+	s.closeOnce.Do(func() {
+		s.gc.Stop()
+
+		if err := s.db.Close(); err != nil {
+			s.logger.Error("failed to close local storage",
+				"err", err,
+			)
+		}
+	})
 }
 
 // New creates new untrusted local storage.
@@ -111,16 +115,15 @@ func New(dataDir, fn string, runtimeID common.Namespace) (LocalStorage, error) {
 	opts := badger.DefaultOptions(filepath.Join(dataDir, fn))
 	opts = opts.WithLogger(cmnBadger.NewLogAdapter(s.logger))
 	opts = opts.WithSyncWrites(true)
-	// Allow value log truncation if required (this is needed to recover the
-	// value log file which can get corrupted in crashes).
-	opts = opts.WithTruncate(true)
 	opts = opts.WithCompression(options.None)
 
 	var err error
 	if s.db, err = badger.Open(opts); err != nil {
 		return nil, fmt.Errorf("failed to open local storage database: %w", err)
 	}
+
 	s.gc = cmnBadger.NewGCWorker(s.logger, s.db)
+	s.gc.Start()
 
 	// TODO: The file format could be versioned, but it's not like this
 	// really is subject to change.

@@ -1,3 +1,10 @@
+use std::{convert::TryInto, mem::size_of};
+
+use impl_trait_for_tuples::impl_for_tuples;
+
+/// Size of the KeyFormat prefix.
+const KEY_FORMAT_PREFIX_SIZE: usize = size_of::<u8>();
+
 /// A key formatting helper trait to be used together with key-value
 /// backends for constructing keys.
 pub trait KeyFormat {
@@ -26,7 +33,7 @@ pub trait KeyFormat {
     where
         Self: Sized,
     {
-        let mut v = Vec::with_capacity(1 + Self::size());
+        let mut v = Vec::with_capacity(KEY_FORMAT_PREFIX_SIZE + Self::size());
         v.push(Self::prefix());
 
         if count == 0 {
@@ -34,14 +41,12 @@ pub trait KeyFormat {
         }
 
         let mut atoms = Vec::new();
-        let mut included = 0;
         self.encode_atoms(&mut atoms);
-        for mut atom in atoms {
+        for (included, mut atom) in atoms.into_iter().enumerate() {
             if included >= count {
                 break;
             }
             v.append(&mut atom);
-            included += 1;
         }
 
         v
@@ -52,7 +57,7 @@ pub trait KeyFormat {
     where
         Self: Sized,
     {
-        self.encode_partial(usize::max_value())
+        self.encode_partial(usize::MAX)
     }
 
     /// Decode the given key format from data.
@@ -63,15 +68,156 @@ pub trait KeyFormat {
     where
         Self: Sized,
     {
+        assert!(!data.is_empty(), "key format: malformed input (empty data)");
         if data[0] != Self::prefix() {
             return None;
         }
-        if data.len() < 1 + Self::size() {
-            panic!("key format: malformed input");
-        }
+        assert!(
+            data.len() >= Self::size() + KEY_FORMAT_PREFIX_SIZE,
+            "key format: malformed input"
+        );
 
         Some(Self::decode_atoms(&data[1..]))
     }
+}
+
+/// Part of the KeyFormat to be used with key-value backends for constructing keys.
+pub trait KeyFormatAtom {
+    fn size() -> usize;
+
+    fn encode_atom(self) -> Vec<u8>;
+
+    fn decode_atom(data: &[u8]) -> Self
+    where
+        Self: Sized;
+}
+
+impl KeyFormatAtom for u64 {
+    fn size() -> usize {
+        8
+    }
+
+    fn encode_atom(self) -> Vec<u8> {
+        self.to_be_bytes().to_vec()
+    }
+
+    fn decode_atom(data: &[u8]) -> Self
+    where
+        Self: Sized,
+    {
+        u64::from_be_bytes(data.try_into().expect("key_format: malformed u64 input"))
+    }
+}
+
+impl KeyFormatAtom for u8 {
+    fn size() -> usize {
+        1
+    }
+
+    fn encode_atom(self) -> Vec<u8> {
+        vec![self]
+    }
+
+    fn decode_atom(data: &[u8]) -> Self
+    where
+        Self: Sized,
+    {
+        assert!(!data.is_empty(), "key_format: malformed: u8 input");
+        data[0]
+    }
+}
+
+impl KeyFormatAtom for () {
+    fn size() -> usize {
+        0
+    }
+
+    fn encode_atom(self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    fn decode_atom(_: &[u8]) {}
+}
+
+#[impl_for_tuples(2, 10)]
+impl KeyFormatAtom for Tuple {
+    fn size() -> usize {
+        for_tuples!( #( Tuple::size() )+* );
+    }
+
+    fn encode_atom(self) -> Vec<u8> {
+        let mut atoms: Vec<Vec<u8>> = [for_tuples!( #( self.Tuple.encode_atom() ),* )].to_vec();
+
+        atoms.into_iter().flatten().collect()
+    }
+
+    fn decode_atom(data: &[u8]) -> for_tuples!( ( #( Tuple ),* ) ) {
+        assert!(
+            data.len() >= Self::size(),
+            "key format atom: malformed input"
+        );
+
+        let mut sizes: Vec<usize> = [for_tuples!( #( Tuple::size() ),* )].to_vec();
+        sizes.reverse();
+        let mut data = data.to_vec();
+
+        /*
+            (
+                {
+                    let x = T1::decode_atom(data.drain(0..T1::size()));
+                    x
+                },
+                {
+                    let x = T2::decode_atom(data.drain(0..T2::size()));
+                    x
+                }
+                ...
+            )
+        */
+        for_tuples!(
+            (
+                #(
+                    {
+                        let x = Tuple::decode_atom(data.drain(0..sizes.pop().unwrap()).as_slice());
+                        x
+                    }
+                ),*
+            )
+        )
+    }
+}
+
+/// Define a KeyFormat from KeyFormatAtom and a prefix.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// key_format!(NewKeyFormatName, 0x01, InnerType);
+/// ```
+#[macro_export]
+macro_rules! key_format {
+    ($name:ident, $prefix:expr, $inner:ty) => {
+        #[derive(Debug, Default, PartialEq, Eq, Clone)]
+        struct $name($inner);
+
+        impl KeyFormat for $name {
+            fn prefix() -> u8 {
+                $prefix
+            }
+
+            fn size() -> usize {
+                <$inner>::size()
+            }
+
+            fn encode_atoms(self, atoms: &mut Vec<Vec<u8>>) {
+                atoms.push(self.0.encode_atom());
+            }
+
+            fn decode_atoms(data: &[u8]) -> Self {
+                Self(<$inner>::decode_atom(data))
+            }
+        }
+    };
 }
 
 #[cfg(test)]
@@ -89,7 +235,7 @@ mod test {
 
     impl KeyFormat for Test1KeyFormat {
         fn prefix() -> u8 {
-            'T' as u8
+            b'T'
         }
 
         fn size() -> usize {
@@ -135,5 +281,16 @@ mod test {
         }
         .encode_partial(0);
         assert_eq!(enc.to_hex::<String>(), "54");
+    }
+
+    #[test]
+    fn test_key_format_atom() {
+        key_format!(TestKeyFormat, 0x01, (u8, u64, u8, u64, u64));
+
+        let key = TestKeyFormat((1, 2, 3, 4, 5));
+        let enc = key.clone().encode();
+        let dec = TestKeyFormat::decode(&enc);
+
+        assert_eq!(dec, Some(key),)
     }
 }

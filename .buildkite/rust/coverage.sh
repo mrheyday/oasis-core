@@ -39,23 +39,27 @@ export CARGO_TARGET_DIR=/tmp/coverage_target
 # Required as tarpaulin doesn't honor .cargo/config.
 export RUSTFLAGS="-C target-feature=+aes,+ssse3"
 
+# Make sure we can run unit tests for production enclaves.
+unset OASIS_UNSAFE_ALLOW_DEBUG_ENCLAVES
+unset OASIS_UNSAFE_SKIP_AVR_VERIFY
+
 # Name the current commit so Tarpaulin can detect it correctly.
 git checkout -B ${BUILDKITE_BRANCH}
 
 # Calculate coverage.
 set +x
 cargo tarpaulin \
+  --locked \
   --ignore-tests \
   --out Xml \
   --all \
+  --avoid-cfg-tarpaulin \
   --exclude simple-keyvalue \
-  --exclude simple-keyvalue-client \
-  --exclude simple-keyvalue-enc-client \
-  --exclude simple-keyvalue-ops-client \
-  --exclude test-long-term-client \
   --exclude-files '*generated*' \
   --exclude-files tests \
+  --exclude-files runtime/fuzz \
   --exclude-files runtime/src/storage/mkvs/interop \
+  --exclude-files tools \
   --coveralls ${coveralls_api_token} \
   -v
 set -x

@@ -6,14 +6,13 @@ import (
 	"fmt"
 	"io"
 
+	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
-	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	"github.com/oasisprotocol/oasis-core/go/common/errors"
 	"github.com/oasisprotocol/oasis-core/go/common/prettyprint"
 	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	"github.com/oasisprotocol/oasis-core/go/staking/api/token"
 )
 
@@ -27,19 +26,6 @@ const (
 )
 
 var (
-	// CommonPoolAddress is the common pool address.
-	// The address is reserved to prevent it being accidentally used in the actual ledger.
-	CommonPoolAddress = NewReservedAddress(
-		signature.NewPublicKey("1abe11edc001ffffffffffffffffffffffffffffffffffffffffffffffffffff"),
-	)
-
-	// FeeAccumulatorAddress is the per-block fee accumulator address.
-	// It holds all fees from txs in a block which are later disbursed to validators appropriately.
-	// The address is reserved to prevent it being accidentally used in the actual ledger.
-	FeeAccumulatorAddress = NewReservedAddress(
-		signature.NewPublicKey("1abe11edfeeaccffffffffffffffffffffffffffffffffffffffffffffffffff"),
-	)
-
 	// ErrInvalidArgument is the error returned on malformed arguments.
 	ErrInvalidArgument = errors.New(ModuleName, 1, "staking: invalid argument")
 
@@ -65,6 +51,24 @@ var (
 	// ErrTooManyAllowances is the error returned when the number of allowances per account would
 	// exceed the maximum allowed number.
 	ErrTooManyAllowances = errors.New(ModuleName, 7, "staking: too many allowances")
+
+	// ErrUnderMinDelegationAmount is the error returned when the given escrow
+	// amount is lower than the minimum delegation amount specified in the
+	// consensus parameters.
+	ErrUnderMinDelegationAmount = errors.New(ModuleName, 8, "staking: amount is lower than the minimum delegation amount")
+
+	// ErrUnderMinTransferAmount is the error returned when the given transfer
+	// or burn or withdrawal amount is lower than the minimum transfer amount
+	// specified in the consensus parameters.
+	ErrUnderMinTransferAmount = errors.New(ModuleName, 9, "staking: amount is lower than the minimum transfer amount")
+
+	// ErrBalanceTooLow is the error returned when an account's balance is
+	// below the minimum allowed amount.
+	ErrBalanceTooLow = errors.New(ModuleName, 10, "staking: balance too low")
+
+	// ErrAllowanceGreaterThanSupply is the error returned when the allowance amount exceeds the
+	// total supply value.
+	ErrAllowanceGreaterThanSupply = errors.New(ModuleName, 11, "staking: allowance greater than total supply")
 
 	// MethodTransfer is the method name for transfers.
 	MethodTransfer = transaction.NewMethodName(ModuleName, "Transfer", Transfer{})
@@ -110,11 +114,11 @@ var (
 // Backend is a staking implementation.
 type Backend interface {
 	// TokenSymbol returns the token's ticker symbol.
-	TokenSymbol(ctx context.Context) (string, error)
+	TokenSymbol(ctx context.Context, height int64) (string, error)
 
 	// TokenValueExponent is the token's value base-10 exponent, i.e.
 	// 1 token = 10**TokenValueExponent base units.
-	TokenValueExponent(ctx context.Context) (uint8, error)
+	TokenValueExponent(ctx context.Context, height int64) (uint8, error)
 
 	// TotalSupply returns the total number of base units.
 	TotalSupply(ctx context.Context, height int64) (*quantity.Quantity, error)
@@ -125,6 +129,9 @@ type Backend interface {
 	// LastBlockFees returns the collected fees for previous block.
 	LastBlockFees(ctx context.Context, height int64) (*quantity.Quantity, error)
 
+	// GovernanceDeposits returns the governance deposits account balance.
+	GovernanceDeposits(ctx context.Context, height int64) (*quantity.Quantity, error)
+
 	// Threshold returns the specific staking threshold by kind.
 	Threshold(ctx context.Context, query *ThresholdQuery) (*quantity.Quantity, error)
 
@@ -132,16 +139,36 @@ type Backend interface {
 	// or escrow balance.
 	Addresses(ctx context.Context, height int64) ([]Address, error)
 
+	// CommissionScheduleAddresses returns the addresses of all accounts with
+	// non-empty commission schedule.
+	CommissionScheduleAddresses(ctx context.Context, height int64) ([]Address, error)
+
 	// Account returns the account descriptor for the given account.
 	Account(ctx context.Context, query *OwnerQuery) (*Account, error)
 
-	// Delegations returns the list of delegations for the given owner
-	// (delegator).
-	Delegations(ctx context.Context, query *OwnerQuery) (map[Address]*Delegation, error)
+	// DelegationsFor returns the list of (outgoing) delegations for the given
+	// owner (delegator).
+	DelegationsFor(ctx context.Context, query *OwnerQuery) (map[Address]*Delegation, error)
 
-	// DebondingDelegations returns the list of debonding delegations for
-	// the given owner (delegator).
-	DebondingDelegations(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegation, error)
+	// DelegationInfosFor returns (outgoing) delegations with additional
+	// information for the given owner (delegator).
+	DelegationInfosFor(ctx context.Context, query *OwnerQuery) (map[Address]*DelegationInfo, error)
+
+	// DelegationsTo returns the list of (incoming) delegations to the given
+	// account.
+	DelegationsTo(ctx context.Context, query *OwnerQuery) (map[Address]*Delegation, error)
+
+	// DebondingDelegationsFor returns the list of (outgoing) debonding
+	// delegations for the given owner (delegator).
+	DebondingDelegationsFor(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegation, error)
+
+	// DebondingDelegationInfosFor returns (outgoing) debonding delegations
+	// with additional information for the given owner (delegator).
+	DebondingDelegationInfosFor(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegationInfo, error)
+
+	// DebondingDelegationsTo returns the list of (incoming) debonding
+	// delegations to the given account.
+	DebondingDelegationsTo(ctx context.Context, query *OwnerQuery) (map[Address][]*DebondingDelegation, error)
 
 	// Allowance looks up the allowance for the given owner/beneficiary combination.
 	Allowance(ctx context.Context, query *AllowanceQuery) (*quantity.Quantity, error)
@@ -149,7 +176,7 @@ type Backend interface {
 	// StateToGenesis returns the genesis state at specified block height.
 	StateToGenesis(ctx context.Context, height int64) (*Genesis, error)
 
-	// Paremeters returns the staking consensus parameters.
+	// ConsensusParameters returns the staking consensus parameters.
 	ConsensusParameters(ctx context.Context, height int64) (*ConsensusParameters, error)
 
 	// GetEvents returns the events at specified block height.
@@ -157,9 +184,6 @@ type Backend interface {
 
 	// WatchEvents returns a channel that produces a stream of Events.
 	WatchEvents(ctx context.Context) (<-chan *Event, pubsub.ClosableSubscription, error)
-
-	// Cleanup cleans up the backend.
-	Cleanup()
 }
 
 // ThresholdQuery is a threshold query.
@@ -189,17 +213,54 @@ type TransferEvent struct {
 	Amount quantity.Quantity `json:"amount"`
 }
 
+// EventKind returns a string representation of this event's kind.
+func (e *TransferEvent) EventKind() string {
+	return "transfer"
+}
+
+// ShouldProve returns true iff the event should be included in the event proof tree.
+func (e *TransferEvent) ShouldProve() bool {
+	return true
+}
+
+// ProvableRepresentation returns the provable representation of an event.
+//
+// Since this representation is part of commitments that are included in consensus layer state
+// any changes to this representation are consensus-breaking.
+func (e *TransferEvent) ProvableRepresentation() any {
+	return e
+}
+
 // BurnEvent is the event emitted when stake is destroyed via a call to Burn.
 type BurnEvent struct {
 	Owner  Address           `json:"owner"`
 	Amount quantity.Quantity `json:"amount"`
 }
 
+// EventKind returns a string representation of this event's kind.
+func (e *BurnEvent) EventKind() string {
+	return "burn"
+}
+
+// ShouldProve returns true iff the event should be included in the event proof tree.
+func (e *BurnEvent) ShouldProve() bool {
+	return true
+}
+
+// ProvableRepresentation returns the provable representation of an event.
+//
+// Since this representation is part of commitments that are included in consensus layer state
+// any changes to this representation are consensus-breaking.
+func (e *BurnEvent) ProvableRepresentation() any {
+	return e
+}
+
 // EscrowEvent is an escrow event.
 type EscrowEvent struct {
-	Add     *AddEscrowEvent     `json:"add,omitempty"`
-	Take    *TakeEscrowEvent    `json:"take,omitempty"`
-	Reclaim *ReclaimEscrowEvent `json:"reclaim,omitempty"`
+	Add            *AddEscrowEvent            `json:"add,omitempty"`
+	Take           *TakeEscrowEvent           `json:"take,omitempty"`
+	DebondingStart *DebondingStartEscrowEvent `json:"debonding_start,omitempty"`
+	Reclaim        *ReclaimEscrowEvent        `json:"reclaim,omitempty"`
 }
 
 // Event signifies a staking event, returned via GetEvents.
@@ -216,16 +277,90 @@ type Event struct {
 // AddEscrowEvent is the event emitted when stake is transferred into an escrow
 // account.
 type AddEscrowEvent struct {
-	Owner  Address           `json:"owner"`
-	Escrow Address           `json:"escrow"`
-	Amount quantity.Quantity `json:"amount"`
+	Owner     Address           `json:"owner"`
+	Escrow    Address           `json:"escrow"`
+	Amount    quantity.Quantity `json:"amount"`
+	NewShares quantity.Quantity `json:"new_shares"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *AddEscrowEvent) EventKind() string {
+	return "add_escrow"
+}
+
+// ShouldProve returns true iff the event should be included in the event proof tree.
+func (e *AddEscrowEvent) ShouldProve() bool {
+	return true
+}
+
+// ProvableRepresentation returns the provable representation of an event.
+//
+// Since this representation is part of commitments that are included in consensus layer state
+// any changes to this representation are consensus-breaking.
+func (e *AddEscrowEvent) ProvableRepresentation() any {
+	return e
 }
 
 // TakeEscrowEvent is the event emitted when stake is taken from an escrow
 // account (i.e. stake is slashed).
 type TakeEscrowEvent struct {
-	Owner  Address           `json:"owner"`
+	Owner Address `json:"owner"`
+	// The sum of amounts slashed from active and debonding escrow balances.
 	Amount quantity.Quantity `json:"amount"`
+	// The amount slashed from debonding escrow balances.
+	DebondingAmount quantity.Quantity `json:"debonding_amount"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *TakeEscrowEvent) EventKind() string {
+	return "take_escrow"
+}
+
+// ShouldProve returns true iff the event should be included in the event proof tree.
+func (e *TakeEscrowEvent) ShouldProve() bool {
+	return true
+}
+
+// ProvableRepresentation returns the provable representation of an event.
+//
+// Since this representation is part of commitments that are included in consensus layer state
+// any changes to this representation are consensus-breaking.
+func (e *TakeEscrowEvent) ProvableRepresentation() any {
+	return e
+}
+
+// DebondingStartEscrowEvent is the event emitted when the debonding process has
+// started and the given number of active shares have been moved into the
+// debonding pool and started debonding.
+//
+// Note that the given amount is valid at the time of debonding start and
+// may not correspond to the final debonded amount in case any escrowed
+// stake is subject to slashing.
+type DebondingStartEscrowEvent struct {
+	Owner           Address           `json:"owner"`
+	Escrow          Address           `json:"escrow"`
+	Amount          quantity.Quantity `json:"amount"`
+	ActiveShares    quantity.Quantity `json:"active_shares"`
+	DebondingShares quantity.Quantity `json:"debonding_shares"`
+	DebondEndTime   beacon.EpochTime  `json:"debond_end_time"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *DebondingStartEscrowEvent) EventKind() string {
+	return "debonding_start"
+}
+
+// ShouldProve returns true iff the event should be included in the event proof tree.
+func (e *DebondingStartEscrowEvent) ShouldProve() bool {
+	return true
+}
+
+// ProvableRepresentation returns the provable representation of an event.
+//
+// Since this representation is part of commitments that are included in consensus layer state
+// any changes to this representation are consensus-breaking.
+func (e *DebondingStartEscrowEvent) ProvableRepresentation() any {
+	return e
 }
 
 // ReclaimEscrowEvent is the event emitted when stake is reclaimed from an
@@ -234,15 +369,52 @@ type ReclaimEscrowEvent struct {
 	Owner  Address           `json:"owner"`
 	Escrow Address           `json:"escrow"`
 	Amount quantity.Quantity `json:"amount"`
+	Shares quantity.Quantity `json:"shares"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *ReclaimEscrowEvent) EventKind() string {
+	return "reclaim_escrow"
+}
+
+// ShouldProve returns true iff the event should be included in the event proof tree.
+func (e *ReclaimEscrowEvent) ShouldProve() bool {
+	return true
+}
+
+// ProvableRepresentation returns the provable representation of an event.
+//
+// Since this representation is part of commitments that are included in consensus layer state
+// any changes to this representation are consensus-breaking.
+func (e *ReclaimEscrowEvent) ProvableRepresentation() any {
+	return e
 }
 
 // AllowanceChangeEvent is the event emitted when allowance is changed for a beneficiary.
-type AllowanceChangeEvent struct { // nolint: maligned
+type AllowanceChangeEvent struct {
 	Owner        Address           `json:"owner"`
 	Beneficiary  Address           `json:"beneficiary"`
 	Allowance    quantity.Quantity `json:"allowance"`
 	Negative     bool              `json:"negative,omitempty"`
 	AmountChange quantity.Quantity `json:"amount_change"`
+}
+
+// EventKind returns a string representation of this event's kind.
+func (e *AllowanceChangeEvent) EventKind() string {
+	return "allowance_change"
+}
+
+// ShouldProve returns true iff the event should be included in the event proof tree.
+func (e *AllowanceChangeEvent) ShouldProve() bool {
+	return true
+}
+
+// ProvableRepresentation returns the provable representation of an event.
+//
+// Since this representation is part of commitments that are included in consensus layer state
+// any changes to this representation are consensus-breaking.
+func (e *AllowanceChangeEvent) ProvableRepresentation() any {
+	return e
 }
 
 // Transfer is a stake transfer.
@@ -254,7 +426,7 @@ type Transfer struct {
 // PrettyPrint writes a pretty-printed representation of Transfer to the given
 // writer.
 func (t Transfer) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
-	fmt.Fprintf(w, "%sTo:     %s\n", prefix, t.To)
+	fmt.Fprintf(w, "%sTo:     %s\n", prefix, FormatAddress(ctx, t.To))
 
 	fmt.Fprintf(w, "%sAmount: ", prefix)
 	token.PrettyPrintAmount(ctx, t.Amount, w)
@@ -263,7 +435,7 @@ func (t Transfer) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
 
 // PrettyType returns a representation of Transfer that can be used for pretty
 // printing.
-func (t Transfer) PrettyType() (interface{}, error) {
+func (t Transfer) PrettyType() (any, error) {
 	return t, nil
 }
 
@@ -287,7 +459,7 @@ func (b Burn) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
 
 // PrettyType returns a representation of Burn that can be used for pretty
 // printing.
-func (b Burn) PrettyType() (interface{}, error) {
+func (b Burn) PrettyType() (any, error) {
 	return b, nil
 }
 
@@ -305,16 +477,16 @@ type Escrow struct {
 // PrettyPrint writes a pretty-printed representation of Escrow to the given
 // writer.
 func (e Escrow) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
-	fmt.Fprintf(w, "%sAccount: %s\n", prefix, e.Account)
+	fmt.Fprintf(w, "%sTo:     %s\n", prefix, FormatAddress(ctx, e.Account))
 
-	fmt.Fprintf(w, "%sAmount:  ", prefix)
+	fmt.Fprintf(w, "%sAmount: ", prefix)
 	token.PrettyPrintAmount(ctx, e.Amount, w)
 	fmt.Fprintln(w)
 }
 
 // PrettyType returns a representation of Escrow that can be used for pretty
 // printing.
-func (e Escrow) PrettyType() (interface{}, error) {
+func (e Escrow) PrettyType() (any, error) {
 	return e, nil
 }
 
@@ -332,14 +504,14 @@ type ReclaimEscrow struct {
 // PrettyPrint writes a pretty-printed representation of ReclaimEscrow to the
 // given writer.
 func (re ReclaimEscrow) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
-	fmt.Fprintf(w, "%sAccount: %s\n", prefix, re.Account)
+	fmt.Fprintf(w, "%sFrom:   %s\n", prefix, FormatAddress(ctx, re.Account))
 
-	fmt.Fprintf(w, "%sShares:  %s\n", prefix, re.Shares)
+	fmt.Fprintf(w, "%sShares: %s\n", prefix, re.Shares)
 }
 
 // PrettyType returns a representation of Transfer that can be used for pretty
 // printing.
-func (re ReclaimEscrow) PrettyType() (interface{}, error) {
+func (re ReclaimEscrow) PrettyType() (any, error) {
 	return re, nil
 }
 
@@ -362,7 +534,7 @@ func (acs AmendCommissionSchedule) PrettyPrint(ctx context.Context, prefix strin
 
 // PrettyType returns a representation of AmendCommissionSchedule that can be
 // used for pretty printing.
-func (acs AmendCommissionSchedule) PrettyType() (interface{}, error) {
+func (acs AmendCommissionSchedule) PrettyType() (any, error) {
 	return acs, nil
 }
 
@@ -380,17 +552,20 @@ type Allow struct {
 
 // PrettyPrint writes a pretty-printed representation of Allow to the given writer.
 func (aw Allow) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
-	fmt.Fprintf(w, "%sBeneficiary:   %s\n", prefix, aw.Beneficiary)
+	fmt.Fprintf(w, "%sBeneficiary:   %s\n", prefix, FormatAddress(ctx, aw.Beneficiary))
 
-	var sign string
+	sign := "+"
 	if aw.Negative {
 		sign = "-"
 	}
-	fmt.Fprintf(w, "%sAmount Change: %s%s\n", prefix, sign, aw.AmountChange)
+	ctx = context.WithValue(ctx, prettyprint.ContextKeyTokenValueSign, sign)
+	fmt.Fprintf(w, "%sAmount change: ", prefix)
+	token.PrettyPrintAmount(ctx, aw.AmountChange, w)
+	fmt.Fprintln(w)
 }
 
 // PrettyType returns a representation of Allow that can be used for pretty printing.
-func (aw Allow) PrettyType() (interface{}, error) {
+func (aw Allow) PrettyType() (any, error) {
 	return aw, nil
 }
 
@@ -407,12 +582,15 @@ type Withdraw struct {
 
 // PrettyPrint writes a pretty-printed representation of Withdraw to the given writer.
 func (wt Withdraw) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
-	fmt.Fprintf(w, "%sFrom:   %s\n", prefix, wt.From)
-	fmt.Fprintf(w, "%sAmount: %s\n", prefix, wt.Amount)
+	fmt.Fprintf(w, "%sFrom:   %s\n", prefix, FormatAddress(ctx, wt.From))
+
+	fmt.Fprintf(w, "%sAmount: ", prefix)
+	token.PrettyPrintAmount(ctx, wt.Amount, w)
+	fmt.Fprintln(w)
 }
 
 // PrettyType returns a representation of Withdraw that can be used for pretty printing.
-func (wt Withdraw) PrettyType() (interface{}, error) {
+func (wt Withdraw) PrettyType() (any, error) {
 	return wt, nil
 }
 
@@ -440,7 +618,7 @@ func (p SharePool) PrettyPrint(ctx context.Context, prefix string, w io.Writer) 
 
 // PrettyType returns a representation of SharePool that can be used for pretty
 // printing.
-func (p SharePool) PrettyType() (interface{}, error) {
+func (p SharePool) PrettyType() (any, error) {
 	return p, nil
 }
 
@@ -474,30 +652,33 @@ func (p *SharePool) sharesForStake(amount *quantity.Quantity) (*quantity.Quantit
 }
 
 // Deposit moves stake into the combined balance, raising the shares.
+//
+// Returns the number of new shares created as a result of the deposit.
+//
 // If an error occurs, the pool and affected accounts are left in an invalid state.
-func (p *SharePool) Deposit(shareDst, stakeSrc, baseUnitsAmount *quantity.Quantity) error {
+func (p *SharePool) Deposit(shareDst, stakeSrc, baseUnitsAmount *quantity.Quantity) (*quantity.Quantity, error) {
 	shares, err := p.sharesForStake(baseUnitsAmount)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if err = quantity.Move(&p.Balance, stakeSrc, baseUnitsAmount); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err = p.TotalShares.Add(shares); err != nil {
-		return err
+		return nil, err
 	}
 
 	if err = shareDst.Add(shares); err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return shares, nil
 }
 
-// stakeForShares computes the amount of base units for the given amount of shares.
-func (p *SharePool) stakeForShares(amount *quantity.Quantity) (*quantity.Quantity, error) {
+// StakeForShares computes the amount of base units for the given amount of shares.
+func (p *SharePool) StakeForShares(amount *quantity.Quantity) (*quantity.Quantity, error) {
 	if amount.IsZero() || p.Balance.IsZero() || p.TotalShares.IsZero() {
 		// No existing shares or no balance means no base units.
 		return quantity.NewQuantity(), nil
@@ -522,7 +703,7 @@ func (p *SharePool) stakeForShares(amount *quantity.Quantity) (*quantity.Quantit
 // Withdraw moves stake out of the combined balance, reducing the shares.
 // If an error occurs, the pool and affected accounts are left in an invalid state.
 func (p *SharePool) Withdraw(stakeDst, shareSrc, shareAmount *quantity.Quantity) error {
-	baseUnits, err := p.stakeForShares(shareAmount)
+	baseUnits, err := p.StakeForShares(shareAmount)
 	if err != nil {
 		return err
 	}
@@ -535,35 +716,46 @@ func (p *SharePool) Withdraw(stakeDst, shareSrc, shareAmount *quantity.Quantity)
 		return err
 	}
 
-	if err = quantity.Move(stakeDst, &p.Balance, baseUnits); err != nil {
-		return err
-	}
-
-	return nil
+	return quantity.Move(stakeDst, &p.Balance, baseUnits)
 }
 
 // ThresholdKind is the kind of staking threshold.
 type ThresholdKind int
 
+// nolint: revive
 const (
 	KindEntity            ThresholdKind = 0
 	KindNodeValidator     ThresholdKind = 1
 	KindNodeCompute       ThresholdKind = 2
-	KindNodeStorage       ThresholdKind = 3
+	KindNodeObserver      ThresholdKind = 3
 	KindNodeKeyManager    ThresholdKind = 4
 	KindRuntimeCompute    ThresholdKind = 5
 	KindRuntimeKeyManager ThresholdKind = 6
-
-	KindMax = KindRuntimeKeyManager
+	KindKeyManagerChurp   ThresholdKind = 7
 
 	KindEntityName            = "entity"
 	KindNodeValidatorName     = "node-validator"
 	KindNodeComputeName       = "node-compute"
-	KindNodeStorageName       = "node-storage"
+	KindNodeObserverName      = "node-observer"
 	KindNodeKeyManagerName    = "node-keymanager"
 	KindRuntimeComputeName    = "runtime-compute"
 	KindRuntimeKeyManagerName = "runtime-keymanager"
+	KindKeyManagerChurpName   = "keymanager-churp"
 )
+
+// ThresholdKinds are the valid threshold kinds.
+var ThresholdKinds = []ThresholdKind{
+	KindEntity,
+	KindNodeValidator,
+	KindNodeCompute,
+	KindNodeObserver,
+	KindNodeKeyManager,
+	KindRuntimeCompute,
+	KindRuntimeKeyManager,
+	// Commented out to pass sanity check of the genesis file and to avoid
+	// breaking consensus change parameters proposals for the staking module.
+	// KindKeyManagerChurp,
+}
 
 // String returns the string representation of a ThresholdKind.
 func (k ThresholdKind) String() string {
@@ -574,14 +766,16 @@ func (k ThresholdKind) String() string {
 		return KindNodeValidatorName
 	case KindNodeCompute:
 		return KindNodeComputeName
-	case KindNodeStorage:
-		return KindNodeStorageName
+	case KindNodeObserver:
+		return KindNodeObserverName
 	case KindNodeKeyManager:
 		return KindNodeKeyManagerName
 	case KindRuntimeCompute:
 		return KindRuntimeComputeName
 	case KindRuntimeKeyManager:
 		return KindRuntimeKeyManagerName
+	case KindKeyManagerChurp:
+		return KindKeyManagerChurpName
 	default:
 		return "[unknown threshold kind]"
 	}
@@ -601,14 +795,16 @@ func (k *ThresholdKind) UnmarshalText(text []byte) error {
 		*k = KindNodeValidator
 	case KindNodeComputeName:
 		*k = KindNodeCompute
-	case KindNodeStorageName:
-		*k = KindNodeStorage
+	case KindNodeObserverName:
+		*k = KindNodeObserver
 	case KindNodeKeyManagerName:
 		*k = KindNodeKeyManager
 	case KindRuntimeComputeName:
 		*k = KindRuntimeCompute
 	case KindRuntimeKeyManagerName:
 		*k = KindRuntimeKeyManager
+	case KindKeyManagerChurpName:
+		*k = KindKeyManagerChurp
 	default:
 		return fmt.Errorf("%w: %s", ErrInvalidThreshold, string(text))
 	}
@@ -640,7 +836,7 @@ func (st StakeThreshold) String() string {
 
 // PrettyPrint writes a pretty-printed representation of StakeThreshold to the
 // given writer.
-func (st StakeThreshold) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
+func (st StakeThreshold) PrettyPrint(_ context.Context, prefix string, w io.Writer) {
 	switch {
 	case st.Global != nil:
 		fmt.Fprintf(w, "%s- Global: %s\n", prefix, *st.Global)
@@ -653,7 +849,7 @@ func (st StakeThreshold) PrettyPrint(ctx context.Context, prefix string, w io.Wr
 
 // PrettyType returns a representation of StakeThreshold that can be used for
 // pretty printing.
-func (st StakeThreshold) PrettyType() (interface{}, error) {
+func (st StakeThreshold) PrettyType() (any, error) {
 	return st, nil
 }
 
@@ -693,11 +889,12 @@ func GlobalStakeThreshold(kind ThresholdKind) StakeThreshold {
 }
 
 // GlobalStakeThresholds creates a new list of global StakeThresholds.
-func GlobalStakeThresholds(kinds ...ThresholdKind) (sts []StakeThreshold) {
+func GlobalStakeThresholds(kinds ...ThresholdKind) []StakeThreshold {
+	var sts []StakeThreshold
 	for _, k := range kinds {
 		sts = append(sts, GlobalStakeThreshold(k))
 	}
-	return
+	return sts
 }
 
 // StakeAccumulator is a per-escrow-account stake accumulator.
@@ -726,7 +923,7 @@ func (sa StakeAccumulator) PrettyPrint(ctx context.Context, prefix string, w io.
 
 // PrettyType returns a representation of StakeAccumulator that can be used for
 // pretty printing.
-func (sa StakeAccumulator) PrettyType() (interface{}, error) {
+func (sa StakeAccumulator) PrettyType() (any, error) {
 	return sa, nil
 }
 
@@ -743,7 +940,7 @@ func (sa *StakeAccumulator) AddClaimUnchecked(claim StakeClaim, thresholds []Sta
 //
 // It is an error if the stake claim does not exist.
 func (sa *StakeAccumulator) RemoveClaim(claim StakeClaim) error {
-	if sa.Claims == nil || sa.Claims[claim] == nil {
+	if _, exists := sa.Claims[claim]; !exists {
 		return fmt.Errorf("staking: claim does not exist: %s", claim)
 	}
 
@@ -777,12 +974,41 @@ func (sa *StakeAccumulator) TotalClaims(thresholds map[ThresholdKind]quantity.Qu
 	return &total, nil
 }
 
+// HookKind is an account hook kind.
+type HookKind uint8
+
+const (
+	// HookKindWithdraw is the hook kind invoked during withdrawals. It may either allow or reject
+	// the given withdrawal based on custom logic.
+	HookKindWithdraw HookKind = 1
+)
+
+// String returns a string representation of an account hook kind.
+func (hk HookKind) String() string {
+	switch hk {
+	case HookKindWithdraw:
+		return "withdraw"
+	default:
+		return "[invalid]"
+	}
+}
+
+// HookDestination describes a hook destination.
+type HookDestination struct {
+	// Module is the identifier of a module that should handle the hook.
+	Module string `json:"module"`
+}
+
 // GeneralAccount is a general-purpose account.
 type GeneralAccount struct {
 	Balance quantity.Quantity `json:"balance,omitempty"`
 	Nonce   uint64            `json:"nonce,omitempty"`
 
+	// Allowances is the set of per-beneficiary allowances.
 	Allowances map[Address]quantity.Quantity `json:"allowances,omitempty"`
+	// Hooks is the set of hooks that should be invoked when specific actions happen to override
+	// common behavior.
+	Hooks map[HookKind]HookDestination `json:"hooks,omitempty"`
 }
 
 // PrettyPrint writes a pretty-printed representation of GeneralAccount to the
@@ -804,11 +1030,20 @@ func (ga GeneralAccount) PrettyPrint(ctx context.Context, prefix string, w io.Wr
 			fmt.Fprintln(w)
 		}
 	}
+
+	fmt.Fprintf(w, "%sHooks:\n", prefix)
+	if len(ga.Hooks) == 0 {
+		fmt.Fprintf(w, "%s%snone\n", prefix, prefix)
+	} else {
+		for kind, dst := range ga.Hooks {
+			fmt.Fprintf(w, "%s%s%s: %s\n", prefix, prefix, kind, dst.Module)
+		}
+	}
 }
 
 // PrettyType returns a representation of GeneralAccount that can be used for
 // pretty printing.
-func (ga GeneralAccount) PrettyType() (interface{}, error) {
+func (ga GeneralAccount) PrettyType() (any, error) {
 	return ga, nil
 }
 
@@ -839,7 +1074,7 @@ func (e EscrowAccount) PrettyPrint(ctx context.Context, prefix string, w io.Writ
 
 // PrettyType returns a representation of EscrowAccount that can be used for
 // pretty printing.
-func (e EscrowAccount) PrettyType() (interface{}, error) {
+func (e EscrowAccount) PrettyType() (any, error) {
 	return e, nil
 }
 
@@ -857,7 +1092,7 @@ func (e *EscrowAccount) CheckStakeClaims(tm map[ThresholdKind]quantity.Quantity)
 
 // AddStakeClaim attempts to add a stake claim to the given escrow account.
 //
-// In case there is insufficient stake to cover the claim or an error occurrs, no modifications are
+// In case there is insufficient stake to cover the claim or an error occurs, no modifications are
 // made to the stake accumulator.
 func (e *EscrowAccount) AddStakeClaim(tm map[ThresholdKind]quantity.Quantity, claim StakeClaim, thresholds []StakeThreshold) error {
 	// Compute total amount of claims excluding the claim that we are just adding. This is needed
@@ -914,7 +1149,7 @@ func (a Account) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
 
 // PrettyType returns a representation of Account that can be used for pretty
 // printing.
-func (a Account) PrettyType() (interface{}, error) {
+func (a Account) PrettyType() (any, error) {
 	return a, nil
 }
 
@@ -923,10 +1158,40 @@ type Delegation struct {
 	Shares quantity.Quantity `json:"shares"`
 }
 
+// DelegationInfo is a delegation descriptor with additional information.
+//
+// Additional information contains the share pool the delegation belongs to.
+type DelegationInfo struct {
+	Delegation
+	Pool SharePool `json:"pool"`
+}
+
 // DebondingDelegation is a debonding delegation descriptor.
 type DebondingDelegation struct {
-	Shares        quantity.Quantity   `json:"shares"`
-	DebondEndTime epochtime.EpochTime `json:"debond_end"`
+	Shares        quantity.Quantity `json:"shares"`
+	DebondEndTime beacon.EpochTime  `json:"debond_end"`
+}
+
+// Merge merges debonding delegations with same debond end time by summing
+// the shares amounts.
+func (d *DebondingDelegation) Merge(other DebondingDelegation) error {
+	if d.DebondEndTime != other.DebondEndTime {
+		return fmt.Errorf("cannot merge debonding delegations, end time doesn't match")
+	}
+	if err := d.Shares.Add(&other.Shares); err != nil {
+		return fmt.Errorf("error adding debonding delegation shares: %w", err)
+	}
+	return nil
+}
+
+// DebondingDelegationInfo is a debonding delegation descriptor with additional
+// information.
+//
+// Additional information contains the share pool the debonding delegation
+// belongs to.
+type DebondingDelegationInfo struct {
+	DebondingDelegation
+	Pool SharePool `json:"pool"`
 }
 
 // Genesis is the initial staking state for use in the genesis block.
@@ -941,12 +1206,14 @@ type Genesis struct {
 	// 1 token = 10**TokenValueExponent base units.
 	TokenValueExponent uint8 `json:"token_value_exponent"`
 
-	// TokenSupply is the network's total amount of stake in base units.
+	// TotalSupply is the network's total amount of stake in base units.
 	TotalSupply quantity.Quantity `json:"total_supply"`
 	// CommonPool is the network's common stake pool.
 	CommonPool quantity.Quantity `json:"common_pool"`
 	// LastBlockFees are the collected fees for previous block.
 	LastBlockFees quantity.Quantity `json:"last_block_fees"`
+	// GovernanceDeposits are network's governance deposits.
+	GovernanceDeposits quantity.Quantity `json:"governance_deposits"`
 
 	// Ledger is a map of staking accounts.
 	Ledger map[Address]*Account `json:"ledger,omitempty"`
@@ -960,20 +1227,37 @@ type Genesis struct {
 }
 
 // ConsensusParameters are the staking consensus parameters.
-type ConsensusParameters struct { // nolint: maligned
-	Thresholds                        map[ThresholdKind]quantity.Quantity `json:"thresholds,omitempty"`
-	DebondingInterval                 epochtime.EpochTime                 `json:"debonding_interval,omitempty"`
-	RewardSchedule                    []RewardStep                        `json:"reward_schedule,omitempty"`
-	SigningRewardThresholdNumerator   uint64                              `json:"signing_reward_threshold_numerator,omitempty"`
-	SigningRewardThresholdDenominator uint64                              `json:"signing_reward_threshold_denominator,omitempty"`
-	CommissionScheduleRules           CommissionScheduleRules             `json:"commission_schedule_rules,omitempty"`
-	Slashing                          map[SlashReason]Slash               `json:"slashing,omitempty"`
-	GasCosts                          transaction.Costs                   `json:"gas_costs,omitempty"`
-	MinDelegationAmount               quantity.Quantity                   `json:"min_delegation"`
+type ConsensusParameters struct {
+	// TokenSymbol is the token's ticker symbol.
+	// Only upper case A-Z characters are allowed.
+	TokenSymbol string `json:"token_symbol,omitempty"`
+	// TokenValueExponent is the token's value base-10 exponent, i.e.
+	// 1 token = 10**TokenValueExponent base units.
+	TokenValueExponent uint8 `json:"token_value_exponent,omitempty"`
+
+	Thresholds        map[ThresholdKind]quantity.Quantity `json:"thresholds,omitempty"`
+	DebondingInterval beacon.EpochTime                    `json:"debonding_interval,omitempty"`
+	RewardSchedule    []RewardStep                        `json:"reward_schedule,omitempty"`
+	// SigningRewardThresholdNumerator is the numerator of the threshold used for
+	// block signing rewards.
+	SigningRewardThresholdNumerator uint64 `json:"signing_reward_threshold_numerator,omitempty"`
+	// SigningRewardThresholdDenominator is the denominator of the threshold used for
+	// block signing rewards. If the denominator is zero, the threshold is treated as zero.
+	SigningRewardThresholdDenominator uint64                  `json:"signing_reward_threshold_denominator,omitempty"`
+	CommissionScheduleRules           CommissionScheduleRules `json:"commission_schedule_rules,omitempty"`
+	Slashing                          map[SlashReason]Slash   `json:"slashing,omitempty"`
+	GasCosts                          transaction.Costs       `json:"gas_costs,omitempty"`
+	MinDelegationAmount               quantity.Quantity       `json:"min_delegation"`
+	MinTransferAmount                 quantity.Quantity       `json:"min_transfer"`
+	MinTransactBalance                quantity.Quantity       `json:"min_transact_balance"`
 
 	DisableTransfers       bool             `json:"disable_transfers,omitempty"`
 	DisableDelegation      bool             `json:"disable_delegation,omitempty"`
 	UndisableTransfersFrom map[Address]bool `json:"undisable_transfers_from,omitempty"`
+
+	// AllowEscrowMessages can be used to allow runtimes to perform AddEscrow
+	// and ReclaimEscrow via runtime messages.
+	AllowEscrowMessages bool `json:"allow_escrow_messages,omitempty"`
 
 	// MaxAllowances is the maximum number of allowances an account can have. Zero means disabled.
 	MaxAllowances uint32 `json:"max_allowances,omitempty"`
@@ -991,6 +1275,107 @@ type ConsensusParameters struct { // nolint: maligned
 	// RewardFactorBlockProposed is the factor for a reward distributed per block
 	// to the entity that proposed the block.
 	RewardFactorBlockProposed quantity.Quantity `json:"reward_factor_block_proposed"`
+
+	// DebugBypassStake is true iff all of the staking-related checks and
+	// operations should be bypassed.
+	DebugBypassStake bool `json:"debug_bypass_stake,omitempty"`
+}
+
+// ConsensusParameterChanges are allowed staking consensus parameter changes.
+type ConsensusParameterChanges struct {
+	// DebondingInterval is the new debonding interval.
+	DebondingInterval *beacon.EpochTime `json:"debonding_interval,omitempty"`
+
+	// RewardSchedule is the new reward schedule.
+	RewardSchedule *[]RewardStep `json:"reward_schedule,omitempty"`
+
+	// GasCosts are the new gas costs.
+	GasCosts transaction.Costs `json:"gas_costs,omitempty"`
+
+	// MinDelegationAmount is the new minimum delegation amount.
+	MinDelegationAmount *quantity.Quantity `json:"min_delegation"`
+	// MinTransferAmount is the new minimum transfer amount.
+	MinTransferAmount *quantity.Quantity `json:"min_transfer"`
+	// MinTransactBalance is the new minimum transact balance.
+	MinTransactBalance *quantity.Quantity `json:"min_transact_balance"`
+	// MinCommissionRate is the new minimum commission rate.
+	MinCommissionRate *quantity.Quantity `json:"min_commission_rate"`
+
+	// DisableTransfers is the new disable transfers flag.
+	DisableTransfers *bool `json:"disable_transfers,omitempty"`
+	// DisableDelegation is the new disable delegation flag.
+	DisableDelegation *bool `json:"disable_delegation,omitempty"`
+
+	// AllowEscrowMessages is the new allow escrow messages flag.
+	AllowEscrowMessages *bool `json:"allow_escrow_messages,omitempty"`
+
+	// MaxAllowances is the new maximum number of allowances.
+	MaxAllowances *uint32 `json:"max_allowances,omitempty"`
+
+	// FeeSplitWeightPropose is the new propose fee split weight.
+	FeeSplitWeightPropose *quantity.Quantity `json:"fee_split_weight_propose"`
+	// FeeSplitWeightVote is the new vote fee split weight.
+	FeeSplitWeightVote *quantity.Quantity `json:"fee_split_weight_vote"`
+	// FeeSplitWeightNextPropose is the new next propose fee split weight.
+	FeeSplitWeightNextPropose *quantity.Quantity `json:"fee_split_weight_next_propose"`
+
+	// RewardFactorEpochSigned is the new epoch signed reward factor.
+	RewardFactorEpochSigned *quantity.Quantity `json:"reward_factor_epoch_signed"`
+	// RewardFactorBlockProposed is the new block proposed reward factor.
+	RewardFactorBlockProposed *quantity.Quantity `json:"reward_factor_block_proposed"`
+}
+
+// Apply applies changes to the given consensus parameters.
+func (c *ConsensusParameterChanges) Apply(params *ConsensusParameters) error {
+	if c.DebondingInterval != nil {
+		params.DebondingInterval = *c.DebondingInterval
+	}
+	if c.RewardSchedule != nil {
+		params.RewardSchedule = *c.RewardSchedule
+	}
+	if c.GasCosts != nil {
+		params.GasCosts = c.GasCosts
+	}
+	if c.MinDelegationAmount != nil {
+		params.MinDelegationAmount = *c.MinDelegationAmount
+	}
+	if c.MinTransferAmount != nil {
+		params.MinTransferAmount = *c.MinTransferAmount
+	}
+	if c.MinTransactBalance != nil {
+		params.MinTransactBalance = *c.MinTransactBalance
+	}
+	if c.MinCommissionRate != nil {
+		params.CommissionScheduleRules.MinCommissionRate = *c.MinCommissionRate
+	}
+	if c.DisableTransfers != nil {
+		params.DisableTransfers = *c.DisableTransfers
+	}
+	if c.DisableDelegation != nil {
+		params.DisableDelegation = *c.DisableDelegation
+	}
+	if c.AllowEscrowMessages != nil {
+		params.AllowEscrowMessages = *c.AllowEscrowMessages
+	}
+	if c.MaxAllowances != nil {
+		params.MaxAllowances = *c.MaxAllowances
+	}
+	if c.FeeSplitWeightPropose != nil {
+		params.FeeSplitWeightPropose = *c.FeeSplitWeightPropose
+	}
+	if c.FeeSplitWeightVote != nil {
+		params.FeeSplitWeightVote = *c.FeeSplitWeightVote
+	}
+	if c.FeeSplitWeightNextPropose != nil {
+		params.FeeSplitWeightNextPropose = *c.FeeSplitWeightNextPropose
+	}
+	if c.RewardFactorEpochSigned != nil {
+		params.RewardFactorEpochSigned = *c.RewardFactorEpochSigned
+	}
+	if c.RewardFactorBlockProposed != nil {
+		params.RewardFactorBlockProposed = *c.RewardFactorBlockProposed
+	}
+	return nil
 }
 
 const (
@@ -1009,3 +1394,36 @@ const (
 	// GasOpWithdraw is the gas operation identifier for withdraw.
 	GasOpWithdraw transaction.Op = "withdraw"
 )
+
+// TransferResult is the result of staking transfer.
+type TransferResult struct {
+	From   Address           `json:"from"`
+	To     Address           `json:"to"`
+	Amount quantity.Quantity `json:"amount"`
+}
+
+// WithdrawResult is the result of withdraw.
+type WithdrawResult struct {
+	Owner        Address           `json:"owner"`
+	Beneficiary  Address           `json:"beneficiary"`
+	Allowance    quantity.Quantity `json:"allowance"`
+	AmountChange quantity.Quantity `json:"amount_change"`
+}
+
+// AddEscrowResult is the result of add escrow.
+type AddEscrowResult struct {
+	Owner     Address           `json:"owner"`
+	Escrow    Address           `json:"escrow"`
+	Amount    quantity.Quantity `json:"amount"`
+	NewShares quantity.Quantity `json:"new_shares"`
+}
+
+// ReclaimEscrowResult is the result of reclaim escrow.
+type ReclaimEscrowResult struct {
+	Owner           Address           `json:"owner"`
+	Escrow          Address           `json:"escrow"`
+	Amount          quantity.Quantity `json:"amount"`
+	DebondingShares quantity.Quantity `json:"debonding_shares"`
+	RemainingShares quantity.Quantity `json:"remaining_shares"`
+	DebondEndTime   beacon.EpochTime  `json:"debond_end_time"`
+}

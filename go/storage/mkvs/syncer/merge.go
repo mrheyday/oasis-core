@@ -8,8 +8,7 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/node"
 )
 
-type SubtreeMerger struct {
-}
+type SubtreeMerger struct{}
 
 // MergeVerifiedSubtree merges a previously verified subtree with an
 // existing tree.
@@ -47,10 +46,7 @@ func (m *SubtreeMerger) MergeVerifiedSubtree(
 	// If destination node is nil, we can simply replace the whole subtree.
 	if dst.Node == nil {
 		dst.Node = subtree.Node
-		if err := committer(dst); err != nil {
-			return err
-		}
-		return nil
+		return committer(dst)
 	}
 
 	switch n := dst.Node.(type) {

@@ -3,7 +3,6 @@ package dumpdb
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,21 +14,27 @@ import (
 
 	beacon "github.com/oasisprotocol/oasis-core/go/beacon/api"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	"github.com/oasisprotocol/oasis-core/go/config"
+	"github.com/oasisprotocol/oasis-core/go/consensus/cometbft/abci"
+	cmtAPI "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/api"
+	beaconApp "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/apps/beacon"
+	consensusApp "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/apps/consensus"
+	governanceApp "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/apps/governance"
+	keymanagerChurpApp "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/apps/keymanager/churp"
+	keymanagerSecretsApp "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/apps/keymanager/secrets"
+	registryApp "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/apps/registry"
+	roothashApp "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/apps/roothash"
+	schedulerApp "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/apps/scheduler"
+	stakingApp "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/apps/staking"
+	vaultApp "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/apps/vault"
+	cmtCommon "github.com/oasisprotocol/oasis-core/go/consensus/cometbft/common"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/genesis"
-	"github.com/oasisprotocol/oasis-core/go/consensus/tendermint/abci"
-	abciState "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/abci/state"
-	tendermintAPI "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/api"
-	beaconApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/beacon"
-	keymanagerApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/keymanager"
-	registryApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/registry"
-	roothashApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/roothash"
-	schedulerApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/scheduler"
-	stakingApp "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/apps/staking"
-	tendermintCommon "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/common"
-	epochtime "github.com/oasisprotocol/oasis-core/go/epochtime/api"
 	genesis "github.com/oasisprotocol/oasis-core/go/genesis/api"
 	genesisFile "github.com/oasisprotocol/oasis-core/go/genesis/file"
+	governance "github.com/oasisprotocol/oasis-core/go/governance/api"
 	keymanager "github.com/oasisprotocol/oasis-core/go/keymanager/api"
+	"github.com/oasisprotocol/oasis-core/go/keymanager/churp"
+	"github.com/oasisprotocol/oasis-core/go/keymanager/secrets"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
 	registry "github.com/oasisprotocol/oasis-core/go/registry/api"
@@ -37,7 +42,8 @@ import (
 	scheduler "github.com/oasisprotocol/oasis-core/go/scheduler/api"
 	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
 	storage "github.com/oasisprotocol/oasis-core/go/storage/api"
-	storageDB "github.com/oasisprotocol/oasis-core/go/storage/database"
+	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/checkpoint"
+	vault "github.com/oasisprotocol/oasis-core/go/vault/api"
 )
 
 const (
@@ -58,7 +64,7 @@ var (
 	logger = logging.GetLogger("cmd/debug/dumpdb")
 )
 
-func doDumpDB(cmd *cobra.Command, args []string) {
+func doDumpDB(cmd *cobra.Command, _ []string) {
 	var ok bool
 	defer func() {
 		if !ok {
@@ -78,13 +84,7 @@ func doDumpDB(cmd *cobra.Command, args []string) {
 
 	// Load the old genesis document, required for filling in parameters
 	// that are not persisted to ABCI state.
-	fp, err := genesisFile.NewFileProvider(flags.GenesisFile())
-	if err != nil {
-		logger.Error("failed to load existing genesis document",
-			"err", err,
-		)
-		return
-	}
+	fp := genesisFile.NewProvider(flags.GenesisFile())
 	oldDoc, err := fp.GetGenesisDocument()
 	if err != nil {
 		logger.Error("failed to get existing genesis document",
@@ -102,13 +102,13 @@ func doDumpDB(cmd *cobra.Command, args []string) {
 	// Hope you have backups if you ever run into this.
 	ctx := context.Background()
 	ldb, _, stateRoot, err := abci.InitStateStorage(
-		ctx,
 		&abci.ApplicationConfig{
-			DataDir:             filepath.Join(dataDir, tendermintCommon.StateDir),
-			StorageBackend:      storageDB.BackendNameBadgerDB, // No other backend for now.
+			DataDir:             filepath.Join(dataDir, cmtCommon.StateDir),
+			StorageBackend:      config.GlobalConfig.Storage.Backend,
 			MemoryOnlyStorage:   false,
 			ReadOnlyStorage:     viper.GetBool(cfgDumpReadOnlyDB),
 			DisableCheckpointer: true,
+			ChainContext:        oldDoc.ChainContext(),
 		},
 	)
 	if err != nil {
@@ -144,11 +144,9 @@ func doDumpDB(cmd *cobra.Command, args []string) {
 		height: dumpVersion,
 	}
 	doc := &genesis.Document{
-		Height:    qs.BlockHeight(),
+		Height:    qs.LastHeight(),
 		Time:      time.Now(), // XXX: Make this deterministic?
 		ChainID:   oldDoc.ChainID,
-		EpochTime: oldDoc.EpochTime,
-		HaltEpoch: oldDoc.HaltEpoch,
 		ExtraData: oldDoc.ExtraData,
 	}
 
@@ -208,6 +206,16 @@ func doDumpDB(cmd *cobra.Command, args []string) {
 	}
 	doc.Scheduler = *schedulerSt
 
+	// Governance
+	governanceSt, err := dumpGovernance(ctx, qs)
+	if err != nil {
+		logger.Error("failed to dump governance state",
+			"err", err,
+		)
+		return
+	}
+	doc.Governance = *governanceSt
+
 	// Beacon
 	beaconSt, err := dumpBeacon(ctx, qs)
 	if err != nil {
@@ -228,6 +236,16 @@ func doDumpDB(cmd *cobra.Command, args []string) {
 	}
 	doc.Consensus = *consensusSt
 
+	// Vault
+	vaultSt, err := dumpVault(ctx, qs)
+	if err != nil {
+		logger.Error("failed to dump vault state",
+			"err", err,
+		)
+		return
+	}
+	doc.Vault = vaultSt
+
 	logger.Info("writing state dump",
 		"output", viper.GetString(cfgDumpOutput),
 	)
@@ -243,14 +261,14 @@ func doDumpDB(cmd *cobra.Command, args []string) {
 	if shouldClose {
 		defer w.Close()
 	}
-	raw, err := json.Marshal(doc)
+	prettyDoc, err := cmdCommon.PrettyJSONMarshal(doc)
 	if err != nil {
 		logger.Error("failed to marshal state dump into JSON",
 			"err", err,
 		)
 		return
 	}
-	if _, err := w.Write(raw); err != nil {
+	if _, err := w.Write(prettyDoc); err != nil {
 		logger.Error("failed to write state dump file",
 			"err", err,
 		)
@@ -262,7 +280,7 @@ func doDumpDB(cmd *cobra.Command, args []string) {
 
 func dumpRegistry(ctx context.Context, qs *dumpQueryState) (*registry.Genesis, error) {
 	qf := registryApp.NewQueryFactory(qs)
-	q, err := qf.QueryAt(ctx, qs.BlockHeight())
+	q, err := qf.QueryAt(ctx, qs.LastHeight())
 	if err != nil {
 		return nil, fmt.Errorf("dumpdb: failed to create registry query: %w", err)
 	}
@@ -275,7 +293,7 @@ func dumpRegistry(ctx context.Context, qs *dumpQueryState) (*registry.Genesis, e
 
 func dumpRootHash(ctx context.Context, qs *dumpQueryState) (*roothash.Genesis, error) {
 	qf := roothashApp.NewQueryFactory(qs)
-	q, err := qf.QueryAt(ctx, qs.BlockHeight())
+	q, err := qf.QueryAt(ctx, qs.LastHeight())
 	if err != nil {
 		return nil, fmt.Errorf("dumpdb: failed to create root hash query: %w", err)
 	}
@@ -288,7 +306,7 @@ func dumpRootHash(ctx context.Context, qs *dumpQueryState) (*roothash.Genesis, e
 
 func dumpStaking(ctx context.Context, qs *dumpQueryState) (*staking.Genesis, error) {
 	qf := stakingApp.NewQueryFactory(qs)
-	q, err := qf.QueryAt(ctx, qs.BlockHeight())
+	q, err := qf.QueryAt(ctx, qs.LastHeight())
 	if err != nil {
 		return nil, fmt.Errorf("dumpdb: failed to create staking query: %w", err)
 	}
@@ -300,21 +318,49 @@ func dumpStaking(ctx context.Context, qs *dumpQueryState) (*staking.Genesis, err
 }
 
 func dumpKeyManager(ctx context.Context, qs *dumpQueryState) (*keymanager.Genesis, error) {
-	qf := keymanagerApp.NewQueryFactory(qs)
-	q, err := qf.QueryAt(ctx, qs.BlockHeight())
+	secrets, err := dumpKeyManagerSecrets(ctx, qs)
 	if err != nil {
-		return nil, fmt.Errorf("dumpdb: failed to create key manager query: %w", err)
+		return nil, err
 	}
-	st, err := q.Genesis(ctx)
+	churp, err := dumpKeyManagerChurp(ctx, qs)
 	if err != nil {
-		return nil, fmt.Errorf("dumpdb: failed to dump key manager state: %w", err)
+		return nil, err
 	}
-	return st, nil
+	return &keymanager.Genesis{
+		Genesis: *secrets,
+		Churp:   churp,
+	}, nil
+}
+
+func dumpKeyManagerSecrets(ctx context.Context, qs *dumpQueryState) (*secrets.Genesis, error) {
+	qf := keymanagerSecretsApp.NewQueryFactory(qs)
+	q, err := qf.QueryAt(ctx, qs.LastHeight())
+	if err != nil {
+		return nil, fmt.Errorf("dumpdb: failed to create key manager secrets query: %w", err)
+	}
+	secrets, err := q.Genesis(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("dumpdb: failed to dump key manager secrets state: %w", err)
+	}
+	return secrets, nil
+}
+
+func dumpKeyManagerChurp(ctx context.Context, qs *dumpQueryState) (*churp.Genesis, error) {
+	qf := keymanagerChurpApp.NewQueryFactory(qs)
+	q, err := qf.QueryAt(ctx, qs.LastHeight())
+	if err != nil {
+		return nil, fmt.Errorf("dumpdb: failed to create key manager CHURP query: %w", err)
+	}
+	churp, err := q.Genesis(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("dumpdb: failed to dump key manager CHURP state: %w", err)
+	}
+	return churp, nil
 }
 
 func dumpScheduler(ctx context.Context, qs *dumpQueryState) (*scheduler.Genesis, error) {
 	qf := schedulerApp.NewQueryFactory(qs)
-	q, err := qf.QueryAt(ctx, qs.BlockHeight())
+	q, err := qf.QueryAt(ctx, qs.LastHeight())
 	if err != nil {
 		return nil, fmt.Errorf("dumpdb: failed to create scheduler query: %w", err)
 	}
@@ -325,9 +371,22 @@ func dumpScheduler(ctx context.Context, qs *dumpQueryState) (*scheduler.Genesis,
 	return st, nil
 }
 
+func dumpGovernance(ctx context.Context, qs *dumpQueryState) (*governance.Genesis, error) {
+	qf := governanceApp.NewQueryFactory(qs)
+	q, err := qf.QueryAt(ctx, qs.LastHeight())
+	if err != nil {
+		return nil, fmt.Errorf("dumpdb: failed to create governance query: %w", err)
+	}
+	st, err := q.Genesis(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("dumpdb: failed to dump governance state: %w", err)
+	}
+	return st, nil
+}
+
 func dumpBeacon(ctx context.Context, qs *dumpQueryState) (*beacon.Genesis, error) {
 	qf := beaconApp.NewQueryFactory(qs)
-	q, err := qf.QueryAt(ctx, qs.BlockHeight())
+	q, err := qf.QueryAt(ctx, qs.LastHeight())
 	if err != nil {
 		return nil, fmt.Errorf("dumpdb: failed to create beacon query: %w", err)
 	}
@@ -339,19 +398,32 @@ func dumpBeacon(ctx context.Context, qs *dumpQueryState) (*beacon.Genesis, error
 }
 
 func dumpConsensus(ctx context.Context, qs *dumpQueryState) (*consensus.Genesis, error) {
-	is, err := abciState.NewImmutableState(ctx, qs, qs.BlockHeight())
+	qf := consensusApp.NewQueryFactory(qs)
+	q, err := qf.QueryAt(ctx, qs.LastHeight())
 	if err != nil {
-		return nil, fmt.Errorf("dumpdb: failed to get consensus state: %w", err)
+		return nil, fmt.Errorf("dumpdb: failed to create consensus query: %w", err)
 	}
-	params, err := is.ConsensusParameters(ctx)
+	params, err := q.ConsensusParameters(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("dumpdb: failed to get consensus params: %w", err)
 	}
-	_ = params
 	return &consensus.Genesis{
-		Backend:    tendermintAPI.BackendName,
+		Backend:    cmtAPI.BackendName,
 		Parameters: *params,
 	}, nil
+}
+
+func dumpVault(ctx context.Context, qs *dumpQueryState) (*vault.Genesis, error) {
+	qf := vaultApp.NewQueryFactory(qs)
+	q, err := qf.QueryAt(ctx, qs.LastHeight())
+	if err != nil {
+		return nil, fmt.Errorf("dumpdb: failed to create vault query: %w", err)
+	}
+	st, err := q.Genesis(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("dumpdb: failed to dump vault state: %w", err)
+	}
+	return st, nil
 }
 
 type dumpQueryState struct {
@@ -363,16 +435,20 @@ func (qs *dumpQueryState) Storage() storage.LocalBackend {
 	return qs.ldb
 }
 
-func (qs *dumpQueryState) BlockHeight() int64 {
+func (qs *dumpQueryState) Checkpointer() checkpoint.Checkpointer {
+	return nil
+}
+
+func (qs *dumpQueryState) LastHeight() int64 {
 	return qs.height
 }
 
-func (qs *dumpQueryState) GetEpoch(ctx context.Context, blockHeight int64) (epochtime.EpochTime, error) {
+func (qs *dumpQueryState) GetEpoch(context.Context, int64) (beacon.EpochTime, error) {
 	// This is only required because certain registry backend queries
 	// need the epoch to filter out expired nodes.  It is not
 	// implemented because acquiring a full state dump does not
 	// involve any of the relevant queries.
-	return epochtime.EpochTime(0), fmt.Errorf("dumpdb/dumpQueryState: GetEpoch not supported")
+	return beacon.EpochTime(0), fmt.Errorf("dumpdb/dumpQueryState: GetEpoch not supported")
 }
 
 func (qs *dumpQueryState) LastRetainedVersion() (int64, error) {

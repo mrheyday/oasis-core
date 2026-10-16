@@ -1,10 +1,13 @@
 package sigstruct
 
 import (
+	"crypto"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
-	"io/ioutil"
+	"os"
 	"testing"
 	"time"
 
@@ -37,18 +40,30 @@ func TestSigstruct(t *testing.T) {
 	sigstruct, err := builder.Sign(privateKey)
 	require.NoError(err, "Sigstruct.New")
 
-	expected, err := ioutil.ReadFile("../testdata/sig1.sigstruct.bin")
-	require.NoError(err, "ioutil.ReadFile(sig1.sigstruct.bin)")
+	expected, err := os.ReadFile("../testdata/sig1.sigstruct.bin")
+	require.NoError(err, "os.ReadFile(sig1.sigstruct.bin)")
 	require.Equal(expected, sigstruct, "SIGSTRUCT should match Fortanix's")
 
 	extractedPublicKey, derivedBuilder, err := Verify(sigstruct)
 	require.NoError(err, "SIGSTRUCT should validate")
 	require.EqualValues(builder, derivedBuilder, "Parsed SIGSTRUCT should match builder")
 	require.EqualValues(privateKey.Public(), extractedPublicKey, "SIGSTRUCT public key extraction")
+
+	// Test "offline" signing.
+	sigHash := builder.HashForSignature()
+	expectedSigHash, _ := hex.DecodeString("ea7ced3b8c78324bce65ad851152a125fd1989df324dc72b244ed5f44573ac95")
+	require.EqualValues(expectedSigHash, sigHash, "HashForSignature")
+
+	rawSig, err := rsa.SignPKCS1v15(rand.Reader, privateKey, crypto.SHA256, sigHash)
+	require.NoError(err, "rsa.SignPKCS1v15")
+
+	sigstruct2, err := builder.WithSignature(rawSig, privateKey.Public().(*rsa.PublicKey))
+	require.NoError(err, "WithSignature")
+	require.EqualValues(sigstruct, sigstruct2, "SIGSTRUCT signed in detached mode should match")
 }
 
 func loadTestPrivateKey() (*rsa.PrivateKey, error) {
-	rawPEM, err := ioutil.ReadFile("../testdata/sig1.key.pem")
+	rawPEM, err := os.ReadFile("../testdata/sig1.key.pem")
 	if err != nil {
 		return nil, err
 	}

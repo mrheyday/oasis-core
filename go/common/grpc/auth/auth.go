@@ -9,10 +9,10 @@ import (
 
 // AuthenticationFunction defines the gRPC server default authentication function. This
 // can be overridden per service by implementing AuthFunc on the gRPC service.
-type AuthenticationFunction func(ctx context.Context, fullMethodName string, req interface{}) error
+type AuthenticationFunction func(ctx context.Context, req any) error
 
 // NoAuth is a function that does no authentication.
-func NoAuth(ctx context.Context, fullMethodName string, req interface{}) error {
+func NoAuth(context.Context, any) error {
 	return nil
 }
 
@@ -24,26 +24,27 @@ type ServerAuth interface {
 	//
 	// Make sure to error with `codes.Unauthenticated` and
 	// `codes.PermissionDenied` appropriately.
-	AuthFunc(ctx context.Context, fullMethodName string, req interface{}) error
+	AuthFunc(ctx context.Context, req any) error
 }
 
 // UnaryServerInterceptor returns an authentication unary server interceptor.
 func UnaryServerInterceptor(authFunc AuthenticationFunction) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context,
-		req interface{},
+		req any,
 		info *grpc.UnaryServerInfo,
-		handler grpc.UnaryHandler) (interface{}, error) {
+		handler grpc.UnaryHandler,
+	) (any, error) {
 		overrideSrv, ok := info.Server.(ServerAuth)
 		if !ok {
 			// Server doesn't implement Authentication.
 			// Use default Auth.
-			if err := authFunc(ctx, info.FullMethod, req); err != nil {
+			if err := authFunc(ctx, req); err != nil {
 				return nil, err
 			}
 			return handler(ctx, req)
 		}
 
-		if err := overrideSrv.AuthFunc(ctx, info.FullMethod, req); err != nil {
+		if err := overrideSrv.AuthFunc(ctx, req); err != nil {
 			return nil, err
 		}
 
@@ -56,10 +57,11 @@ func UnaryServerInterceptor(authFunc AuthenticationFunction) grpc.UnaryServerInt
 // StreamServerInterceptor wraps the incoming server stream and authenticates
 // all received messages.
 func StreamServerInterceptor(authFunc AuthenticationFunction) grpc.StreamServerInterceptor {
-	return func(srv interface{},
+	return func(srv any,
 		stream grpc.ServerStream,
 		info *grpc.StreamServerInfo,
-		handler grpc.StreamHandler) error {
+		handler grpc.StreamHandler,
+	) error {
 		overrideSrv, ok := srv.(ServerAuth)
 		if !ok {
 			// Server doesn't implement Authentication.
@@ -87,13 +89,13 @@ type authServerStream struct {
 	grpc.ServerStream
 
 	fullMethod string
-	authFunc   func(ctx context.Context, fullMethodName string, req interface{}) error
+	authFunc   func(ctx context.Context, req any) error
 }
 
-func (a authServerStream) RecvMsg(m interface{}) error {
+func (a authServerStream) RecvMsg(m any) error {
 	if err := a.ServerStream.RecvMsg(m); err != nil {
 		return err
 	}
 	// Authenticate request.
-	return a.authFunc(a.Context(), a.fullMethod, m)
+	return a.authFunc(a.Context(), m)
 }

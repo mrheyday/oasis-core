@@ -13,6 +13,9 @@ const (
 	MetricNetReceivePacketsTotal  = "oasis_node_net_receive_packets_total"
 	MetricNetTransmitBytesTotal   = "oasis_node_net_transmit_bytes_total"
 	MetricNetTransmitPacketsTotal = "oasis_node_net_transmit_packets_total"
+
+	// labelDevice is the label for the network interface name (e.g. eth0).
+	labelDevice = "device"
 )
 
 var (
@@ -22,8 +25,7 @@ var (
 			Help: "Received data for each network device as reported by /proc/net/dev (bytes).",
 		},
 		[]string{
-			// Interface name, e.g. eth0.
-			"device",
+			labelDevice,
 		})
 
 	receivePacketsGauge = prometheus.NewGaugeVec(
@@ -32,8 +34,7 @@ var (
 			Help: "Received data for each network device as reported by /proc/net/dev (packets).",
 		},
 		[]string{
-			// Interface name, e.g. eth0.
-			"device",
+			labelDevice,
 		})
 
 	transmitBytesGauge = prometheus.NewGaugeVec(
@@ -42,8 +43,7 @@ var (
 			Help: "Transmitted data for each network device as reported by /proc/net/dev (bytes).",
 		},
 		[]string{
-			// Interface name, e.g. eth0.
-			"device",
+			labelDevice,
 		})
 
 	transmitPacketsGauge = prometheus.NewGaugeVec(
@@ -52,16 +52,14 @@ var (
 			Help: "Transmitted data for each network device as reported by /proc/net/dev (packets).",
 		},
 		[]string{
-			// Interface name, e.g. eth0.
-			"device",
+			labelDevice,
 		})
 
 	netCollectors  = []prometheus.Collector{receiveBytesGauge, receivePacketsGauge, transmitBytesGauge, transmitPacketsGauge}
 	netServiceOnce sync.Once
 )
 
-type netCollector struct {
-}
+type netCollector struct{}
 
 func (n *netCollector) Name() string {
 	return "net"

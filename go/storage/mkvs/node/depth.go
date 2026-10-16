@@ -6,12 +6,13 @@ import (
 )
 
 // Depth determines the maximum length of the key in bits.
-//
-// maxKeyLengthInBits = 2^size_of(Depth)*8
 type Depth uint16
 
 // DepthSize is the size of Depth in bytes.
 const DepthSize = int(unsafe.Sizeof(Depth(0)))
+
+// MaxDepth is the largest value representable by Depth.
+const MaxDepth = ^Depth(0)
 
 // ToBytes returns the number of bytes needed to fit given bits.
 func (dt Depth) ToBytes() int {
@@ -29,8 +30,12 @@ func (dt Depth) MarshalBinary() []byte {
 	return data
 }
 
-// MarshalBinary encodes a Depth into binary form.
+// UnmarshalBinary decodes a binary marshaled depth.
 func (dt *Depth) UnmarshalBinary(data []byte) (int, error) {
+	if len(data) < DepthSize {
+		return 0, ErrMalformedNode
+	}
+
 	*dt = Depth(binary.LittleEndian.Uint16(data[0:DepthSize]))
 	return DepthSize, nil
 }

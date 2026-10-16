@@ -1,0 +1,86 @@
+package committee
+
+import (
+	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+// labelRuntime is the label for the runtime identifier.
+const labelRuntime = "runtime"
+
+var (
+	storageWorkerLastFullRound = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "oasis_worker_storage_full_round",
+			Help: "The last round that was fully synced and finalized.",
+		},
+		[]string{labelRuntime},
+	)
+
+	storageWorkerLastSyncedRound = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "oasis_worker_storage_synced_round",
+			Help: "The last round that was synced but not yet finalized.",
+		},
+		[]string{labelRuntime},
+	)
+
+	storageWorkerLastPendingRound = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "oasis_worker_storage_pending_round",
+			Help: "The last round that is in-flight for syncing.",
+		},
+		[]string{labelRuntime},
+	)
+
+	storageWorkerRoundSyncLatency = prometheus.NewSummaryVec(
+		prometheus.SummaryOpts{
+			Name: "oasis_worker_storage_round_sync_latency",
+			Help: "Storage round sync latency (seconds).",
+		},
+		[]string{labelRuntime},
+	)
+
+	storageWorkerPruneLatency = prometheus.NewSummaryVec(
+		prometheus.SummaryOpts{
+			Name: "oasis_worker_storage_prune_latency",
+			Help: "Storage pruner per-round latency (seconds).",
+		},
+		[]string{labelRuntime},
+	)
+
+	storageWorkerCollectors = []prometheus.Collector{
+		storageWorkerLastFullRound,
+		storageWorkerLastSyncedRound,
+		storageWorkerLastPendingRound,
+		storageWorkerRoundSyncLatency,
+		storageWorkerPruneLatency,
+	}
+
+	prometheusOnce sync.Once
+)
+
+func initMetrics() {
+	prometheusOnce.Do(func() {
+		prometheus.MustRegister(storageWorkerCollectors...)
+	})
+}
+
+type metrics struct {
+	lastFullRound    prometheus.Gauge
+	lastSyncedRound  prometheus.Gauge
+	lastPendingRound prometheus.Gauge
+	roundSyncLatency prometheus.Observer
+	pruneLatency     prometheus.Observer
+}
+
+func newMetrics(runtime string) *metrics {
+	return &metrics{
+		lastFullRound:    storageWorkerLastFullRound.WithLabelValues(runtime),
+		lastSyncedRound:  storageWorkerLastSyncedRound.WithLabelValues(runtime),
+		lastPendingRound: storageWorkerLastPendingRound.WithLabelValues(runtime),
+		roundSyncLatency: storageWorkerRoundSyncLatency.WithLabelValues(runtime),
+		pruneLatency:     storageWorkerPruneLatency.WithLabelValues(runtime),
+	}
+}

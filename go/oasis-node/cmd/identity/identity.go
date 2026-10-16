@@ -8,6 +8,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	flag "github.com/spf13/pflag"
+	"github.com/spf13/viper"
 
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 	fileSigner "github.com/oasisprotocol/oasis-core/go/common/crypto/signature/signers/file"
@@ -15,56 +17,85 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	cmdCommon "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common"
 	cmdFlags "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/flags"
-	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/identity/tendermint"
+	cmdGrpc "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/common/grpc"
+	cmdControl "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/control"
+	"github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/identity/cometbft"
+	staking "github.com/oasisprotocol/oasis-core/go/staking/api"
+)
+
+const (
+	// CmdIdentity is the identity subcommand.
+	CmdIdentity = "identity"
+	// CmdIniti is the init subcommand.
+	CmdInit = "init"
+	// CmdShowSentryPubkey is the show-sentry-client-pubkey subcommand.
+	CmdShowSentryPubkey = "show-sentry-client-pubkey"
+	// CmdShowTLSPubkey is the show-tls-pubkey subcommand.
+	CmdShowTLSPubkey = "show-tls-pubkey"
+	// CmdShowAddress is the show-address subcommand.
+	CmdShowAddress = "show-address"
+
+	CfgDataDir = "datadir"
 )
 
 var (
+	datadirFlags = flag.NewFlagSet("", flag.ContinueOnError)
+
 	identityCmd = &cobra.Command{
-		Use:   "identity",
+		Use:   CmdIdentity,
 		Short: "identity interface utilities",
 	}
 
 	identityInitCmd = &cobra.Command{
-		Use:   "init",
+		Use:   CmdInit,
 		Short: "initialize node identity",
 		Run:   doNodeInit,
 	}
 
 	identityShowSentryPubkeyCmd = &cobra.Command{
-		Use:   "show-sentry-client-pubkey",
+		Use:   CmdShowSentryPubkey,
 		Short: "outputs node's sentry control client tls public key",
 		Run:   doShowSentryTLSPubkey,
 	}
 
 	identityShowTLSPubkeyCmd = &cobra.Command{
-		Use:   "show-tls-pubkey",
+		Use:   CmdShowTLSPubkey,
 		Short: "outputs node's endpoint tls public key",
 		Run:   doShowTLSPubkey,
+	}
+
+	identityShowAddressCmd = &cobra.Command{
+		Use:   CmdShowAddress,
+		Short: "outputs node's address",
+		Run:   doShowAddress,
 	}
 
 	logger = logging.GetLogger("cmd/identity")
 )
 
-func doNodeInit(cmd *cobra.Command, args []string) {
+func doNodeInit(*cobra.Command, []string) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
 
-	dataDir := cmdCommon.DataDir()
+	// Workaround for viper bug: https://github.com/spf13/viper/issues/233
+	_ = viper.BindPFlag(CfgDataDir, identityCmd.PersistentFlags().Lookup(CfgDataDir))
+
+	dataDir := viper.GetString(CfgDataDir)
 	if dataDir == "" {
 		logger.Error("data directory must be set")
 		os.Exit(1)
 	}
 
 	// Provision the node identity.
-	nodeSignerFactory, err := fileSigner.NewFactory(dataDir, signature.SignerNode, signature.SignerP2P, signature.SignerConsensus)
+	nodeSignerFactory, err := fileSigner.NewFactory(dataDir, identity.RequiredSignerRoles...)
 	if err != nil {
 		logger.Error("failed to create identity signer factory",
 			"err", err,
 		)
 		os.Exit(1)
 	}
-	if _, err = identity.LoadOrGenerate(dataDir, nodeSignerFactory, true); err != nil {
+	if _, err = identity.LoadOrGenerate(dataDir, nodeSignerFactory); err != nil {
 		logger.Error("failed to load or generate node identity",
 			"err", err,
 		)
@@ -74,18 +105,21 @@ func doNodeInit(cmd *cobra.Command, args []string) {
 	fmt.Printf("Generated identity files in: %s\n", dataDir)
 }
 
-func doShowPubkey(cmd *cobra.Command, args []string, sentry bool) {
+func doShowPubkey(_ *cobra.Command, _ []string, sentry bool) {
 	if err := cmdCommon.Init(); err != nil {
 		cmdCommon.EarlyLogAndExit(err)
 	}
 
-	dataDir := cmdCommon.DataDir()
+	// Workaround for viper bug: https://github.com/spf13/viper/issues/233
+	_ = viper.BindPFlag(CfgDataDir, identityCmd.PersistentFlags().Lookup(CfgDataDir))
+
+	dataDir := viper.GetString(CfgDataDir)
 	if dataDir == "" {
 		logger.Error("data directory must be set")
 		os.Exit(1)
 	}
 
-	nodeSignerFactory, err := fileSigner.NewFactory(dataDir, signature.SignerNode, signature.SignerP2P, signature.SignerConsensus)
+	nodeSignerFactory, err := fileSigner.NewFactory(dataDir, identity.RequiredSignerRoles...)
 	if err != nil {
 		logger.Error("failed to create node identity signer factory",
 			"err", err,
@@ -102,7 +136,7 @@ func doShowPubkey(cmd *cobra.Command, args []string, sentry bool) {
 	case true:
 		rawCertificate = identity.TLSSentryClientCertificate.Certificate[0]
 	case false:
-		rawCertificate = identity.GetTLSCertificate().Certificate[0]
+		rawCertificate = identity.TLSCertificate.Certificate[0]
 	}
 	cert, err := x509.ParseCertificate(rawCertificate)
 	if err != nil {
@@ -129,14 +163,32 @@ func doShowSentryTLSPubkey(cmd *cobra.Command, args []string) {
 	doShowPubkey(cmd, args, true)
 }
 
+func doShowAddress(cmd *cobra.Command, _ []string) {
+	status := cmdControl.DoFetchStatus(cmd)
+
+	addr := staking.NewAddress(status.Identity.Node)
+	fmt.Println(addr)
+}
+
 // Register registers the client sub-command and all of it's children.
 func Register(parentCmd *cobra.Command) {
-	tendermint.Register(identityCmd)
+	cometbft.Register(identityCmd)
+
+	identityCmd.PersistentFlags().AddFlagSet(datadirFlags)
 
 	identityInitCmd.Flags().AddFlagSet(cmdFlags.VerboseFlags)
+
+	identityShowAddressCmd.Flags().AddFlagSet(cmdGrpc.ClientFlags)
+
 	identityCmd.AddCommand(identityInitCmd)
 	identityCmd.AddCommand(identityShowSentryPubkeyCmd)
 	identityCmd.AddCommand(identityShowTLSPubkeyCmd)
+	identityCmd.AddCommand(identityShowAddressCmd)
 
 	parentCmd.AddCommand(identityCmd)
+}
+
+func init() {
+	datadirFlags.String(CfgDataDir, "", "data directory")
+	_ = viper.BindPFlags(datadirFlags)
 }

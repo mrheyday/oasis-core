@@ -9,12 +9,16 @@ reporting:
 
 ## Configuring `oasis-node` in Pull Mode
 
-To run `oasis-node` in *pull mode* set flag `--metrics.mode pull` and provide
-the listen address with `--metrics.address`. For example
+To run `oasis-node` in *pull mode* with Prometheus metrics enabled, add the
+following to your `config.yml`.
 
 ```
-oasis-node --metrics.mode pull --metrics.address localhost:3000
+metrics:
+  mode: pull
+  address: 0.0.0.0:3000
 ```
+
+After restarting the node, Prometheus metrics will be exposed on port 3000.
 
 Then, add the following segment to your `prometheus.yml` and restart
 Prometheus:
@@ -42,11 +46,11 @@ The following metrics are currently reported:
 
 ## Consensus backends
 
-### Metrics Reported by *Tendermint*
+### Metrics Reported by *CometBFT*
 
-When `oasis-node` is configured to use [Tendermint][1] for BFT consensus, all
-Tendermint metrics are also reported. Consult
-[tendermint-core documentation][2] for a list of reported by Tendermint.
+When `oasis-node` is configured to use [CometBFT][1] for BFT consensus, all
+CometBFT metrics are also reported. Consult
+[CometBFT-core documentation][2] for a list of reported by CometBFT.
 
-[1]: ../consensus/index.md#tendermint
-[2]: https://docs.tendermint.com/master/tendermint-core/metrics.html
+[1]: ../consensus/README.md#cometbft
+[2]: https://docs.cometbft.com/v0.38/core/metrics

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
+	cmdNode "github.com/oasisprotocol/oasis-core/go/oasis-node/cmd/node"
 	"github.com/oasisprotocol/oasis-core/go/oasis-test-runner/env"
 )
 
@@ -47,9 +48,12 @@ func (b *helpersBase) runSubCommandWithOutput(name string, args []string) (bytes
 
 // Helpers are the oasis-node cli helpers.
 type Helpers struct {
+	*helpersBase
+
 	Consensus  *ConsensusHelpers
 	Registry   *RegistryHelpers
 	Keymanager *KeymanagerHelpers
+	Genesis    *GenesisHelpers
 }
 
 // New creates new oasis-node cli helpers.
@@ -61,16 +65,39 @@ func New(env *env.Env, factory Factory, logger *logging.Logger) *Helpers {
 	}
 
 	return &Helpers{
-		Consensus:  &ConsensusHelpers{base},
-		Registry:   &RegistryHelpers{base},
-		Keymanager: &KeymanagerHelpers{base},
+		helpersBase: base,
+		Consensus:   &ConsensusHelpers{base},
+		Registry:    &RegistryHelpers{base},
+		Keymanager:  &KeymanagerHelpers{base},
+		Genesis:     &GenesisHelpers{base},
 	}
+}
+
+// SetConfig sets the configuration for the oasis-node cli helpers.
+func (h *Helpers) SetConfig(cfg Config) {
+	h.cfg = cfg
+}
+
+// UnsafeReset launches the unsafe-reset subcommand, clearing all consensus and (optionally)
+// runtime state.
+func (h *Helpers) UnsafeReset(dataDir string, preserveRuntimeStorage, preserveLocalStorage, force bool) error {
+	args := []string{"unsafe-reset", "--" + cmdNode.CfgDataDir, dataDir}
+	if !preserveRuntimeStorage {
+		args = append(args, "--"+cmdNode.CfgPreserveMKVSDatabase+"=false")
+	}
+	if !preserveLocalStorage {
+		args = append(args, "--"+cmdNode.CfgPreserveLocalStorage+"=false")
+	}
+	if force {
+		args = append(args, "--force")
+	}
+	return h.runSubCommand("unsafe-reset", args)
 }
 
 // StartSubCommand launches an oasis-node subcommand.
 //
 // It does not wait for the subcommand to complete.
-func StartSubCommand(childEnv *env.Env, logger *logging.Logger, name, binary string, args []string, stdout, stderr io.Writer) (*exec.Cmd, error) {
+func StartSubCommand(_ *env.Env, logger *logging.Logger, _, binary string, args []string, stdout, stderr io.Writer) (*exec.Cmd, error) {
 	cmd := exec.Command(binary, args...)
 	cmd.SysProcAttr = env.CmdAttrs
 	cmd.Stdout = stdout
@@ -105,10 +132,7 @@ func RunSubCommand(env *env.Env, logger *logging.Logger, name, binary string, ar
 	if err != nil {
 		return err
 	}
-	if err = cmd.Wait(); err != nil {
-		return err
-	}
-	return nil
+	return cmd.Wait()
 }
 
 // RunSubCommandWithOutput launches an oasis-node subcommand and waits for it to complete.

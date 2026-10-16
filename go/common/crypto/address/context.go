@@ -7,7 +7,7 @@ import (
 	"sync"
 )
 
-// ContextMaxSize is the maximum size of a context's identifier string.
+// ContextIdentifierMaxSize is the maximum size of a context's identifier string.
 const ContextIdentifierMaxSize = 64
 
 var (
@@ -29,8 +29,7 @@ type Context struct {
 
 // MarshalBinary encodes a context into binary form.
 func (c Context) MarshalBinary() (data []byte, err error) {
-	data = append([]byte(c.Identifier), c.Version)
-	return
+	return append([]byte(c.Identifier), c.Version), nil
 }
 
 // String returns a string representation of address' context.

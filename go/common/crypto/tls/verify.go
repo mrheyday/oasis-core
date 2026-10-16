@@ -24,23 +24,20 @@ type VerifyOptions struct {
 	AllowNoCertificate bool
 }
 
-// VerifyCertificate verifies a TLS certificate as required by Oasis Core. Instead of using CAs,
+// VerifyCertificates verifies a TLS certificates as required by Oasis Core. Instead of using CAs,
 // public key pinning is used and certificates must follow the template.
-func VerifyCertificate(rawCerts [][]byte, opts VerifyOptions) error {
+func VerifyCertificates(certs []*x509.Certificate, opts VerifyOptions) error {
 	// Allowing no certificate is useful in case access control is performed by a higher layer.
-	if len(rawCerts) == 0 && opts.AllowNoCertificate {
+	if len(certs) == 0 && opts.AllowNoCertificate {
 		return nil
 	}
 
 	// Make sure there is only a single certificate.
-	if len(rawCerts) != 1 {
-		return fmt.Errorf("tls: expecting a single certificate (got: %d)", len(rawCerts))
+	if len(certs) != 1 {
+		return fmt.Errorf("tls: expecting a single certificate (got: %d)", len(certs))
 	}
 
-	cert, err := x509.ParseCertificate(rawCerts[0])
-	if err != nil {
-		return fmt.Errorf("tls: bad X509 certificate: %w", err)
-	}
+	cert := certs[0]
 
 	// Public key should match the pinned key.
 	if cert.PublicKeyAlgorithm != x509.Ed25519 || cert.SignatureAlgorithm != x509.PureEd25519 {
@@ -53,7 +50,7 @@ func VerifyCertificate(rawCerts [][]byte, opts VerifyOptions) error {
 	}
 	if !opts.AllowUnknownKeys || opts.Keys != nil {
 		var spk signature.PublicKey
-		if err = spk.UnmarshalBinary(pk[:]); err != nil {
+		if err := spk.UnmarshalBinary(pk[:]); err != nil {
 			// This should NEVER happen.
 			return fmt.Errorf("tls: bad public key: %w", err)
 		}
@@ -113,7 +110,7 @@ func VerifyCertificate(rawCerts [][]byte, opts VerifyOptions) error {
 	}
 
 	// Signature should be valid.
-	if err = cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature); err != nil {
+	if err := cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature); err != nil {
 		return fmt.Errorf("tls: bad signature: %w", err)
 	}
 

@@ -7,7 +7,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/oasisprotocol/oasis-core/go/common"
-	"github.com/oasisprotocol/oasis-core/go/common/pubsub"
 	"github.com/oasisprotocol/oasis-core/go/roothash/api"
 )
 
@@ -37,10 +36,6 @@ var (
 
 type metricsWrapper struct {
 	api.Backend
-}
-
-func (w *metricsWrapper) WatchBlocks(id common.Namespace) (<-chan *api.AnnotatedBlock, *pubsub.Subscription, error) {
-	return w.Backend.WatchBlocks(id)
 }
 
 func (w *metricsWrapper) worker() {

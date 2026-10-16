@@ -2,30 +2,39 @@ package api
 
 import (
 	"context"
+	"time"
 
-	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction"
-	"github.com/oasisprotocol/oasis-core/go/storage/mkvs/syncer"
+	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
+	"github.com/oasisprotocol/oasis-core/go/consensus/genesis"
 )
 
-// LightClientBackend is the limited consensus interface used by light clients.
-type LightClientBackend interface {
-	// GetLightBlock returns a light version of the consensus layer block that can be used for light
-	// client verification.
-	GetLightBlock(ctx context.Context, height int64) (*LightBlock, error)
+// LightService is a consensus light client service.
+type LightService interface {
+	LightProvider
 
-	// GetParameters returns the consensus parameters for a specific height.
-	GetParameters(ctx context.Context, height int64) (*Parameters, error)
+	// GetStatus returns the current status overview.
+	GetStatus() (*LightClientStatus, error)
+}
 
-	// State returns a MKVS read syncer that can be used to read consensus state from a remote node
-	// and verify it against the trusted local root.
-	State() syncer.ReadSyncer
+// LightProvider is a consensus light provider interface.
+//
+// Warning: Light blocks returned by this provider are untrusted and should be
+// verified before use.
+type LightProvider interface {
+	// LightBlock retrieves an untrusted light block at the specified height.
+	LightBlock(ctx context.Context, height int64) (*LightBlock, error)
 
-	// SubmitTxNoWait submits a signed consensus transaction, but does not wait for the transaction
-	// to be included in a block. Use SubmitTx if you need to wait for execution.
-	SubmitTxNoWait(ctx context.Context, tx *transaction.SignedTransaction) error
+	// Validators retrieves an untrusted validator set at the specified height.
+	Validators(ctx context.Context, height int64) (*Validators, error)
+}
 
-	// SubmitEvidence submits evidence of misbehavior.
-	SubmitEvidence(ctx context.Context, evidence *Evidence) error
+// LightClient is a consensus light client interface.
+//
+// Light blocks returned by this client are trusted and don't need to be
+// verified before use.
+type LightClient interface {
+	// TrustedLightBlock returns trusted light block at the specified height.
+	TrustedLightBlock(height int64) (*LightBlock, error)
 }
 
 // LightBlock is a light consensus block suitable for syncing light clients.
@@ -36,18 +45,46 @@ type LightBlock struct {
 	Meta []byte `json:"meta"`
 }
 
+// Validators is a validator set for the specified height.
+type Validators struct {
+	// Height contains the block height.
+	Height int64 `json:"height"`
+	// Meta contains the consensus backend specific validator set.
+	Meta []byte `json:"meta"`
+}
+
 // Parameters are the consensus backend parameters.
 type Parameters struct {
 	// Height contains the block height these consensus parameters are for.
 	Height int64 `json:"height"`
+	// Parameters are the backend agnostic consensus parameters.
+	Parameters genesis.Parameters `json:"parameters"`
 	// Meta contains the consensus backend specific consensus parameters.
 	Meta []byte `json:"meta"`
-
-	// TODO: Consider also including consensus/genesis.Parameters which are backend-agnostic.
 }
 
 // Evidence is evidence of a node's Byzantine behavior.
 type Evidence struct {
 	// Meta contains the consensus backend specific evidence.
 	Meta []byte `json:"meta"`
+}
+
+// LightClientStatus is the current light client status overview.
+type LightClientStatus struct {
+	// LatestHeight is the height of the latest block.
+	LatestHeight int64 `json:"latest_height"`
+	// LatestHash is the hash of the latest block.
+	LatestHash hash.Hash `json:"latest_hash"`
+	// LatestTime is the timestamp of the latest block.
+	LatestTime time.Time `json:"latest_time"`
+
+	// OldestHeight is the height of the oldest block.
+	OldestHeight int64 `json:"oldest_height"`
+	// LatestHash is the hash of the oldest block.
+	OldestHash hash.Hash `json:"oldest_hash"`
+	// OldestTime is the timestamp of the oldest block.
+	OldestTime time.Time `json:"oldest_time"`
+
+	// PeerIDs are the light client provider peer identifiers.
+	PeerIDs []string `json:"peer_ids"`
 }

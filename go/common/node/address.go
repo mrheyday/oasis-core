@@ -7,6 +7,9 @@ import (
 	"net"
 	"strings"
 
+	"github.com/multiformats/go-multiaddr"
+
+	"github.com/oasisprotocol/oasis-core/go/common"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/signature"
 )
 
@@ -20,8 +23,6 @@ var (
 	// ErrTLSAddressNoPubKey is the error returned when a TLS address doesn't have the PubKey@ part.
 	ErrTLSAddressNoPubKey = errors.New("node: TLS address missing PubKey@ part")
 
-	unroutableNetworks []net.IPNet
-
 	_ encoding.TextMarshaler   = (*Address)(nil)
 	_ encoding.TextUnmarshaler = (*Address)(nil)
 	_ encoding.TextMarshaler   = (*ConsensusAddress)(nil)
@@ -30,7 +31,18 @@ var (
 
 // Address represents a TCP address for the purpose of node descriptors.
 type Address struct {
-	net.TCPAddr
+	IP   net.IP `json:"IP"`
+	Port int64  `json:"Port"`
+	Zone string `json:"Zone"`
+}
+
+// ToTCPAddr returns a net TCP address.
+func (a *Address) ToTCPAddr() *net.TCPAddr {
+	return &net.TCPAddr{
+		IP:   a.IP,
+		Port: int(a.Port),
+		Zone: a.Zone,
+	}
 }
 
 // Equal compares vs another address for equality.
@@ -59,7 +71,9 @@ func (a *Address) UnmarshalText(text []byte) error {
 		return err
 	}
 
-	a.TCPAddr = *tcpAddr
+	a.IP = tcpAddr.IP
+	a.Port = int64(tcpAddr.Port)
+	a.Zone = tcpAddr.Zone
 
 	return nil
 }
@@ -74,7 +88,7 @@ func (a *Address) FromIP(ip net.IP, port uint16) error {
 		return ErrInvalidAddress
 	}
 
-	a.Port = int(port)
+	a.Port = int64(port)
 	a.Zone = ""
 
 	return nil
@@ -82,20 +96,33 @@ func (a *Address) FromIP(ip net.IP, port uint16) error {
 
 // IsRoutable returns true iff the address is likely to be globally routable.
 func (a *Address) IsRoutable() bool {
-	for _, v := range unroutableNetworks {
-		if v.Contains(a.IP) {
-			return false
-		}
-	}
-	return true
+	return common.IsProbablyGloballyReachable(a.IP)
 }
 
 // String returns the string representation of an address.
 func (a Address) String() string {
-	return a.TCPAddr.String()
+	ip := a.IP.String()
+	if a.Zone != "" {
+		return net.JoinHostPort(ip+"%"+a.Zone, fmt.Sprintf("%d", a.Port))
+	}
+	return net.JoinHostPort(ip, fmt.Sprintf("%d", a.Port))
 }
 
-// ConsensusAddress represents a Tendermint consensus address that includes an
+// MultiAddressStr returns a multi address string representation of the address.
+func (a Address) MultiAddressStr() string {
+	version := 4
+	if p4 := a.IP.To4(); len(p4) != net.IPv4len {
+		version = 6
+	}
+	return fmt.Sprintf("/ip%d/%s/tcp/%d", version, a.IP, a.Port)
+}
+
+// MultiAddress returns a multi address representation of the address.
+func (a Address) MultiAddress() (multiaddr.Multiaddr, error) {
+	return multiaddr.NewMultiaddr(a.MultiAddressStr())
+}
+
+// ConsensusAddress represents a CometBFT consensus address that includes an
 // ID and a TCP address.
 // NOTE: The consensus address ID could be different from the consensus ID
 // to allow using a sentry node's ID and address instead of the validator's.
@@ -191,42 +218,4 @@ func (ta *TLSAddress) UnmarshalText(text []byte) error {
 // String returns a string representation of a TLS address.
 func (ta *TLSAddress) String() string {
 	return ta.Address.String()
-}
-
-func init() {
-	// List taken from RFC 6890.  This is different from what tendermint
-	// does (more restrictive).
-	for _, v := range []string{
-		"0.0.0.0/8",          // RFC 1122
-		"10.0.0.0/8",         // RFC 1918: Private-Use
-		"100.64.0.0/10",      // RFC 6598: Shared Address Space
-		"127.0.0.0/8",        // RFC 1122: Loopback
-		"169.254.0.0/16",     // RFC 3927: Link Local
-		"172.16.0.0/12",      // RFC 1918: Private-Use
-		"192.0.0.0/24",       // RFC 6890
-		"192.0.0.0/29",       // RFC 6333: DS-Lite
-		"192.0.2.0/24",       // RFC 5737: Documentation (TEST-NET-1)
-		"192.168.0.0/16",     // RFC 1918: Private-Use
-		"192.18.0.0/15",      // RFC 2544: Benchmarking
-		"198.51.100.0/24",    // RFC 5737: TEST-NET-2
-		"203.0.113.0/24",     // RFC 5737: TEST-NET-3
-		"240.0.0.0/4",        // RFC 1112: Reserved
-		"255.255.255.255/32", // RFC 919: Limited Broadcast
-		"::1/128",            // RFC 4291: Loopback Address
-		"::/128",             // RFC 4291: Unspecified Address
-		"100::/64",           // RFC 6666: Discard-Only Address Block
-		"2001::/32",          // RFC 4380: TEREDO
-		"2001:2::/48",        // RFC 5180: Benchmarking
-		"2001:db8::/32",      // RFC 3849: Documentation
-		"2001:10::/28",       // RFC 4843: ORCHID
-		"2002::/16",          // RFC 3056: 6to4
-		"fc00::/7",           // RFC 4193: Unique-Local
-		"fe80::/10",          // RFC 4291: Linked-Scoped Unicast
-	} {
-		_, ipNet, err := net.ParseCIDR(v)
-		if err != nil {
-			panic("node: failed to parse reserved net: " + err.Error())
-		}
-		unroutableNetworks = append(unroutableNetworks, *ipNet)
-	}
 }

@@ -25,7 +25,7 @@ func (t *tree) Insert(ctx context.Context, key, value []byte) error {
 	t.cache.markPosition()
 
 	var result insertResult
-	result, err := t.doInsert(ctx, t.cache.pendingRoot, 0, key, value, 0)
+	result, err := t.doInsert(ctx, t.cache.pendingRoot, 0, key, value)
 	if err != nil {
 		return err
 	}
@@ -42,6 +42,7 @@ func (t *tree) Insert(ctx context.Context, key, value []byte) error {
 			}
 		} else {
 			entry.value = value
+			entry.insertedLeaf = result.insertedLeaf
 		}
 	}
 
@@ -55,13 +56,12 @@ type insertResult struct {
 	existed      bool
 }
 
-func (t *tree) doInsert(
+func (t *tree) doInsert( // nolint: gocyclo
 	ctx context.Context,
 	ptr *node.Pointer,
 	bitDepth node.Depth,
 	key node.Key,
 	val []byte,
-	depth node.Depth,
 ) (insertResult, error) {
 	if ctx.Err() != nil {
 		return insertResult{}, ctx.Err()
@@ -73,7 +73,11 @@ func (t *tree) doInsert(
 		return insertResult{}, err
 	}
 
-	_, keyRemainder := key.Split(bitDepth, key.BitLength())
+	keyBitLength, err := key.BitLength()
+	if err != nil {
+		return insertResult{}, err
+	}
+	_, keyRemainder := key.MustSplit(bitDepth, keyBitLength)
 
 	switch n := nd.(type) {
 	case nil:
@@ -86,31 +90,34 @@ func (t *tree) doInsert(
 		}
 		return result, nil
 	case *node.InternalNode:
-		cpLength := n.Label.CommonPrefixLen(n.LabelBitLength, keyRemainder, key.BitLength()-bitDepth)
+		cpLength, err := n.Label.CommonPrefixLen(n.LabelBitLength, keyRemainder, keyBitLength-bitDepth)
+		if err != nil {
+			return insertResult{}, err
+		}
 		var result insertResult
 
 		if cpLength == n.LabelBitLength {
 			bitLength := bitDepth + n.LabelBitLength
 
 			// The current part of key matched the node's Label. Do recursion.
-			if key.BitLength() == bitLength {
+			if keyBitLength == bitLength {
 				// Key to insert ends exactly at this node. Add it to the
 				// existing internal node as LeafNode.
-				result, err = t.doInsert(ctx, n.LeafNode, bitLength, key, val, depth)
-			} else if key.GetBit(bitLength) {
+				result, err = t.doInsert(ctx, n.LeafNode, bitLength, key, val)
+			} else if key.MustGetBit(bitLength) {
 				// Insert recursively based on the bit value.
-				result, err = t.doInsert(ctx, n.Right, bitLength, key, val, depth+1)
+				result, err = t.doInsert(ctx, n.Right, bitLength, key, val)
 			} else {
-				result, err = t.doInsert(ctx, n.Left, bitLength, key, val, depth+1)
+				result, err = t.doInsert(ctx, n.Left, bitLength, key, val)
 			}
 
 			if err != nil {
 				return insertResult{}, err
 			}
 
-			if key.BitLength() == bitLength {
+			if keyBitLength == bitLength {
 				n.LeafNode = result.newRoot
-			} else if key.GetBit(bitLength) {
+			} else if key.MustGetBit(bitLength) {
 				n.Right = result.newRoot
 			} else {
 				n.Left = result.newRoot
@@ -119,11 +126,11 @@ func (t *tree) doInsert(
 			if !n.LeafNode.IsClean() || !n.Left.IsClean() || !n.Right.IsClean() {
 				if n.Clean {
 					// Node was clean so old node is eligible for removal.
-					t.pendingRemovedNodes = append(t.pendingRemovedNodes, n.ExtractUnchecked())
+					t.pendingRemovedNodes = append(t.pendingRemovedNodes, ptr.ExtractUnchecked())
 				}
 
 				n.Clean = false
-				ptr.Clean = false
+				ptr.SetDirty()
 				// No longer eligible for eviction as it is dirty.
 				t.cache.rollbackNode(ptr)
 			}
@@ -134,34 +141,34 @@ func (t *tree) doInsert(
 
 		// Key mismatches the label at position cpLength. Split the edge and
 		// insert new leaf.
-		labelPrefix, labelSuffix := n.Label.Split(cpLength, n.LabelBitLength)
+		labelPrefix, labelSuffix := n.Label.MustSplit(cpLength, n.LabelBitLength)
 		n.Label = labelSuffix
 		n.LabelBitLength = n.LabelBitLength - cpLength
 
 		if n.Clean {
 			// Node was clean so old node is eligible for removal.
-			t.pendingRemovedNodes = append(t.pendingRemovedNodes, n.ExtractUnchecked())
+			t.pendingRemovedNodes = append(t.pendingRemovedNodes, ptr.ExtractUnchecked())
 		}
 
 		n.Clean = false
-		ptr.Clean = false
+		ptr.SetDirty()
 		// No longer eligible for eviction as it is dirty.
 		t.cache.rollbackNode(ptr)
 
 		newLeaf := t.cache.newLeafNode(key, val)
 		var leafNode, left, right *node.Pointer
 
-		if key.BitLength()-bitDepth == cpLength {
+		if keyBitLength-bitDepth == cpLength {
 			// The key is a prefix of existing path.
 			leafNode = newLeaf
-			if labelSuffix.GetBit(0) {
+			if labelSuffix.MustGetBit(0) {
 				left = nil
 				right = ptr
 			} else {
 				left = ptr
 				right = nil
 			}
-		} else if keyRemainder.GetBit(cpLength) {
+		} else if keyRemainder.MustGetBit(cpLength) {
 			left = ptr
 			right = newLeaf
 		} else {
@@ -186,12 +193,12 @@ func (t *tree) doInsert(
 
 			if n.Clean {
 				// Node is dirty so old node is eligible for removal.
-				t.pendingRemovedNodes = append(t.pendingRemovedNodes, n.ExtractUnchecked())
+				t.pendingRemovedNodes = append(t.pendingRemovedNodes, ptr.ExtractUnchecked())
 			}
 
 			n.Value = val
 			n.Clean = false
-			ptr.Clean = false
+			ptr.SetDirty()
 			// No longer eligible for eviction as it is dirty.
 			t.cache.rollbackNode(ptr)
 			return insertResult{
@@ -201,37 +208,49 @@ func (t *tree) doInsert(
 			}, nil
 		}
 
+		nodeKeyBitLength, err := n.Key.BitLength()
+		if err != nil {
+			return insertResult{}, err
+		}
+
 		var result insertResult
-		_, leafKeyRemainder := n.Key.Split(bitDepth, n.Key.BitLength())
-		cpLength := leafKeyRemainder.CommonPrefixLen(n.Key.BitLength()-bitDepth, keyRemainder, key.BitLength()-bitDepth)
+		_, leafKeyRemainder := n.Key.MustSplit(bitDepth, nodeKeyBitLength)
+		cpLength, err := leafKeyRemainder.CommonPrefixLen(nodeKeyBitLength-bitDepth, keyRemainder, keyBitLength-bitDepth)
+		if err != nil {
+			return insertResult{}, err
+		}
 
 		// Key mismatches the label at position cpLength. Split the edge.
-		labelPrefix, _ := leafKeyRemainder.Split(cpLength, leafKeyRemainder.BitLength())
+		leafKeyBitLength, err := leafKeyRemainder.BitLength()
+		if err != nil {
+			return insertResult{}, err
+		}
+		labelPrefix, _ := leafKeyRemainder.MustSplit(cpLength, leafKeyBitLength)
 		newLeaf := t.cache.newLeafNode(key, val)
 		result.insertedLeaf = newLeaf
 		var leafNode, left, right *node.Pointer
 
-		if key.BitLength()-bitDepth == cpLength {
+		if keyBitLength-bitDepth == cpLength {
 			// Inserted key is a prefix of the label.
 			leafNode = newLeaf
-			if leafKeyRemainder.GetBit(cpLength) {
+			if leafKeyRemainder.MustGetBit(cpLength) {
 				left = nil
 				right = ptr
 			} else {
 				left = ptr
 				right = nil
 			}
-		} else if n.Key.BitLength()-bitDepth == cpLength {
+		} else if nodeKeyBitLength-bitDepth == cpLength {
 			// Label is a prefix of the inserted key.
 			leafNode = ptr
-			if keyRemainder.GetBit(cpLength) {
+			if keyRemainder.MustGetBit(cpLength) {
 				left = nil
 				right = newLeaf
 			} else {
 				left = newLeaf
 				right = nil
 			}
-		} else if keyRemainder.GetBit(cpLength) {
+		} else if keyRemainder.MustGetBit(cpLength) {
 			left = ptr
 			right = newLeaf
 		} else {

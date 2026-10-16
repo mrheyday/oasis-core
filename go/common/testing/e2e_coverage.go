@@ -1,4 +1,4 @@
-// +build e2ecoverage
+//go:build e2ecoverage
 
 package testing
 

@@ -5,7 +5,8 @@ OSS Watch. It should not be considered set in stone and may evolve over time as
 the project grows.*
 
 <!-- markdownlint-disable line-length -->
-[Meritocratic Governance Model]: http://oss-watch.ac.uk/resources/meritocraticgovernancemodel
+[Meritocratic Governance Model]:
+  http://oss-watch.ac.uk/resources/meritocraticgovernancemodel
 <!-- markdownlint-enable line-length -->
 
 ## Overview
@@ -39,12 +40,12 @@ doing one or more of the following:
 * adding features
 
 Contributors engage with the project through the issue tracker, writing or
-editing documentation, and participating in the [Oasis Community Slack
-channels]. They submit changes to the project itself via pull requests, which
-will be considered for inclusion in the project by existing committers (see next
-section).
+editing documentation, and participating at our [Oasis Network Community server
+on Discord]. They submit changes to the project itself via pull requests, which
+will be considered for inclusion in the project by existing committers (see
+next section).
 
-[Oasis Community Slack channels]: https://oasiscommunity.slack.com
+[Oasis Network Community server on Discord]: https://oasis.io/discord
 
 ### Committers
 
@@ -63,9 +64,9 @@ have provided valuable contributions to the project over a period of time.
 ## Contribution Process
 
 Anyone can contribute to the project, regardless of their skills, as there are
-many ways to contribute. The [Oasis Community Slack channels] are the best place
-to ask questions, and the [Oasis Protocol GitHub] is the best place to see open
-bugs, open proposals and more.
+many ways to contribute. The [Oasis Network Community server on Discord] is the
+best place to ask questions, and the [Oasis Protocol GitHub] is the best place
+to see open bugs, open proposals and more.
 
 For details on how to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -82,7 +83,8 @@ In order to ensure that the project is not bogged down by endless discussion and
 continual voting, the project operates a policy of lazy consensus. This allows
 the majority of decisions to be made without resorting to a formal vote.
 
-[Architectural Decision Records (ADRs)]: docs/adr/index.md
+[Architectural Decision Records (ADRs)]:
+  https://github.com/oasisprotocol/adrs/blob/main/README.md
 
 ### ADRs and Lazy Consensus
 

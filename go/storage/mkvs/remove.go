@@ -27,7 +27,7 @@ func (t *tree) RemoveExisting(ctx context.Context, key []byte) ([]byte, error) {
 	// Remember where the path from root to target node ends (will end).
 	t.cache.markPosition()
 
-	newRoot, changed, existing, err := t.doRemove(ctx, t.cache.pendingRoot, 0, key, 0)
+	newRoot, changed, existing, err := t.doRemove(ctx, t.cache.pendingRoot, 0, key)
 	if err != nil {
 		return nil, err
 	}
@@ -38,6 +38,7 @@ func (t *tree) RemoveExisting(ctx context.Context, key []byte) ([]byte, error) {
 			t.pendingWriteLog[node.ToMapKey(key)] = &pendingEntry{key, nil, changed, nil}
 		} else {
 			entry.value = nil
+			entry.insertedLeaf = nil
 		}
 	}
 
@@ -56,7 +57,6 @@ func (t *tree) doRemove(
 	ptr *node.Pointer,
 	bitDepth node.Depth,
 	key node.Key,
-	depth node.Depth,
 ) (*node.Pointer, bool, []byte, error) {
 	if ctx.Err() != nil {
 		return nil, false, nil, ctx.Err()
@@ -64,6 +64,11 @@ func (t *tree) doRemove(
 
 	// Dereference the node, possibly making a remote request.
 	nd, err := t.cache.derefNodePtr(ctx, ptr, t.newFetcherSyncGet(key, true))
+	if err != nil {
+		return nil, false, nil, err
+	}
+
+	keyBitLength, err := key.BitLength()
 	if err != nil {
 		return nil, false, nil, err
 	}
@@ -79,15 +84,16 @@ func (t *tree) doRemove(
 
 		var changed bool
 		var existing []byte
-		if key.BitLength() < bitLength {
+		switch {
+		case keyBitLength < bitLength:
 			// Lookup key is too short for the current n.Label, so it doesn't exist.
 			return ptr, false, nil, nil
-		} else if key.BitLength() == bitLength {
-			n.LeafNode, changed, existing, err = t.doRemove(ctx, n.LeafNode, bitLength, key, depth)
-		} else if key.GetBit(bitLength) {
-			n.Right, changed, existing, err = t.doRemove(ctx, n.Right, bitLength, key, depth+1)
-		} else {
-			n.Left, changed, existing, err = t.doRemove(ctx, n.Left, bitLength, key, depth+1)
+		case keyBitLength == bitLength:
+			n.LeafNode, changed, existing, err = t.doRemove(ctx, n.LeafNode, bitLength, key)
+		case key.MustGetBit(bitLength):
+			n.Right, changed, existing, err = t.doRemove(ctx, n.Right, bitLength, key)
+		default:
+			n.Left, changed, existing, err = t.doRemove(ctx, n.Left, bitLength, key)
 		}
 		if err != nil {
 			return nil, false, existing, err
@@ -112,7 +118,7 @@ func (t *tree) doRemove(
 		if remainingLeaf != nil && remainingLeft == nil && remainingRight == nil {
 			ndLeaf := n.LeafNode
 			n.LeafNode = nil
-			t.pendingRemovedNodes = append(t.pendingRemovedNodes, n)
+			t.pendingRemovedNodes = append(t.pendingRemovedNodes, ptr)
 			t.cache.removeNode(ptr)
 			return ndLeaf, true, existing, nil
 		} else if remainingLeaf == nil && (remainingLeft == nil || remainingRight == nil) {
@@ -131,19 +137,22 @@ func (t *tree) doRemove(
 			// If child is an internal node, also fix the label.
 			switch inode := ndChild.(type) {
 			case *node.InternalNode:
-				inode.Label = n.Label.Merge(n.LabelBitLength, inode.Label, inode.LabelBitLength)
+				inode.Label, err = n.Label.Merge(n.LabelBitLength, inode.Label, inode.LabelBitLength)
+				if err != nil {
+					return nil, false, nil, err
+				}
 				inode.LabelBitLength += n.LabelBitLength
 				if inode.Clean {
 					// Node was clean so old node is eligible for removal.
-					t.pendingRemovedNodes = append(t.pendingRemovedNodes, inode.ExtractUnchecked())
+					t.pendingRemovedNodes = append(t.pendingRemovedNodes, nodePtr.ExtractUnchecked())
 				}
 				inode.Clean = false
-				nodePtr.Clean = false
+				nodePtr.SetDirty()
 				// No longer eligible for eviction as it is dirty.
 				t.cache.rollbackNode(nodePtr)
 			}
 
-			t.pendingRemovedNodes = append(t.pendingRemovedNodes, n)
+			t.pendingRemovedNodes = append(t.pendingRemovedNodes, ptr)
 			t.cache.removeNode(ptr)
 			return nodePtr, true, existing, nil
 		}
@@ -152,11 +161,11 @@ func (t *tree) doRemove(
 		if changed {
 			if n.Clean {
 				// Node was clean so old node is eligible for removal.
-				t.pendingRemovedNodes = append(t.pendingRemovedNodes, n.ExtractUnchecked())
+				t.pendingRemovedNodes = append(t.pendingRemovedNodes, ptr.ExtractUnchecked())
 			}
 
 			n.Clean = false
-			ptr.Clean = false
+			ptr.SetDirty()
 			// No longer eligible for eviction as it is dirty.
 			t.cache.rollbackNode(ptr)
 		}
@@ -165,7 +174,7 @@ func (t *tree) doRemove(
 	case *node.LeafNode:
 		// Remove from leaf node.
 		if n.Key.Equal(key) {
-			t.pendingRemovedNodes = append(t.pendingRemovedNodes, n)
+			t.pendingRemovedNodes = append(t.pendingRemovedNodes, ptr)
 			t.cache.removeNode(ptr)
 			return nil, true, n.Value, nil
 		}

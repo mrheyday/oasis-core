@@ -13,11 +13,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"sync"
 
-	"github.com/oasisprotocol/ed25519"
+	"github.com/oasisprotocol/curve25519-voi/curve"
+	"github.com/oasisprotocol/curve25519-voi/primitives/ed25519"
+	"github.com/oasisprotocol/curve25519-voi/primitives/ed25519/extra/cache"
+	"github.com/oasisprotocol/curve25519-voi/primitives/h2c"
 
 	"github.com/oasisprotocol/oasis-core/go/common/cbor"
 	"github.com/oasisprotocol/oasis-core/go/common/crypto/hash"
@@ -54,6 +56,10 @@ var (
 	// fails when opening a signed blob.
 	ErrVerifyFailed = errors.New("signed: signature verification failed")
 
+	// ErrForbiddenPublicKey is the error returned when a public key is
+	// in the blacklist.
+	ErrForbiddenPublicKey = errors.New("signature: public key forbidden")
+
 	errKeyMismatch = errors.New("signature: public key PEM is not for private key")
 
 	_ encoding.BinaryMarshaler   = PublicKey{}
@@ -66,7 +72,18 @@ var (
 	testPublicKeys        sync.Map
 	blacklistedPublicKeys sync.Map
 
-	defaultOptions = &ed25519.Options{}
+	defaultOptions = &ed25519.Options{
+		Verify: &ed25519.VerifyOptions{
+			AllowSmallOrderA:   false,
+			AllowSmallOrderR:   false,
+			AllowNonCanonicalA: true,
+			AllowNonCanonicalR: true,
+		},
+	}
+
+	cachingVerifier = cache.NewVerifier(
+		cache.NewLRUCache(4096), // Should be big enough?
+	)
 )
 
 // PublicKey is a public key used for signing.
@@ -87,13 +104,12 @@ func (k PublicKey) Verify(context Context, message, sig []byte) bool {
 		return false
 	}
 
-	return ed25519.Verify(ed25519.PublicKey(k[:]), data, sig)
+	return cachingVerifier.VerifyWithOptions(k[:], data, sig, defaultOptions)
 }
 
 // MarshalBinary encodes a public key into binary form.
 func (k PublicKey) MarshalBinary() (data []byte, err error) {
-	data = append([]byte{}, k[:]...)
-	return
+	return append([]byte{}, k[:]...), nil
 }
 
 // UnmarshalBinary decodes a binary marshaled public key.
@@ -154,13 +170,7 @@ func (k PublicKey) Equal(cmp PublicKey) bool {
 
 // String returns a string representation of the public key.
 func (k PublicKey) String() string {
-	b64Key := base64.StdEncoding.EncodeToString(k[:])
-
-	if len(k) != PublicKeySize {
-		return "[malformed]: " + b64Key
-	}
-
-	return b64Key
+	return base64.StdEncoding.EncodeToString(k[:])
 }
 
 // IsValid checks whether the public key is well-formed.
@@ -190,13 +200,13 @@ func (k *PublicKey) LoadPEM(fn string, signer Signer) error {
 
 			copy((*k)[:], pubKey[:])
 
-			return ioutil.WriteFile(fn, buf, filePerm)
+			return os.WriteFile(fn, buf, filePerm)
 		}
 		return err
 	}
 	defer f.Close() // nolint: errcheck
 
-	buf, err := ioutil.ReadAll(f)
+	buf, err := io.ReadAll(f)
 	if err != nil {
 		return err
 	}
@@ -248,8 +258,7 @@ func (r RawSignature) Equal(cmp RawSignature) bool {
 
 // MarshalBinary encodes a signature into binary form.
 func (r RawSignature) MarshalBinary() (data []byte, err error) {
-	data = append([]byte{}, r[:]...)
-	return
+	return append([]byte{}, r[:]...), nil
 }
 
 // UnmarshalBinary decodes a binary marshaled signature.
@@ -294,6 +303,20 @@ func (r *RawSignature) UnmarshalPEM(data []byte) error {
 	return nil
 }
 
+// SignRaw generates a signature with the private key over the context and message.
+func SignRaw(signer Signer, context Context, message []byte) (*RawSignature, error) {
+	signature, err := signer.ContextSign(context, message)
+	if err != nil {
+		return nil, err
+	}
+
+	var rawSignature RawSignature
+	if err = rawSignature.UnmarshalBinary(signature); err != nil {
+		return nil, err
+	}
+	return &rawSignature, nil
+}
+
 // Signature is a signature, bundled with the signing public key.
 type Signature struct {
 	// PublicKey is the public key that produced the signature.
@@ -314,20 +337,14 @@ func (s *Signature) Equal(cmp *Signature) bool {
 	return true
 }
 
-// Sign generates a signature with the private key over the context and
-// message.
+// Sign generates a signature with the private key over the context and message.
 func Sign(signer Signer, context Context, message []byte) (*Signature, error) {
-	signature, err := signer.ContextSign(context, message)
+	rawSignature, err := SignRaw(signer, context, message)
 	if err != nil {
 		return nil, err
 	}
 
-	var rawSignature RawSignature
-	if err = rawSignature.UnmarshalBinary(signature); err != nil {
-		return nil, err
-	}
-
-	return &Signature{PublicKey: signer.Public(), Signature: rawSignature}, nil
+	return &Signature{PublicKey: signer.Public(), Signature: *rawSignature}, nil
 }
 
 // Verify returns true iff the signature is valid over the given
@@ -365,7 +382,7 @@ func (s Signature) MarshalPEM() (data []byte, err error) {
 	return bytes.Join([][]byte{pk, sig}, []byte{}), nil
 }
 
-// UnmarshalPem decodes a PEM marshaled signature.
+// UnmarshalPEM decodes a PEM marshaled signature.
 func (s *Signature) UnmarshalPEM(data []byte) error {
 	// Marshalled PEM file contains public key block first...
 	blk, rest := encPem.Decode(data)
@@ -389,11 +406,8 @@ func (s *Signature) UnmarshalPEM(data []byte) error {
 	if blk.Type != sigPEMType {
 		return fmt.Errorf("signature: expected different PEM block (expected: %s got: %s)", sigPEMType, blk.Type)
 	}
-	if err := s.Signature.UnmarshalBinary(blk.Bytes); err != nil {
-		return err
-	}
 
-	return nil
+	return s.Signature.UnmarshalBinary(blk.Bytes)
 }
 
 // Signed is a signed blob.
@@ -407,7 +421,7 @@ type Signed struct {
 
 // SignSigned generates a Signed with the Signer over the context and
 // CBOR-serialized message.
-func SignSigned(signer Signer, context Context, src interface{}) (*Signed, error) {
+func SignSigned(signer Signer, context Context, src any) (*Signed, error) {
 	data := cbor.Marshal(src)
 	signature, err := Sign(signer, context, data)
 	if err != nil {
@@ -418,7 +432,7 @@ func SignSigned(signer Signer, context Context, src interface{}) (*Signed, error
 }
 
 // Open first verifies the blob signature and then unmarshals the blob.
-func (s *Signed) Open(context Context, dst interface{}) error {
+func (s *Signed) Open(context Context, dst any) error {
 	// Verify signature first.
 	if !s.Signature.Verify(context, s.Blob) {
 		return ErrVerifyFailed
@@ -440,13 +454,13 @@ func (s *Signed) Equal(cmp *Signed) bool {
 //
 // It should only be used for pretty printing.
 type PrettySigned struct {
-	Body      interface{} `json:"untrusted_raw_value"`
-	Signature Signature   `json:"signature"`
+	Body      any       `json:"untrusted_raw_value"`
+	Signature Signature `json:"signature"`
 }
 
 // PrettyPrint writes a pretty-printed representation of the type
 // to the given writer.
-func (p PrettySigned) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
+func (p PrettySigned) PrettyPrint(_ context.Context, prefix string, w io.Writer) {
 	data, err := json.MarshalIndent(p, prefix, "  ")
 	if err != nil {
 		fmt.Fprintf(w, "%s<error: %s>\n", prefix, err)
@@ -455,13 +469,13 @@ func (p PrettySigned) PrettyPrint(ctx context.Context, prefix string, w io.Write
 }
 
 // PrettyType returns a representation of the type that can be used for pretty printing.
-func (p PrettySigned) PrettyType() (interface{}, error) {
+func (p PrettySigned) PrettyType() (any, error) {
 	return p, nil
 }
 
 // NewPrettySigned creates a new PrettySigned instance that can be
 // used for pretty printing signed values.
-func NewPrettySigned(s Signed, b interface{}) (*PrettySigned, error) {
+func NewPrettySigned(s Signed, b any) (*PrettySigned, error) {
 	if pp, ok := b.(prettyprint.PrettyPrinter); ok {
 		var err error
 		if b, err = pp.PrettyType(); err != nil {
@@ -485,7 +499,7 @@ type MultiSigned struct {
 }
 
 // Open first verifies the blob signatures, and then unmarshals the blob.
-func (s *MultiSigned) Open(context Context, dst interface{}) error {
+func (s *MultiSigned) Open(context Context, dst any) error {
 	if !VerifyManyToOne(context, s.Blob, s.Signatures) {
 		return ErrVerifyFailed
 	}
@@ -535,7 +549,7 @@ func (s *MultiSigned) IsOnlySignedBy(pks []PublicKey) bool {
 
 // SignMultiSigned generates a MultiSigned with the Signers over the context
 // and CBOR-serialized message.
-func SignMultiSigned(signers []Signer, context Context, src interface{}) (*MultiSigned, error) {
+func SignMultiSigned(signers []Signer, context Context, src any) (*MultiSigned, error) {
 	ms := &MultiSigned{
 		Blob: cbor.Marshal(src),
 	}
@@ -556,13 +570,13 @@ func SignMultiSigned(signers []Signer, context Context, src interface{}) (*Multi
 //
 // It should only be used for pretty printing.
 type PrettyMultiSigned struct {
-	Body       interface{} `json:"untrusted_raw_value"`
+	Body       any         `json:"untrusted_raw_value"`
 	Signatures []Signature `json:"signatures"`
 }
 
 // PrettyPrint writes a pretty-printed representation of the type to the
 // given writer.
-func (p PrettyMultiSigned) PrettyPrint(ctx context.Context, prefix string, w io.Writer) {
+func (p PrettyMultiSigned) PrettyPrint(_ context.Context, prefix string, w io.Writer) {
 	data, err := json.MarshalIndent(p, prefix, "  ")
 	if err != nil {
 		fmt.Fprintf(w, "%s<error: %s>\n", prefix, err)
@@ -571,13 +585,13 @@ func (p PrettyMultiSigned) PrettyPrint(ctx context.Context, prefix string, w io.
 }
 
 // PrettyType returns a representation of the type that can be used for pretty printing.
-func (p PrettyMultiSigned) PrettyType() (interface{}, error) {
+func (p PrettyMultiSigned) PrettyType() (any, error) {
 	return p, nil
 }
 
 // NewPrettyMultiSigned creates a new PrettySigned instance that can be
 // used for pretty printing multi-signed values.
-func NewPrettyMultiSigned(s MultiSigned, b interface{}) (*PrettyMultiSigned, error) {
+func NewPrettyMultiSigned(s MultiSigned, b any) (*PrettyMultiSigned, error) {
 	if pp, ok := b.(prettyprint.PrettyPrinter); ok {
 		var err error
 		if b, err = pp.PrettyType(); err != nil {
@@ -597,7 +611,7 @@ type SignedPublicKey struct {
 }
 
 // Open first verifies the blob signature and then unmarshals the blob.
-func (s *SignedPublicKey) Open(context Context, pub *PublicKey) error { // nolint: interfacer
+func (s *SignedPublicKey) Open(context Context, pub *PublicKey) error {
 	return s.Signed.Open(context, pub)
 }
 
@@ -611,10 +625,7 @@ func VerifyManyToOne(context Context, message []byte, sigs []Signature) bool {
 		return false
 	}
 
-	// Adapt from our wrapper types to the types used by the library.
-	pks := make([]ed25519.PublicKey, 0, len(sigs))
-	rawSigs := make([][]byte, 0, len(sigs))
-	msgs := make([][]byte, 0, len(sigs))
+	verifier := ed25519.NewBatchVerifierWithCapacity(len(sigs))
 
 	for i := range sigs {
 		v := sigs[i] // This is deliberate.
@@ -622,63 +633,37 @@ func VerifyManyToOne(context Context, message []byte, sigs []Signature) bool {
 			return false
 		}
 
-		pks = append(pks, ed25519.PublicKey(v.PublicKey[:]))
-		rawSigs = append(rawSigs, v.Signature[:])
-		msgs = append(msgs, msg)
+		cachingVerifier.AddWithOptions(verifier, v.PublicKey[:], msg, v.Signature[:], defaultOptions)
 	}
 
-	allOk, _, err := ed25519.VerifyBatch(rand.Reader, pks, msgs, rawSigs, defaultOptions)
-	if err != nil {
-		return false
-	}
-
-	return allOk
-}
-
-// VerifyBatch verifies multiple signatures, made by multiple public keys,
-// against a single context and multiple messages, returning true iff every
-// signature is valid.
-func VerifyBatch(context Context, messages [][]byte, sigs []Signature) bool {
-	if len(messages) != len(sigs) {
-		panic("signature: VerifyBatch messages/signature count mismatch")
-	}
-
-	// Adapt from our wrapper types to the types used by the library.
-	pks := make([]ed25519.PublicKey, 0, len(sigs))
-	rawSigs := make([][]byte, 0, len(sigs))
-	msgs := make([][]byte, 0, len(sigs))
-
-	for i := range sigs {
-		v := sigs[i] // This is deliberate.
-		if v.PublicKey.IsBlacklisted() {
-			return false
-		}
-		pks = append(pks, ed25519.PublicKey(v.PublicKey[:]))
-		rawSigs = append(rawSigs, v.Signature[:])
-
-		// Sigh. :(
-		msg, err := PrepareSignerMessage(context, messages[i])
-		if err != nil {
-			return false
-		}
-		msgs = append(msgs, msg)
-	}
-
-	allOk, _, err := ed25519.VerifyBatch(rand.Reader, pks, msgs, rawSigs, defaultOptions)
-	if err != nil {
-		return false
-	}
-
-	return allOk
+	return verifier.VerifyBatchOnly(rand.Reader)
 }
 
 // NewPublicKey creates a new public key from the given hex representation or
 // panics.
-func NewPublicKey(hex string) (pk PublicKey) {
+func NewPublicKey(hex string) PublicKey {
+	var pk PublicKey
 	if err := pk.UnmarshalHex(hex); err != nil {
 		panic(err)
 	}
-	return
+	return pk
+}
+
+// HashToPublicKey creates a public key via h2c from the given domain separator
+// and message.  The private key of the returned public key is unknown.
+func HashToPublicKey(dst, message []byte) PublicKey {
+	point, err := h2c.Edwards25519_XMD_SHA512_ELL2_RO(dst, message)
+	if err != nil {
+		panic(err)
+	}
+
+	var aCompressed curve.CompressedEdwardsY
+	aCompressed.SetEdwardsPoint(point)
+
+	var pk PublicKey
+	copy(pk[:], aCompressed[:])
+
+	return pk
 }
 
 // RegisterTestPublicKey registers a hardcoded test public key with the
@@ -690,7 +675,7 @@ func RegisterTestPublicKey(pk PublicKey) {
 // BuildPublicKeyBlacklist builds the public key blacklist.
 func BuildPublicKeyBlacklist(allowTestKeys bool) {
 	if !allowTestKeys {
-		testPublicKeys.Range(func(k, v interface{}) bool {
+		testPublicKeys.Range(func(k, v any) bool {
 			blacklistedPublicKeys.Store(k, v)
 			return true
 		})
